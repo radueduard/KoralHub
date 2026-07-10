@@ -1,0 +1,26 @@
+[package]
+name = "koral-hub"
+version = "0.1.0"
+description = "Koral Hub — create, manage and run Koral projects"
+authors = ["radue"]
+edition = "2021"
+
+# The Rust core is compiled as a library so the same code can back both the desktop
+# binary (main.rs) and, later, mobile entry points.
+[lib]
+name = "koral_hub_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# --- Coming soon (uncomment when wiring up the package-manager core) ---
+# git2 = "0.19"          # native clone/pull for labs + framework SDKs
+# reqwest = { version = "0.12", features = ["blocking", "rustls-tls"] }  # download SDK archives
+# zip = "2"              # unpack SDK archives
+# dirs = "5"             # locate ~/.local/share, %LOCALAPPDATA%, etc.
