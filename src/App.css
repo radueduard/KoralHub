@@ -81,6 +81,32 @@
   background: rgba(26, 200, 26, 0.12);
 }
 
+.btn-icon {
+  background: transparent;
+  color: var(--text-faint);
+  border-radius: 50%;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  font-size: 12px;
+  display: grid;
+  place-items: center;
+}
+.btn-icon:hover {
+  color: #e05555;
+  background: rgba(224, 85, 85, 0.12);
+}
+
+.error {
+  color: #ff8a8a;
+  background: rgba(224, 85, 85, 0.1);
+  border: 1px solid rgba(224, 85, 85, 0.3);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  font-size: 13px;
+}
+
 /* --- Content --- */
 .content {
   flex: 1;

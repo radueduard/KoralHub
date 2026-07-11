@@ -18,9 +18,10 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+dirs = "5"                                                      # per-OS data/home dirs
+# rustls-tls avoids a system OpenSSL build dependency for downloads.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+zip = "2"                                                       # unpack SDK archives
 
-# --- Coming soon (uncomment when wiring up the package-manager core) ---
-# git2 = "0.19"          # native clone/pull for labs + framework SDKs
-# reqwest = { version = "0.12", features = ["blocking", "rustls-tls"] }  # download SDK archives
-# zip = "2"              # unpack SDK archives
-# dirs = "5"             # locate ~/.local/share, %LOCALAPPDATA%, etc.
+# --- Coming soon (uncomment when wiring up labs) ---
+# git2 = "0.19"          # native clone/pull for labs + git-hosted frameworks

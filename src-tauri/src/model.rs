@@ -5,8 +5,6 @@
 //! per-machine state — the selected build profile, absolute build directories, the chosen
 //! IDE — is deliberately kept OUT of this struct and lives in the Hub's local cache instead.
 //! That split is what lets "clone the link and run" work across machines.
-//!
-//! Not wired into a command yet; this is the design target for project load/save/create.
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
@@ -30,6 +28,41 @@ pub struct ProjectConfig {
     /// releases can version independently.
     #[serde(default)]
     pub libraries: Vec<Library>,
+}
+
+impl ProjectConfig {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    /// A fresh project with the default rendering settings and library set.
+    pub fn new(
+        name: impl Into<String>,
+        framework_version: impl Into<String>,
+        color: [f32; 3],
+    ) -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            name: name.into(),
+            color,
+            framework_version: framework_version.into(),
+            rendering: Rendering::default(),
+            libraries: default_libraries(),
+        }
+    }
+}
+
+/// The ports every Koral project links by default. Anything the framework itself uses
+/// internally is already inside the SDK's shared library, so only what user scene code
+/// directly `#include`s belongs here.
+pub fn default_libraries() -> Vec<Library> {
+    vec![
+        Library { vcpkg_port: "glm".into(), min_version: "1.0.3".into(), features: vec![] },
+        Library {
+            vcpkg_port: "imgui".into(),
+            min_version: "1.91.9".into(),
+            features: vec!["docking-experimental".into()],
+        },
+        Library { vcpkg_port: "spdlog".into(), min_version: "1.15.0".into(), features: vec![] },
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
