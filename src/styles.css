@@ -1,17 +1,62 @@
-:root {
-  --bg: #16171b;
-  --bg-elevated: #1e2026;
-  --bg-card: #1e2026;
-  --bg-card-hover: #262932;
-  --border: #2c2f38;
-  --text: #ececf0;
-  --text-dim: #9a9ca6;
-  --text-faint: #6b6d78;
-  --accent: #5c8cf0;
-  --accent-hover: #6f9bf5;
-  --play: #1ac81a;
+/* Palette drawn from the Koral logo: coral (#FD8856 / #C05629) on deep maroon (#630101).
+   Backgrounds stay near-neutral gray — very dark or very light — nudged a hair warm so the
+   coral accent sits in the same family rather than clashing with a cold blue-gray. */
 
+:root,
+:root[data-theme="dark"] {
   color-scheme: dark;
+
+  --bg: #161513;
+  --bg-elevated: #1e1c19;
+  --bg-card: #1e1c19;
+  --bg-card-hover: #272420;
+  --border: #322e29;
+  --border-strong: #454039;
+  --text: #f0ede9;
+  --text-dim: #a49f98;
+  --text-faint: #726c64;
+
+  /* Neutral overlay for hover washes that must not assume a background lightness. */
+  --overlay: rgba(255, 255, 255, 0.06);
+  --scrim: rgba(0, 0, 0, 0.55);
+
+  /* The build console keeps a terminal feel: darkest surface in either theme. */
+  --console-bg: #100f0d;
+  --console-text: #d3cfc9;
+
+  --shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #f4f2ef;
+  --bg-elevated: #ffffff;
+  --bg-card: #ffffff;
+  --bg-card-hover: #ece9e4;
+  --border: #e2ddd6;
+  --border-strong: #ccc6bd;
+  --text: #201e1b;
+  --text-dim: #5e5a53;
+  --text-faint: #918b82;
+
+  --overlay: rgba(60, 40, 25, 0.06);
+  --scrim: rgba(40, 30, 22, 0.35);
+
+  --console-bg: #201e1b;
+  --console-text: #d3cfc9;
+
+  --shadow: 0 18px 40px rgba(60, 40, 25, 0.18);
+}
+
+/* Coral accent — shared across both themes so the brand reads the same either way. */
+:root {
+  --accent: #e46a35;
+  --accent-hover: #f27d46;
+  --play: #24a324;
+  /* Semantic red for errors/destructive text — legible on both themes' translucent red wash. */
+  --danger: #dd5346;
+
   font-family: "Inter", system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
   font-synthesis: none;
   -webkit-font-smoothing: antialiased;

@@ -21,16 +21,55 @@
   font-weight: 700;
   font-size: 15px;
   letter-spacing: 0.2px;
+  /* The title bar is the window drag handle; letting clicks fall through the brand to the
+     header (which carries data-tauri-drag-region) makes the whole left side draggable. */
+  pointer-events: none;
 }
 
-.brand-mark {
-  color: var(--accent);
-  font-size: 18px;
+.brand-logo {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  display: block;
 }
 
 .titlebar-actions {
   display: flex;
+  align-items: center;
   gap: 10px;
+}
+
+/* --- Custom window controls (native decorations are disabled) --- */
+.window-controls {
+  display: flex;
+  gap: 2px;
+  margin-left: 8px;
+}
+
+.win-btn {
+  width: 36px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.win-btn:hover {
+  background: var(--bg-card-hover);
+  color: var(--text);
+}
+.win-btn svg {
+  display: block;
+}
+/* Close is the one destructive control — it goes red on hover, like every native title bar. */
+.win-close:hover {
+  background: #e04747;
+  color: #fff;
 }
 
 /* --- Buttons --- */
@@ -65,20 +104,111 @@
   background: var(--bg-card-hover);
 }
 
-.btn-play {
+/* The round icon buttons on a project card sit in one row, so they share their box metrics —
+   only colour distinguishes them. Diverging sizes here read as a misalignment bug. */
+.btn-play,
+.btn-icon {
   background: transparent;
-  color: var(--text-dim);
   border-radius: 50%;
-  width: 38px;
-  height: 38px;
+  width: 34px;
+  height: 34px;
   padding: 0;
-  font-size: 14px;
+  font-size: 13px;
+  line-height: 1;
   display: grid;
   place-items: center;
+  flex: none;
+}
+
+.btn-play {
+  color: var(--text-dim);
 }
 .btn-play:hover {
   color: var(--play);
   background: rgba(26, 200, 26, 0.12);
+}
+
+.btn-icon {
+  color: var(--text-faint);
+}
+.btn-icon:hover {
+  color: var(--text);
+  background: var(--bg-card-hover);
+}
+
+/* Destructive actions only — the neutral .btn-icon hover must not look like a delete. */
+.btn-danger:hover {
+  color: #e05555;
+  background: rgba(224, 85, 85, 0.12);
+}
+.btn-icon:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+/* Reordering is not destructive — it shouldn't wear the delete button's red. */
+.btn-move:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--overlay);
+}
+
+.btn-small {
+  padding: 4px 10px;
+  font-size: 12px;
+  align-self: flex-start;
+}
+
+/* One entry of a search list: the path, then reorder and remove. */
+.dir-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.dir-row .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.error {
+  color: var(--danger);
+  background: rgba(224, 85, 85, 0.1);
+  border: 1px solid rgba(224, 85, 85, 0.3);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  font-size: 13px;
+}
+
+/* --- Build console --- */
+.console {
+  border-top: 1px solid var(--border);
+  background: var(--console-bg);
+  display: flex;
+  flex-direction: column;
+  max-height: 240px;
+}
+
+.console-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--border);
+}
+
+.console-body {
+  margin: 0;
+  padding: 12px 16px;
+  overflow-y: auto;
+  font-family: "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--console-text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
 }
 
 /* --- Content --- */
@@ -114,6 +244,9 @@
   display: flex;
   flex-direction: column;
   gap: 12px;
+  /* Separates the last card from the next section heading, which carries no top margin.
+     Same value as .fw-list. */
+  margin-bottom: 32px;
 }
 
 .project-card {
@@ -128,7 +261,7 @@
 }
 .project-card:hover {
   background: var(--bg-card-hover);
-  border-color: #3a3e49;
+  border-color: var(--border-strong);
 }
 
 .project-swatch {
@@ -171,4 +304,339 @@
   padding: 4px 10px;
   border: 1px solid var(--border);
   border-radius: 999px;
+}
+
+/* Git badge: branch name in a pill, matching the framework pill's metrics. */
+.project-git {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 160px;
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+.git-icon {
+  flex: none;
+  opacity: 0.75;
+}
+.git-branch-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A coral dot flags uncommitted changes. */
+.git-dot {
+  flex: none;
+  color: var(--accent);
+  font-size: 8px;
+  line-height: 1;
+}
+
+/* --- Framework cards --- */
+.fw-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 32px;
+}
+
+.fw-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.fw-card:hover {
+  background: var(--bg-card-hover);
+}
+/* An installed SDK reads as "present", not as another thing to act on. */
+.fw-installed {
+  border-color: #2f6f4f;
+}
+
+.fw-meta {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.fw-version {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.fw-sub {
+  color: var(--text-faint);
+  font-size: 13px;
+  margin-top: 4px;
+  /* Asset names are long; never let one push the buttons off the card. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fw-tag {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+}
+
+.fw-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* No `value` attribute => the browser renders this indeterminate, which is exactly what we
+   want when the server sends no Content-Length. */
+.fw-bar {
+  width: 160px;
+  height: 6px;
+}
+
+/* --- New-project dialog --- */
+.modal-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--scrim);
+}
+
+.modal {
+  width: 100%;
+  max-width: 460px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 22px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow);
+}
+
+.modal-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+/* Input + Browse button share a row; the input takes the slack. */
+.field-row {
+  display: flex;
+  gap: 8px;
+}
+.field-row .input {
+  flex: 1;
+  min-width: 0;
+}
+.field-row .btn {
+  flex: none;
+}
+
+.input {
+  width: 100%;
+  padding: 9px 12px;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  transition: border-color 120ms ease;
+}
+.input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.field-hint {
+  margin: -4px 0 0;
+  font-size: 12px;
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+.field-hint code {
+  color: var(--text-dim);
+}
+.field-bad {
+  color: var(--danger);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+/* The dialog owns its error, so drop the list-spacing margin. */
+.modal .error {
+  margin-bottom: 0;
+}
+
+/* Drafts are only installable by whoever can see them (a signed-in maintainer), so they
+   should never be mistaken for a normal release. */
+.fw-tag-draft {
+  color: #e3b341;
+  border-color: rgba(227, 179, 65, 0.4);
+  background: rgba(227, 179, 65, 0.1);
+}
+
+/* --- Open-in-IDE actions --- */
+.project-ides {
+  display: flex;
+  gap: 6px;
+}
+
+.btn-ide {
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+/* --- Run settings panel --- */
+.field-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 12px;
+}
+
+select.input {
+  cursor: pointer;
+}
+
+.toggle-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin-top: -4px;
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.toggle input {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.toggle:hover {
+  color: var(--text);
+}
+
+/* --- Template picker (New Project) --- */
+.template-picker {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: -4px;
+}
+
+.template-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px;
+  text-align: left;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.template-card:hover {
+  background: var(--bg-card-hover);
+}
+.template-active {
+  border-color: var(--accent);
+  background: var(--bg-card-hover);
+}
+
+.template-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.template-blurb {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-faint);
+}
+
+/* --- Kind badge on the project card --- */
+.project-kind {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+}
+.kind-job {
+  color: #b98af5;
+  border-color: rgba(185, 138, 245, 0.4);
+  background: rgba(185, 138, 245, 0.1);
+}
+
+/* --- Destructive confirmation --- */
+.btn-destructive {
+  background: #d24545;
+  color: white;
+}
+.btn-destructive:hover {
+  background: #e05555;
+}
+
+/* The one toggle that arms an irreversible action, so it does not read as an ordinary option. */
+.danger-toggle {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.danger-toggle:has(input:checked) {
+  color: var(--danger);
+  border-color: rgba(224, 85, 85, 0.4);
+  background: rgba(224, 85, 85, 0.08);
+}
+.danger-toggle input {
+  accent-color: #e05555;
 }

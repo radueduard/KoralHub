@@ -1,0 +1,81 @@
+name: Release (Linux)
+
+# Cut a release by pushing a tag like `v0.1.0`: this builds the Linux bundles
+# (.deb, .rpm and AppImage) and attaches them to a *draft* GitHub Release for that tag,
+# which you then review and publish. Also runnable from the Actions tab (workflow_dispatch)
+# as a dry run — that produces a draft named after the branch.
+#
+# Linux only for now; macOS/Windows jobs can be added as a matrix once they're verified.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write # tauri-action creates the GitHub Release and uploads the bundles to it
+
+jobs:
+  release-linux:
+    # 22.04 keeps the glibc floor low, so the bundles run on older distros too.
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Tauri v2's Linux webview + bundling toolchain. webkit2gtk-4.1 is the v2 webview;
+      # patchelf + file are needed to build the AppImage. libgit2 and OpenSSL are vendored by
+      # Cargo, so only a C toolchain + cmake (to compile them) are required, not system copies.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            file \
+            build-essential \
+            cmake \
+            curl \
+            wget
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build bundles and draft the release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GitHub runners have no FUSE, so linuxdeploy (itself an AppImage) has to self-extract;
+          # NO_STRIP avoids its strip step choking on the bundle. Both were needed to build the
+          # AppImage locally, too.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          NO_STRIP: "true"
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Koral Hub ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false
+          args: "--bundles deb,rpm,appimage"

@@ -18,9 +18,27 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+dirs = "5"                                                      # per-OS data/home dirs
+# rustls-tls avoids a system OpenSSL build dependency for downloads.
+# "json" is used to read the GitHub releases API when listing what is installable.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+# SDK archives are .tar.gz on Linux/macOS and .zip on Windows — the release workflow emits
+# whichever is native to the platform, so the Hub has to be able to open both.
+zip = "2"
+tar = "0.4"
+flate2 = "1"
+tauri-plugin-dialog = "2"
+# Native git (init on create, clone on import, status for the cards). libgit2 is vendored and
+# statically linked so the Hub needs no system `git` binary — the same "owns its dependencies"
+# stance as the rest of the Hub. SSH is left out; the import flow targets HTTPS remotes.
+#
+# HTTPS transport differs by OS: on Unix libgit2 uses OpenSSL (vendored in the target section
+# below so there's no libssl runtime dependency), while on Windows it uses the built-in WinHTTP.
+# Vendoring OpenSSL only for Unix keeps the Windows build from having to compile OpenSSL from
+# source (Perl/NASM) for a transport it never uses.
+git2 = { version = "0.19", default-features = false, features = ["https", "vendored-libgit2"] }
 
-# --- Coming soon (uncomment when wiring up the package-manager core) ---
-# git2 = "0.19"          # native clone/pull for labs + framework SDKs
-# reqwest = { version = "0.12", features = ["blocking", "rustls-tls"] }  # download SDK archives
-# zip = "2"              # unpack SDK archives
-# dirs = "5"             # locate ~/.local/share, %LOCALAPPDATA%, etc.
+# OpenSSL, vendored, is libgit2's HTTPS backend on Unix. Windows uses WinHTTP instead, so OpenSSL
+# is neither pulled in nor built there. Cargo unions these features with the base git2 above.
+[target.'cfg(unix)'.dependencies]
+git2 = { version = "0.19", default-features = false, features = ["vendored-openssl"] }
