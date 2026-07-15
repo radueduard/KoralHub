@@ -5,7 +5,6 @@
 //! IDE's own recent list) behaves identically to one launched from here.
 
 use std::path::Path;
-use std::process::Command;
 
 use serde::Serialize;
 
@@ -94,7 +93,9 @@ pub fn open(id: &str, project_root: &Path) -> Result<(), String> {
         .find(|i| i.id == id)
         .ok_or_else(|| format!("{id} is not installed on this machine"))?;
 
-    let mut cmd = Command::new(&ide.command);
+    // Strip the Hub's inherited loader environment (an AppImage's bundled-lib paths) so the IDE —
+    // and anything it in turn launches, like the same cmake — runs against the system libraries.
+    let mut cmd = crate::builder::external_command(&ide.command);
     cmd.arg(project_root);
 
     cmd.spawn()

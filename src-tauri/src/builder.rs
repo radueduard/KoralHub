@@ -12,6 +12,25 @@ use tauri::{AppHandle, Emitter};
 
 use crate::{framework, project, scaffold};
 
+/// Build a `Command` for an external tool with any inherited loader environment stripped out.
+///
+/// When the Hub runs as an AppImage — or is launched from something that does the same — its own
+/// process has `LD_LIBRARY_PATH`/`LD_PRELOAD` pointing at *bundled* libraries. A tool we spawn
+/// (cmake, ninja and the compiler it drives, the SDK runtime) would inherit that and load those
+/// bundled libraries against the system ones, which fails with symbol-lookup errors — classically
+/// the system `libcurl` pairing with an older bundled `libnghttp2`. These tools must use the
+/// system libraries, so we drop the two variables for the child only; the Hub's own environment
+/// is left untouched. No-op on non-Linux, where there is nothing to strip.
+pub(crate) fn external_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(target_os = "linux")]
+    {
+        cmd.env_remove("LD_LIBRARY_PATH");
+        cmd.env_remove("LD_PRELOAD");
+    }
+    cmd
+}
+
 /// Platform-specific shared-library file name for a scene target.
 pub fn lib_file_name(name: &str) -> String {
     if cfg!(target_os = "windows") {
@@ -42,7 +61,7 @@ fn build(app: &AppHandle, project_root: &Path, profile: &str) -> Result<BuildOut
     scaffold::generate(project_root, &cfg, &sdk_root, &manifest, profile)?;
 
     let configure = || {
-        let mut c = Command::new("cmake");
+        let mut c = external_command("cmake");
         c.arg("--preset").arg(profile).current_dir(project_root);
         c
     };
@@ -65,7 +84,7 @@ fn build(app: &AppHandle, project_root: &Path, profile: &str) -> Result<BuildOut
         run_step(app, &mut configure())?;
     }
 
-    let mut compile = Command::new("cmake");
+    let mut compile = external_command("cmake");
     compile
         .arg("--build")
         .arg("--preset")
@@ -109,7 +128,7 @@ pub fn run(app: &AppHandle, project_root: &Path, profile: &str) -> Result<(), St
         &format!("$ {} {}\n", runtime.display(), args.join(" ")),
     );
 
-    Command::new(&runtime)
+    external_command(&runtime)
         .args(&args)
         .spawn()
         .map_err(|e| format!("failed to launch runtime {}: {e}", runtime.display()))?;
@@ -154,4 +173,26 @@ fn run_step(app: &AppHandle, cmd: &mut Command) -> Result<(), String> {
 
 fn emit(app: &AppHandle, text: &str) {
     let _ = app.emit("build-output", text.to_string());
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// The whole point of `external_command`: a child must not inherit the AppImage's
+    /// `LD_LIBRARY_PATH`, which is what made cmake load bundled libraries and crash.
+    #[test]
+    fn external_command_strips_the_loader_environment() {
+        std::env::set_var("LD_LIBRARY_PATH", "/appimage/bundled/lib");
+        std::env::set_var("LD_PRELOAD", "/appimage/bundled/preload.so");
+
+        let out = external_command("sh")
+            .args(["-c", "printf '%s|%s' \"${LD_LIBRARY_PATH-unset}\" \"${LD_PRELOAD-unset}\""])
+            .output()
+            .expect("sh should run");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "unset|unset");
+
+        std::env::remove_var("LD_LIBRARY_PATH");
+        std::env::remove_var("LD_PRELOAD");
+    }
 }
