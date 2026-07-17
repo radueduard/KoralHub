@@ -73,6 +73,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          # Stable key (not the per-job default) so the CI workflow's master build seeds a cache
+          # this tag-triggered job can restore — tag runs can only read their own ref or master.
+          shared-key: linux
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
@@ -136,6 +139,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          shared-key: macos
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
