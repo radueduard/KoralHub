@@ -1,23 +1,35 @@
-name: Release (Linux)
+name: Release
 
 # Cut a release by pushing a tag like `v0.1.0`: this builds the Linux bundles
-# (.deb, .rpm and AppImage) and attaches them to a *draft* GitHub Release for that tag,
-# which you then review and publish. Also runnable from the Actions tab (workflow_dispatch)
-# as a dry run — that produces a draft named after the branch.
+# (.deb, .rpm, AppImage) and the macOS bundle (a universal .dmg + .app), and
+# attaches them to a *draft* GitHub Release for that tag, which you then review
+# and publish.
 #
-# Linux only for now; macOS/Windows jobs can be added as a matrix once they're verified.
+# Also runnable from the Actions tab (workflow_dispatch):
+#   - Leave "tag" blank for a dry run — builds off the current branch into a draft
+#     named after the branch.
+#   - Set "tag" to an existing release (e.g. v0.1.0) to build and attach the macOS
+#     bundle to that already-published release. In this mode only the macOS job runs,
+#     so you can backfill a Mac build onto a release cut before this job existed.
 
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build & attach the macOS bundle to (e.g. v0.1.0). Blank = branch dry run."
+        required: false
+        default: ""
 
 permissions:
   contents: write # tauri-action creates the GitHub Release and uploads the bundles to it
 
 jobs:
   release-linux:
+    # Skipped when a "tag" input is supplied on a manual run — that mode is a macOS-only backfill.
+    if: ${{ github.event.inputs.tag == '' }}
     # 22.04 keeps the glibc floor low, so the bundles run on older distros too.
     runs-on: ubuntu-22.04
     steps:
@@ -80,3 +92,63 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: "--bundles deb,rpm,appimage"
+
+  release-macos:
+    # macos-14 is Apple Silicon. The universal-apple-darwin target cross-compiles the x86_64
+    # slice as well, so the single .dmg runs on both Apple Silicon and Intel Macs.
+    #
+    # Note: the app is *unsigned* (no Apple Developer cert is available in CI), so on first
+    # launch macOS Gatekeeper will warn. Users open it via right-click -> Open, or:
+    #   xattr -dr com.apple.quarantine "/Applications/Koral Hub.app"
+    runs-on: macos-14
+    steps:
+      - name: Resolve target tag
+        id: meta
+        # On a tag push this is the tag; on a manual run it's the "tag" input, falling back to
+        # the branch name for a dry run.
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the universal macOS bundle and attach it to the release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ steps.meta.outputs.tag }}
+          releaseName: "Koral Hub ${{ steps.meta.outputs.tag }}"
+          # If the release already exists (e.g. backfilling v0.1.0) tauri-action just appends the
+          # macOS assets and leaves its existing draft/prerelease state untouched.
+          releaseDraft: true
+          prerelease: false
+          args: "--target universal-apple-darwin"
