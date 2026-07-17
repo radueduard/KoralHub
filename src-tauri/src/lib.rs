@@ -11,6 +11,54 @@ mod project;
 mod scaffold;
 mod settings;
 
+/// Recover a usable `PATH` when launched from a GUI.
+///
+/// A `.app` opened from Finder/Dock — or an IDE that was itself opened that way, whose Run button
+/// then spawns us — inherits macOS's bare launchd `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`). That
+/// omits Homebrew, so `cmake`, the `ninja` it drives and the compiler all fail to launch with
+/// "No such file or directory", even though a terminal finds them fine. Rebuild `PATH` from the
+/// user's login shell (which sources their profile) plus a few well-known toolchain dirs as a
+/// backstop, and set it on our own process so every tool we spawn inherits it.
+///
+/// Unix-only; a Windows GUI process already gets the full system `PATH`.
+#[cfg(unix)]
+fn repair_path() {
+    use std::collections::HashSet;
+
+    // A login shell sources .zprofile/.zshenv (.bash_profile for bash), where Homebrew, rustup and
+    // friends put themselves on PATH. Non-interactive (`-lc`, not `-lic`) so a heavyweight .zshrc
+    // prompt can't hang startup; the backstop below covers anything only .zshrc would have added.
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let from_shell = std::process::Command::new(&shell)
+        .args(["-lc", "printf %s \"$PATH\""])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+
+    // Common toolchain locations, in case the shell probe failed or missed one. Homebrew first so
+    // cmake/ninja resolve here even when the profile never ran.
+    let extras = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin";
+    let current = std::env::var("PATH").unwrap_or_default();
+
+    // Merge in priority order (what we have, the shell's PATH, then the backstop), deduping while
+    // preserving order.
+    let mut seen = HashSet::new();
+    let mut dirs = Vec::new();
+    for source in [current.as_str(), from_shell.as_str(), extras] {
+        for dir in source.split(':').filter(|s| !s.is_empty()) {
+            if seen.insert(dir.to_owned()) {
+                dirs.push(dir);
+            }
+        }
+    }
+
+    if let Ok(joined) = std::env::join_paths(&dirs) {
+        std::env::set_var("PATH", joined);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // WebKitGTK's DMABUF renderer crashes on a number of Wayland setups (NVIDIA, and
@@ -21,6 +69,10 @@ pub fn run() {
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
+
+    // Must run before we spawn any external tool (cmake, ninja, the SDK runtime, an IDE).
+    #[cfg(unix)]
+    repair_path();
 
     // Debug builds load the Vite dev server (build.devUrl). When launched from an IDE's Run/Debug
     // button (a plain `cargo run`) nothing has started it, so start it ourselves and hold the
