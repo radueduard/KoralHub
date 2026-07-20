@@ -403,6 +403,19 @@ fn presets_json(
     if let Some(toolchain) = vcpkg_toolchain {
         cache.insert("CMAKE_TOOLCHAIN_FILE".into(), json!(toolchain));
     }
+    // Link the *release* C runtime even in Debug, on Windows only.
+    //
+    // MSVC cannot mix CRTs in one image, and the SDK publishes a single build of its vendored
+    // static libraries (`fmt.lib`, …) compiled against the release CRT. A Debug project would
+    // otherwise default to `/MDd` and fail to link with LNK2038 on both `RuntimeLibrary` and
+    // `_ITERATOR_DEBUG_LEVEL` — two faces of the same mismatch, since `/MD` leaves `_DEBUG`
+    // undefined and the iterator level follows it. Choosing `/MD` costs the debug heap and
+    // iterator debugging; optimisation and debug info are set by the build type and unaffected,
+    // so debugging still works. The real fix is for the SDK to ship a debug set of vendored
+    // libraries, at which point this goes away.
+    if cfg!(windows) {
+        cache.insert("CMAKE_MSVC_RUNTIME_LIBRARY".into(), json!("MultiThreadedDLL"));
+    }
 
     let mut configure = serde_json::Map::new();
     configure.insert("name".into(), json!(profile));
@@ -422,10 +435,95 @@ fn presets_json(
         "configurePresets": [configure],
         "buildPresets": [{
             "name": profile,
-            "configurePreset": profile
+            "configurePreset": profile,
+            // Multi-config generators ignore CMAKE_BUILD_TYPE and pick their own default
+            // (Debug), so without this a Release build silently produces Debug binaries.
+            // Single-config generators ignore it in turn, having already baked the type in.
+            "configuration": profile
         }]
     });
     serde_json::to_string_pretty(&doc).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest() -> FrameworkManifest {
+        FrameworkManifest {
+            name: "koral".into(),
+            version: "0.0.5".into(),
+            platform: "windows-x64".into(),
+            runtime: "bin/Koral_Runtime.exe".into(),
+            cmake_dir: "lib/cmake/Koral".into(),
+            vcpkg_baseline: String::new(),
+        }
+    }
+
+    fn presets(profile: &str) -> Value {
+        let sdk = Path::new("/sdk");
+        let text = presets_json(
+            sdk,
+            &manifest(),
+            profile,
+            None,
+            &sdk.join("bin/Koral_Runtime.exe"),
+            &None,
+        );
+        serde_json::from_str(&text).expect("presets must be valid JSON")
+    }
+
+    /// Multi-config generators (Visual Studio, and what Windows falls back to without Ninja)
+    /// ignore CMAKE_BUILD_TYPE, so the build preset has to name the configuration itself or a
+    /// Release build quietly produces Debug binaries.
+    #[test]
+    fn the_build_preset_names_its_configuration() {
+        for profile in ["Debug", "Release"] {
+            assert_eq!(
+                presets(profile)["buildPresets"][0]["configuration"], profile,
+                "{profile}"
+            );
+        }
+    }
+
+    /// The SDK ships its vendored static libraries built against the release CRT only, and MSVC
+    /// refuses to mix CRTs — a Debug build defaulting to /MDd fails with LNK2038.
+    #[test]
+    fn windows_pins_the_release_msvc_runtime() {
+        let cache = presets("Debug")["configurePresets"][0]["cacheVariables"].clone();
+        if cfg!(windows) {
+            assert_eq!(cache["CMAKE_MSVC_RUNTIME_LIBRARY"], "MultiThreadedDLL");
+        } else {
+            assert!(cache.get("CMAKE_MSVC_RUNTIME_LIBRARY").is_none());
+        }
+    }
+
+    /// A multi-config generator appends its configuration to the plain output-directory
+    /// variables, which is what put the library in `cmake-build-debug/Debug/` and left the Hub
+    /// and both IDE configs looking for something that wasn't there. Only the per-config
+    /// variables are honoured verbatim, so every configuration must set them.
+    #[test]
+    fn every_configuration_pins_a_flat_output_directory() {
+        let cfg = ProjectConfig::new("KoralProject", "0.0.5", [0.5, 0.5, 0.5], crate::model::Kind::Scene);
+        let text = cmakelists(&cfg.name, &cfg);
+
+        // The loop the per-config variables are set from must cover every configuration a
+        // preset can ask for — a missing one silently reverts to the nested layout.
+        let configs = text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("foreach(KORAL_CFG "))
+            .expect("the template should set output directories per configuration");
+        for want in ["DEBUG", "RELEASE", "RELWITHDEBINFO", "MINSIZEREL"] {
+            assert!(configs.contains(want), "{want} missing from `{configs}`");
+        }
+
+        for kind in ["RUNTIME", "LIBRARY", "ARCHIVE"] {
+            assert!(
+                text.contains(&format!("CMAKE_{kind}_OUTPUT_DIRECTORY_${{KORAL_CFG}}")),
+                "{kind} output directory is not pinned per configuration"
+            );
+        }
+    }
 }
 
 const CMAKELISTS_TEMPLATE: &str = r#"cmake_minimum_required(VERSION 3.28)
@@ -433,6 +531,23 @@ project({NAME} VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Put the scene library at the top of the build directory on every generator.
+#
+# Multi-config generators (Visual Studio, Xcode) otherwise append the configuration name, so the
+# library lands in `cmake-build-debug/Debug/` instead of `cmake-build-debug/`. Koral Hub, the
+# VS Code launch config and the CLion run config all name `<build dir>/<library>` directly, so
+# without this the build succeeds and then nothing can find what it produced. The per-config
+# variables are the ones that matter — a multi-config generator appends its subdirectory to the
+# plain `CMAKE_*_OUTPUT_DIRECTORY` but honours these verbatim.
+foreach(KORAL_CFG DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${KORAL_CFG} "${CMAKE_BINARY_DIR}")
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${KORAL_CFG} "${CMAKE_BINARY_DIR}")
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${KORAL_CFG} "${CMAKE_BINARY_DIR}")
+endforeach()
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 # The Koral SDK is located via CMAKE_PREFIX_PATH, which Koral Hub sets in the generated
 # preset. The imported target is expected to propagate the public glm/imgui/spdlog usage
