@@ -420,6 +420,7 @@ pub fn install(version: &str, mut progress: impl FnMut(u64, u64)) -> Result<Path
         } else {
             extract_tar_gz(&bytes, &staging)
         }?;
+        unwrap_single_root(&staging)?;
         prefer_system_vulkan(&staging);
         write_manifest(&staging, version, &platform, &release.asset_name)
     })();
@@ -450,22 +451,16 @@ pub fn ensure_installed(version: &str) -> Result<PathBuf, String> {
 
 // --- Unpacking --------------------------------------------------------------------------
 
-/// Both archive kinds wrap everything in a single top-level directory named after the archive
-/// (`koral-sdk-0.0.1-linux-x64/bin/...`). Strip it, so the SDK root *is* the install dir and
-/// paths in `framework.json` stay relative to something stable.
+/// Reduce an archive entry's path to a plain relative path, or `None` if it is not one.
 ///
-/// Returns `None` for the wrapper directory itself and for any entry that is not a plain
-/// relative path. Rejecting `..`/absolute components is what keeps an entry from escaping the
-/// install directory — the callers join this onto `dest` and write there directly, so this is
-/// the only containment check there is.
-fn strip_root(path: &Path) -> Option<PathBuf> {
+/// Rejecting `..`/absolute components is what keeps an entry from escaping the install
+/// directory — the callers join this onto `dest` and write there directly, so this is the only
+/// containment check there is.
+fn safe_path(path: &Path) -> Option<PathBuf> {
     use std::path::Component;
 
-    let mut parts = path.components();
-    parts.next()?; // discard the wrapper directory
-
     let mut rest = PathBuf::new();
-    for part in parts {
+    for part in path.components() {
         match part {
             Component::Normal(c) => rest.push(c),
             Component::CurDir => {}
@@ -474,6 +469,37 @@ fn strip_root(path: &Path) -> Option<PathBuf> {
         }
     }
     (!rest.as_os_str().is_empty()).then_some(rest)
+}
+
+/// Lift the contents of a lone top-level directory up into `dest`, so the SDK root *is* the
+/// install dir and paths in `framework.json` stay relative to something stable.
+///
+/// The archives disagree about whether they wrap: the tarballs nest everything under a
+/// directory named after the archive (`koral-sdk-0.0.5-linux-x64/bin/...`), while the Windows
+/// zip stores `bin/...` at the top. Unpacking verbatim and unwrapping afterwards handles both
+/// without having to guess from entry paths mid-extraction — an already-flat tree has more
+/// than one top-level entry (`bin`, `include`, `lib`), so it is left alone.
+fn unwrap_single_root(dest: &Path) -> Result<(), String> {
+    let mut entries = std::fs::read_dir(dest)
+        .map_err(|e| format!("failed to read {}: {e}", dest.display()))?
+        .flatten();
+    let (Some(only), None) = (entries.next(), entries.next()) else {
+        return Ok(()); // empty, or already flat
+    };
+    if !only.path().is_dir() {
+        return Ok(());
+    }
+
+    let wrapper = only.path();
+    for child in std::fs::read_dir(&wrapper)
+        .map_err(|e| format!("failed to read {}: {e}", wrapper.display()))?
+        .flatten()
+    {
+        let to = dest.join(child.file_name());
+        std::fs::rename(child.path(), &to)
+            .map_err(|e| format!("failed to move {} out of the archive wrapper: {e}", to.display()))?;
+    }
+    std::fs::remove_dir(&wrapper).map_err(|e| e.to_string())
 }
 
 fn extract_tar_gz(bytes: &[u8], dest: &Path) -> Result<(), String> {
@@ -494,14 +520,14 @@ fn extract_tar_gz(bytes: &[u8], dest: &Path) -> Result<(), String> {
             .path()
             .map_err(|e| format!("bad path in SDK archive: {e}"))?
             .into_owned();
-        let Some(relative) = strip_root(&path) else {
-            continue; // the wrapper directory, or an entry that refuses to sit under `dest`
+        let Some(relative) = safe_path(&path) else {
+            continue; // an entry that refuses to sit under `dest`
         };
         let target = dest.join(&relative);
 
-        // NOT `unpack_in`: that resolves the entry against its own archived path, which still
-        // carries the wrapper directory we just stripped, and would nest the tree under it.
-        // `unpack` writes exactly where it is told — `strip_root` is what keeps that in bounds.
+        // NOT `unpack_in`: it re-resolves the entry against its own archived path rather than
+        // the one we vetted. `unpack` writes exactly where it is told — `safe_path` is what
+        // keeps that in bounds.
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
@@ -525,7 +551,7 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<(), String> {
         let Some(path) = file.enclosed_name() else {
             return Err(format!("SDK archive contains an unsafe path: {}", file.name()));
         };
-        let Some(relative) = strip_root(&path) else {
+        let Some(relative) = safe_path(&path) else {
             continue;
         };
         let target = dest.join(&relative);
@@ -548,6 +574,72 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch() -> PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("koral-framework-test-{n}"))
+    }
+
+    fn zip_of(entries: &[&str]) -> Vec<u8> {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+        for entry in entries {
+            if let Some(dir) = entry.strip_suffix('/') {
+                w.add_directory(dir, opts).unwrap();
+            } else {
+                w.start_file(*entry, opts).unwrap();
+                std::io::Write::write_all(&mut w, b"x").unwrap();
+            }
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    /// The tarballs wrap everything in a directory named after the archive; the Windows zip
+    /// does not. Both must land with `bin/` directly under the install root — stripping a
+    /// component unconditionally left Windows installs with their files loose at the root and
+    /// no `bin/` at all.
+    #[test]
+    fn both_wrapped_and_flat_archives_unpack_to_the_same_root() {
+        let base = scratch();
+
+        for (case, entries) in [
+            ("wrapped", &["koral-sdk-0.0.5-windows-x64/bin/", "koral-sdk-0.0.5-windows-x64/bin/Koral_Runtime.exe"][..]),
+            ("flat", &["bin/", "bin/Koral_Runtime.exe", "include/", "include/api.h"][..]),
+        ] {
+            let dest = base.join(case);
+            std::fs::create_dir_all(&dest).unwrap();
+            extract_zip(&zip_of(entries), &dest).unwrap();
+            unwrap_single_root(&dest).unwrap();
+
+            assert!(
+                dest.join("bin/Koral_Runtime.exe").is_file(),
+                "{case}: runtime should sit at <root>/bin/"
+            );
+            assert_eq!(find_runtime(&dest).unwrap(), "bin/Koral_Runtime.exe", "{case}");
+        }
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Unwrapping keys off "exactly one top-level entry", so an archive that legitimately has
+    /// a single top-level *file* beside nothing must not be mistaken for a wrapper.
+    #[test]
+    fn unwrap_leaves_a_lone_top_level_file_alone() {
+        let dest = scratch();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("framework.json"), "{}").unwrap();
+
+        unwrap_single_root(&dest).unwrap();
+        assert!(dest.join("framework.json").is_file());
+
+        std::fs::remove_dir_all(&dest).ok();
+    }
 }
 
 // --- Vulkan loader ----------------------------------------------------------------------

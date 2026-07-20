@@ -1,16 +1,22 @@
 name: Release
 
 # Cut a release by pushing a tag like `v0.1.0`: this builds the Linux bundles
-# (.deb, .rpm, AppImage) and the macOS bundle (a universal .dmg + .app), and
-# attaches them to a *draft* GitHub Release for that tag, which you then review
-# and publish.
+# (.deb, .rpm, AppImage), the macOS bundle (a universal .dmg + .app) and the Windows
+# installers (.msi + NSIS .exe), and attaches them all to a *draft* GitHub Release for
+# that tag, which you then review and publish.
 #
-# Also runnable from the Actions tab (workflow_dispatch):
-#   - Leave "tag" blank for a dry run — builds off the current branch into a draft
-#     named after the branch.
-#   - Set "tag" to an existing release (e.g. v0.1.0) to build and attach the macOS
-#     bundle to that already-published release. In this mode only the macOS job runs,
-#     so you can backfill a Mac build onto a release cut before this job existed.
+# Also runnable from the Actions tab (workflow_dispatch), where the three inputs are
+# independent — *what* to build, *where* to put it, and *which* platforms:
+#   - "ref" is the code to build. Blank = the branch the run was started from.
+#   - "tag" is the release to attach the bundles to. Blank = a dry run drafting a
+#     release named after the ref. Naming an existing release appends to it, replacing
+#     any same-named assets already there and leaving its draft/prerelease state alone.
+#   - "platforms" restricts which build jobs run.
+#
+# Together those cover backfilling a platform onto an older release (ref + tag both set
+# to that tag) and re-cutting one platform's bundles from newer code (ref = branch,
+# tag = the release). Note the second case leaves that platform's binaries ahead of what
+# the tag points at, which is only reasonable for a fix that platform alone needs.
 
 on:
   push:
@@ -18,23 +24,53 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Existing release tag to build & attach the macOS bundle to (e.g. v0.1.0). Blank = branch dry run."
+      ref:
+        description: "Branch, tag or SHA to build. Blank = the branch this run was started from."
         required: false
         default: ""
+      tag:
+        description: "Release tag to attach the bundles to (e.g. v0.1.0). Blank = dry run named after the ref."
+        required: false
+        default: ""
+      platforms:
+        description: "Which platforms to build"
+        required: false
+        type: choice
+        default: all
+        options: [all, linux, macos, windows]
 
 permissions:
   contents: write # tauri-action creates the GitHub Release and uploads the bundles to it
 
 jobs:
+  # Resolve the ref and tag once, so the build jobs agree on them and a tag push (where the
+  # dispatch inputs are absent) falls back to behaving exactly as it always has.
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.resolve.outputs.ref }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - id: resolve
+        run: |
+          REF="${{ github.event.inputs.ref }}"
+          [ -z "$REF" ] && REF="${{ github.ref_name }}"
+          TAG="${{ github.event.inputs.tag }}"
+          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
   release-linux:
-    # Skipped when a "tag" input is supplied on a manual run — that mode is a macOS-only backfill.
-    if: ${{ github.event.inputs.tag == '' }}
+    needs: meta
+    # The input is null on a tag push, which falls through to "all" — a tag builds everything.
+    if: ${{ contains(fromJSON('["all", "linux"]'), github.event.inputs.platforms || 'all') }}
     # 22.04 keeps the glibc floor low, so the bundles run on older distros too.
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.ref }}
 
       # Tauri v2's Linux webview + bundling toolchain. webkit2gtk-4.1 is the v2 webview;
       # patchelf + file are needed to build the AppImage. libgit2 and OpenSSL are vendored by
@@ -90,13 +126,15 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: "1"
           NO_STRIP: "true"
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Koral Hub ${{ github.ref_name }}"
+          tagName: ${{ needs.meta.outputs.tag }}
+          releaseName: "Koral Hub ${{ needs.meta.outputs.tag }}"
           releaseDraft: true
           prerelease: false
           args: "--bundles deb,rpm,appimage"
 
   release-macos:
+    needs: meta
+    if: ${{ contains(fromJSON('["all", "macos"]'), github.event.inputs.platforms || 'all') }}
     # macos-14 is Apple Silicon. The universal-apple-darwin target cross-compiles the x86_64
     # slice as well, so the single .dmg runs on both Apple Silicon and Intel Macs.
     #
@@ -105,19 +143,10 @@ jobs:
     #   xattr -dr com.apple.quarantine "/Applications/Koral Hub.app"
     runs-on: macos-14
     steps:
-      - name: Resolve target tag
-        id: meta
-        # On a tag push this is the tag; on a manual run it's the "tag" input, falling back to
-        # the branch name for a dry run.
-        run: |
-          TAG="${{ github.event.inputs.tag }}"
-          [ -z "$TAG" ] && TAG="${{ github.ref_name }}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ steps.meta.outputs.tag }}
+          ref: ${{ needs.meta.outputs.ref }}
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -149,8 +178,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ steps.meta.outputs.tag }}
-          releaseName: "Koral Hub ${{ steps.meta.outputs.tag }}"
+          tagName: ${{ needs.meta.outputs.tag }}
+          releaseName: "Koral Hub ${{ needs.meta.outputs.tag }}"
           # If the release already exists (e.g. backfilling v0.1.0) tauri-action just appends the
           # macOS assets and leaves its existing draft/prerelease state untouched.
           releaseDraft: true
@@ -158,15 +187,16 @@ jobs:
           args: "--target universal-apple-darwin"
 
   release-windows:
-    # Skipped on a "tag" backfill run, same as Linux — that mode is macOS-only.
-    if: ${{ github.event.inputs.tag == '' }}
-    #
+    needs: meta
+    if: ${{ contains(fromJSON('["all", "windows"]'), github.event.inputs.platforms || 'all') }}
     # Note: the installers are *unsigned* (no code-signing cert in CI), so SmartScreen shows a
     # "Windows protected your PC" prompt on first run. Users click More info -> Run anyway.
     runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.ref }}
 
       # No system-dependency step: WebView2 ships with Windows 10/11 (and tauri-action's bundler
       # embeds a bootstrapper for older machines), and the runner already has MSVC and cmake for
@@ -199,8 +229,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Koral Hub ${{ github.ref_name }}"
+          tagName: ${{ needs.meta.outputs.tag }}
+          releaseName: "Koral Hub ${{ needs.meta.outputs.tag }}"
           releaseDraft: true
           prerelease: false
           # Both installer flavours: .msi for managed/enterprise deploys, NSIS .exe for the
