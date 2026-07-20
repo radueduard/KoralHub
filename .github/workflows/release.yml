@@ -156,3 +156,53 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: "--target universal-apple-darwin"
+
+  release-windows:
+    # Skipped on a "tag" backfill run, same as Linux — that mode is macOS-only.
+    if: ${{ github.event.inputs.tag == '' }}
+    #
+    # Note: the installers are *unsigned* (no code-signing cert in CI), so SmartScreen shows a
+    # "Windows protected your PC" prompt on first run. Users click More info -> Run anyway.
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # No system-dependency step: WebView2 ships with Windows 10/11 (and tauri-action's bundler
+      # embeds a bootstrapper for older machines), and the runner already has MSVC and cmake for
+      # the vendored libgit2. git2 uses WinHTTP here rather than OpenSSL, so nothing to build there.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          shared-key: windows
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the Windows installers and attach them to the release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Koral Hub ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false
+          # Both installer flavours: .msi for managed/enterprise deploys, NSIS .exe for the
+          # ordinary double-click install.
+          args: "--bundles msi,nsis"

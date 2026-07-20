@@ -61,13 +61,27 @@ fn repair_path() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // WebKitGTK's DMABUF renderer crashes on a number of Wayland setups (NVIDIA, and
-    // several compositors) with "Error 71 (Protocol error) dispatching to Wayland display",
-    // killing the app before the window appears. Fall back to the plain renderer. Must be
-    // set before the webview initializes, so it lives at the very top of run().
+    // Two WebKitGTK GPU paths have to be defused before the webview initializes, so both live at
+    // the very top of run(). Each is skipped when already set, so a machine that does better on
+    // the accelerated path can opt back in.
+    //
+    //  - DMABUF renderer: crashes on a number of Wayland setups (NVIDIA, and several compositors)
+    //    with "Error 71 (Protocol error) dispatching to Wayland display", killing the app before
+    //    the window appears.
+    //  - Accelerated compositing: when WebKit cannot get an EGL context it does not fall back to
+    //    software, it just paints nothing — the window opens blank/white and stays that way. This
+    //    is what the v0.1.0 AppImage hit: the bundle carries its own webkit/GL stack, which fails
+    //    to initialize EGL against a host Mesa it wasn't built against. Disabling compositing
+    //    routes rendering through the software path. The Hub's UI is plain DOM, so that costs
+    //    nothing noticeable.
     #[cfg(target_os = "linux")]
-    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    for (key, value) in [
+        ("WEBKIT_DISABLE_DMABUF_RENDERER", "1"),
+        ("WEBKIT_DISABLE_COMPOSITING_MODE", "1"),
+    ] {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+        }
     }
 
     // Must run before we spawn any external tool (cmake, ninja, the SDK runtime, an IDE).
