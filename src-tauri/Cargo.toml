@@ -1,6 +1,6 @@
 [package]
 name = "koral-hub"
-version = "0.2.1"
+version = "0.3.0"
 description = "Koral Hub — create, manage and run Koral projects"
 authors = ["radue"]
 edition = "2021"
