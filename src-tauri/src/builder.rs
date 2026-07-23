@@ -50,33 +50,6 @@ pub(crate) fn external_command(program: impl AsRef<std::ffi::OsStr>) -> Command 
     cmd
 }
 
-/// Choose the Linux windowing backend for a launched runtime by setting the environment variables
-/// the common toolkits honour. `"wayland"` / `"x11"` force that backend; anything else (the default)
-/// leaves the child to inherit the session's own choice. Only the child is affected — never the Hub.
-#[cfg(target_os = "linux")]
-fn apply_display_backend(cmd: &mut CommandBuilder, backend: &str) {
-    match backend.trim() {
-        "wayland" => {
-            cmd.env("SDL_VIDEODRIVER", "wayland");
-            cmd.env("WINIT_UNIX_BACKEND", "wayland");
-            cmd.env("GDK_BACKEND", "wayland");
-            cmd.env("QT_QPA_PLATFORM", "wayland");
-        }
-        "x11" => {
-            cmd.env("SDL_VIDEODRIVER", "x11");
-            cmd.env("WINIT_UNIX_BACKEND", "x11");
-            cmd.env("GDK_BACKEND", "x11");
-            cmd.env("QT_QPA_PLATFORM", "xcb");
-            // Removing WAYLAND_DISPLAY is *not* enough: GLFW/SDL/winit fall back to the default
-            // `wayland-0` socket when it's unset and still land on Wayland. Pointing it at an empty
-            // name makes the Wayland connection fail outright, so they fall back to X11 (XWayland) —
-            // the only env-only way to force X11 from inside a Wayland session. The Hub is untouched.
-            cmd.env("WAYLAND_DISPLAY", "");
-        }
-        _ => {}
-    }
-}
-
 /// Platform-specific shared-library file name for a scene target.
 pub fn lib_file_name(name: &str) -> String {
     if cfg!(target_os = "windows") {
@@ -188,15 +161,12 @@ pub fn run(app: &AppHandle, project_root: &Path, profile: &str) -> Result<(), St
     cmd.args(&args);
     cmd.env("TERM", "xterm-256color");
     // Match `external_command`: don't hand the app the Hub's bundled-library loader environment.
+    // The Linux windowing backend is not set here — it rides in as the runtime's `--platform` flag
+    // (see `runtime_args`), and so is already visible in the launch line printed above.
     #[cfg(target_os = "linux")]
     {
         cmd.env_remove("LD_LIBRARY_PATH");
         cmd.env_remove("LD_PRELOAD");
-        let backend = crate::settings::load().display_backend;
-        if !backend.trim().is_empty() {
-            emit_run(app, &format!("[forcing {} display backend]\n", backend.trim()));
-        }
-        apply_display_backend(&mut cmd, &backend);
     }
 
     let mut child = pair
@@ -249,9 +219,28 @@ pub fn run(app: &AppHandle, project_root: &Path, profile: &str) -> Result<(), St
 /// neither of them carries the settings. Flags still exist on the runtime (`--width`, `--api`, …)
 /// and still override the file — they are for a one-off run, not for wiring a project up.
 ///
+/// The one exception is the Linux windowing backend: which windowing system the app opens on is a
+/// per-machine fact, so it cannot live in the portable `koral.json` (which defaults `platform` to
+/// `auto`). When the user has pinned one, the Hub rides it in as the runtime's own `--platform`
+/// flag — not by setting SDL/Qt/GTK environment variables, which this GLFW-based runtime never read.
+/// Emitting it here rather than only on the Hub's ▶ is deliberate: it keeps a Run from CLion or
+/// VS Code opening on the same backend, since they launch this exact command.
+///
 /// Shared with `scaffold`.
 pub fn runtime_args(lib: &Path) -> Vec<String> {
-    vec![lib.to_string_lossy().into_owned()]
+    let mut args = vec![lib.to_string_lossy().into_owned()];
+    #[cfg(target_os = "linux")]
+    {
+        // `""` means "no preference" (leave `platform` at the config's `auto`); `"x11"` / `"wayland"`
+        // are exactly the runtime's `--platform` values, so no translation is needed.
+        let backend = crate::settings::load().display_backend;
+        let backend = backend.trim();
+        if !backend.is_empty() {
+            args.push("--platform".into());
+            args.push(backend.to_string());
+        }
+    }
+    args
 }
 
 /// Run one child process to completion, forwarding its stdout+stderr to the UI. Errors if

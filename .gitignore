@@ -10,3 +10,7 @@ dist-ssr/
 *.local
 .idea/
 .vscode/
+
+# Runtime layout dumped into the Hub's cwd by an older SDK. The current runtime writes imgui.ini
+# beside each project's koral.json, so it no longer lands here — this just keeps stragglers out.
+imgui.ini

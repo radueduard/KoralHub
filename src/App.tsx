@@ -98,6 +98,8 @@ type ProjectConfig = {
   frameworkVersion: string;
   rendering: {
     api: "Vulkan" | "OpenGL";
+    // Linux windowing system the Scene opens on; ignored on other platforms. Editable below.
+    platform: "auto" | "x11" | "wayland";
     window: {
       width: number;
       height: number;
@@ -106,6 +108,9 @@ type ProjectConfig = {
       borderless: boolean;
       transparent: boolean;
       vsync: boolean;
+      // Where ImGui saves its layout. Not edited in the UI — carried through so a save never drops
+      // it — a user relocates it by hand in koral.json.
+      imguiIni?: string;
     };
   };
   // Search lists, not single folders: a project can keep its own assets/ and also pull from a
@@ -2703,6 +2708,30 @@ export default function App() {
                   <option value="OpenGL">OpenGL</option>
                 </select>
               </label>
+              {/* A Scene's windowing system on Linux. Ignored on Windows/macOS, so only shown there;
+                  a Job has no window. `auto` lets the runtime (GLFW) choose. Note OpenGL always runs
+                  on X11/XWayland — a Wayland choice with OpenGL is ignored by the runtime. */}
+              <Show when={isLinux && draft.cfg!.kind === "Scene"}>
+                <label class="field">
+                  <span class="field-label">Windowing (Linux)</span>
+                  <select
+                    class="input"
+                    value={draft.cfg!.rendering.platform ?? "auto"}
+                    onChange={(e) =>
+                      setDraft(
+                        "cfg",
+                        "rendering",
+                        "platform",
+                        e.currentTarget.value as "auto" | "x11" | "wayland",
+                      )
+                    }
+                  >
+                    <option value="auto">Auto (GLFW default)</option>
+                    <option value="wayland">Wayland</option>
+                    <option value="x11">X11</option>
+                  </select>
+                </label>
+              </Show>
             </div>
 
             <Show

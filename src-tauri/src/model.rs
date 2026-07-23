@@ -46,6 +46,11 @@ pub struct ProjectConfig {
 impl ProjectConfig {
     pub const SCHEMA_VERSION: u32 = 1;
 
+    /// A fresh project pins ImGui's layout file to the project root, matching the runtime's own
+    /// default location. Written explicitly so it is visible in `koral.json` — the one place a user
+    /// changes it, since the Hub does not expose it in the UI.
+    pub const DEFAULT_IMGUI_INI: &str = "imgui.ini";
+
     /// A fresh project: default rendering settings, and **no** external packages.
     pub fn new(
         name: impl Into<String>,
@@ -53,13 +58,15 @@ impl ProjectConfig {
         color: [f32; 3],
         kind: Kind,
     ) -> Self {
+        let mut rendering = Rendering::default();
+        rendering.window.imgui_ini = Self::DEFAULT_IMGUI_INI.to_string();
         Self {
             schema_version: Self::SCHEMA_VERSION,
             name: name.into(),
             color,
             framework_version: framework_version.into(),
             kind,
-            rendering: Rendering::default(),
+            rendering,
             paths: Paths::default(),
             libraries: Vec::new(),
         }
@@ -165,12 +172,21 @@ pub const SDK_PROVIDED_PORTS: &[&str] = &["glm", "imgui", "spdlog", "fmt"];
 #[serde(rename_all = "camelCase")]
 pub struct Rendering {
     pub api: Api,
+    /// Linux windowing system a Scene opens on; ignored on Windows and macOS. The runtime turns
+    /// this into a GLFW init hint before `glfwInit()` — `auto` keeps GLFW's own choice (Wayland
+    /// when a Wayland session is present, X11 otherwise). OpenGL always runs on X11/XWayland
+    /// regardless, so a `wayland` request there is ignored by the runtime with a warning.
+    ///
+    /// A per-machine `--platform` override still rides in on the launch (see `builder::runtime_args`)
+    /// and wins over this; this is the project's committed default, editable in the settings panel.
+    #[serde(default)]
+    pub platform: Platform,
     pub window: Window,
 }
 
 impl Default for Rendering {
     fn default() -> Self {
-        Self { api: Api::Vulkan, window: Window::default() }
+        Self { api: Api::Vulkan, platform: Platform::default(), window: Window::default() }
     }
 }
 
@@ -178,6 +194,18 @@ impl Default for Rendering {
 pub enum Api {
     OpenGL,
     Vulkan,
+}
+
+/// Linux windowing system, spelled exactly as the runtime's `rendering.platform` / `--platform`
+/// accepts it. Serialized lowercase (`auto` / `x11` / `wayland`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Platform {
+    /// Let GLFW pick, matching the runtime's own default.
+    #[default]
+    Auto,
+    X11,
+    Wayland,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +221,13 @@ pub struct Window {
     /// existed get the same behaviour they had.
     #[serde(default = "default_true")]
     pub vsync: bool,
+    /// Where Dear ImGui persists its layout (window positions, docking), project-relative — the
+    /// runtime resolves it against `koral.json`'s directory. A fresh project pins it to `imgui.ini`
+    /// at the project root; empty means the runtime's own default, which is that same file. The Hub
+    /// carries whatever is here through untouched and does not edit it in the UI: relocating the
+    /// layout file is a hand edit. Skipped when empty so older projects are not churned.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub imgui_ini: String,
 }
 
 fn default_true() -> bool {
@@ -209,6 +244,9 @@ impl Default for Window {
             borderless: false,
             transparent: false,
             vsync: true,
+            // Empty by default so loading an older project that lacks the key does not invent one;
+            // a *fresh* project pins it explicitly in `ProjectConfig::new`.
+            imgui_ini: String::new(),
         }
     }
 }
