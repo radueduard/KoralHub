@@ -144,7 +144,8 @@ fn github_token() -> Option<&'static str> {
             }
             // The Hub is usually launched from a desktop shortcut with no environment to
             // speak of, so the env vars alone would almost never hit. Ask `gh` instead.
-            let out = std::process::Command::new("gh")
+            // Via `external_command` so it doesn't flash a console window on Windows.
+            let out = crate::builder::external_command("gh")
                 .args(["auth", "token"])
                 .output()
                 .ok()?;

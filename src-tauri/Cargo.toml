@@ -37,6 +37,7 @@ tauri-plugin-dialog = "2"
 # Vendoring OpenSSL only for Unix keeps the Windows build from having to compile OpenSSL from
 # source (Perl/NASM) for a transport it never uses.
 git2 = { version = "0.19", default-features = false, features = ["https", "vendored-libgit2"] }
+portable-pty = "0.9.0"
 
 # OpenSSL, vendored, is libgit2's HTTPS backend on Unix. Windows uses WinHTTP instead, so OpenSSL
 # is neither pulled in nor built there. Cargo unions these features with the base git2 above.

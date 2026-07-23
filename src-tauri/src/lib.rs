@@ -1,4 +1,6 @@
+mod auth;
 mod builder;
+mod collection;
 mod commands;
 #[cfg(debug_assertions)]
 mod dev_server;
@@ -102,6 +104,23 @@ pub fn run() {
             commands::create_project,
             commands::import_project,
             commands::remove_project,
+            commands::list_collections,
+            commands::add_collection,
+            commands::remove_collection,
+            commands::download_lab,
+            commands::list_authored_collections,
+            commands::create_collection,
+            commands::add_lab_to_collection,
+            commands::add_project_to_collection,
+            commands::remove_lab_from_collection,
+            commands::reorder_lab_in_collection,
+            commands::remove_authored_collection,
+            commands::device_login_start,
+            commands::open_url,
+            commands::list_accounts,
+            commands::sign_out,
+            commands::publish_collection,
+            commands::publish_project,
             commands::default_project_location,
             commands::settings,
             commands::save_settings,

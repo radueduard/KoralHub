@@ -107,13 +107,14 @@
 /* The round icon buttons on a project card sit in one row, so they share their box metrics —
    only colour distinguishes them. Diverging sizes here read as a misalignment bug. */
 .btn-play,
+.btn-build,
 .btn-icon {
   background: transparent;
   border-radius: 50%;
-  width: 34px;
-  height: 34px;
+  width: 38px;
+  height: 38px;
   padding: 0;
-  font-size: 13px;
+  font-size: 17px;
   line-height: 1;
   display: grid;
   place-items: center;
@@ -136,6 +137,26 @@
   background: var(--bg-card-hover);
 }
 
+/* The hammer build button — same round metrics as ▶ (shared above), sitting just left of it.
+   Neutral until hovered so ▶ stays the primary action. */
+.btn-build {
+  color: var(--text-dim);
+}
+.btn-build:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--bg-card-hover);
+}
+.btn-build:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+/* Monochrome via currentColor; mirrored so the head faces the same way as the ▶ beside it. */
+.hammer-icon {
+  width: 18px;
+  height: 18px;
+  transform: scaleX(-1);
+}
+
 /* Destructive actions only — the neutral .btn-icon hover must not look like a delete. */
 .btn-danger:hover {
   color: #e05555;
@@ -151,10 +172,11 @@
   background: var(--overlay);
 }
 
+/* Compact pill buttons that share a row with cards' icon buttons — kept vertically centred (no
+   align-self override) so they line up with the round .btn-icon / .btn-play beside them. */
 .btn-small {
-  padding: 4px 10px;
-  font-size: 12px;
-  align-self: flex-start;
+  padding: 7px 14px;
+  font-size: 13px;
 }
 
 /* One entry of a search list: the path, then reorder and remove. */
@@ -191,11 +213,35 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 16px;
+  padding: 4px 8px 4px 16px;
   font-size: 12px;
   font-weight: 600;
   color: var(--text-dim);
   border-bottom: 1px solid var(--border);
+}
+
+/* Build / Output tabs inside the console header. */
+.console-tabs {
+  display: flex;
+  gap: 2px;
+}
+.console-tab {
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-faint);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+.console-tab:hover {
+  color: var(--text-dim);
+}
+.console-tab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
 }
 
 .console-body {
@@ -409,6 +455,369 @@
   height: 6px;
 }
 
+/* --- Tabs --- */
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  position: relative;
+  padding: 10px 16px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  /* Sit on top of the row's bottom border so the active underline replaces it. */
+  margin-bottom: -1px;
+  border-bottom: 2px solid transparent;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+.tab:hover {
+  color: var(--text);
+}
+.tab-active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+/* --- Lab collections --- */
+/* A heading with a trailing action (Add collection) on the same baseline. The section-title keeps
+   its own bottom margin, so the row that holds it must not add another. */
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.section-head .section-title {
+  margin-bottom: 0;
+}
+.section-head + * {
+  margin-top: 20px;
+}
+
+.collection-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 32px;
+}
+
+.collection-card {
+  padding: 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+/* Authored collections are list items rather than <section>s; keep the card look. */
+li.collection-card {
+  list-style: none;
+}
+
+/* Intro copy above the authored list. It also carries .field-hint, whose negative top margin
+   (meant for hints tucked under a form label) would otherwise pull this up into the title — so
+   raise specificity here to reinstate a normal top gap and separation from the cards below. */
+p.collections-blurb {
+  margin: 6px 0 18px;
+}
+
+.collection-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* Chevron that folds a collection card. Sits flush-left of the title; a hair smaller than the
+   card's danger button so it reads as a disclosure control, not a primary action. */
+.collapse-toggle {
+  width: 30px;
+  height: 30px;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.collapse-toggle:hover {
+  color: var(--text);
+  background: var(--bg-card-hover);
+}
+/* The whole title block toggles too — hint that with a pointer, and keep the fold obvious. */
+.collection-meta {
+  cursor: pointer;
+}
+.collection-card.collapsed .collection-head {
+  /* No body follows when folded; drop the head's reliance on card padding for bottom breathing. */
+  margin: 0;
+}
+
+/* The source of a collection (its git URL, or an authored one's local path) — the extra locating
+   detail. Monospace and dim so it stays secondary to the title/description. */
+.collection-source {
+  margin-top: 3px;
+  font-family: "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Lab-count pill on an authored collection, matching the framework/kind pills. */
+.collection-count {
+  flex-shrink: 0;
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
+.collection-meta {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.collection-title {
+  font-weight: 700;
+  font-size: 15px;
+}
+
+.collection-sub {
+  color: var(--text-faint);
+  font-size: 12.5px;
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The card owns its error, so drop the list-spacing margin and give it a little breathing room. */
+.collection-card .error {
+  margin: 12px 0 0;
+}
+
+/* The member projects of an authored collection, listed under the card head with reorder/remove. */
+.collection-empty {
+  margin: 14px 0 0;
+}
+.member-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.member-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 8px;
+  border-radius: 8px;
+}
+.member-row:hover {
+  background: var(--bg-card-hover);
+}
+.member-index {
+  flex: none;
+  width: 18px;
+  text-align: center;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+}
+.member-meta {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+.member-name {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.member-sub {
+  margin-top: 1px;
+  font-size: 12px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.member-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+/* Row controls are a touch smaller than a project card's icon buttons. */
+.member-actions .btn-icon {
+  width: 30px;
+  height: 30px;
+  font-size: 15px;
+}
+
+.lab-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.lab-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 11px 2px;
+  border-bottom: 1px solid var(--border);
+}
+.lab-row:last-child {
+  border-bottom: none;
+}
+
+.lab-meta {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.lab-name {
+  font-weight: 600;
+  font-size: 13.5px;
+}
+
+.lab-desc {
+  color: var(--text-faint);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+/* Ordinal for a project inside an imported collection — matches the authored .member-index. */
+.lab-index {
+  flex: none;
+  width: 18px;
+  text-align: center;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+}
+
+/* Where the project's repo lives — the extra "information on their projects" the header asked for. */
+.lab-repo {
+  margin-top: 3px;
+  font-family: "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
+  font-size: 11px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* "Downloaded" flag beside a project already on disk. Quiet green so it informs without shouting. */
+.lab-badge {
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  vertical-align: middle;
+  color: var(--play);
+  background: rgba(26, 200, 26, 0.12);
+}
+
+/* --- Accounts (sign-in) --- */
+.modal-divider {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 6px 0 2px;
+}
+
+.account-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.account-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.account-meta {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.account-name {
+  font-weight: 600;
+  font-size: 13px;
+}
+.account-host {
+  color: var(--text-faint);
+  font-weight: 400;
+}
+.account-provider {
+  color: var(--text-faint);
+  font-size: 11px;
+  text-transform: uppercase;
+  margin-top: 2px;
+}
+
+/* Rows of sign-in controls (a bare button, or the GitLab host input + button). */
+.account-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.account-host-input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The big, copyable user code in the device-flow dialog. */
+.device-code {
+  align-self: center;
+  padding: 12px 20px;
+  font-family: "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 4px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  user-select: all;
+}
+
+/* A URL shown for the user to open/copy — selectable, wrapping, never overflowing the dialog. */
+.device-uri {
+  display: block;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  user-select: all;
+  overflow-wrap: anywhere;
+}
+
 /* --- New-project dialog --- */
 .modal-scrim {
   position: fixed;
@@ -432,6 +841,23 @@
   border-radius: 12px;
   background: var(--bg-elevated);
   box-shadow: var(--shadow);
+}
+
+/* A modal whose content can exceed the viewport (Settings): cap its height and let the middle
+   scroll, so the title stays at the top and the Cancel/Save row stays pinned at the bottom. */
+.modal-tall {
+  max-height: calc(100vh - 48px);
+}
+.modal-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  /* Keep focus rings and the divider off the scrollbar edge. */
+  padding-right: 10px;
+  margin-right: -10px;
 }
 
 .modal-title {
@@ -505,6 +931,95 @@
   margin-bottom: 0;
 }
 
+/* --- Add-project dialog: mode toggle + project picker --- */
+.segmented {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+.segmented button {
+  flex: 1;
+  padding: 6px 10px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.segmented button:hover {
+  color: var(--text);
+}
+.segmented button.active {
+  color: var(--text);
+  background: var(--bg-card-hover);
+}
+
+/* Scrollable radio list of the user's projects, one selectable per add. */
+.project-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.pick-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.pick-row:hover {
+  background: var(--bg-card-hover);
+}
+.pick-row.selected {
+  background: var(--bg-card-hover);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.pick-row input[type="radio"] {
+  accent-color: var(--accent);
+  flex: none;
+}
+.pick-meta {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+.pick-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+.pick-sub {
+  color: var(--text-faint);
+  font-size: 11.5px;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pick-tag {
+  flex: none;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+  padding: 2px 7px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+}
+
 /* Drafts are only installable by whoever can see them (a signed-in maintainer), so they
    should never be mistaken for a normal release. */
 .fw-tag-draft {
@@ -520,10 +1035,83 @@
 }
 
 .btn-ide {
-  padding: 6px 10px;
-  font-size: 12px;
-  font-weight: 500;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 600;
   white-space: nowrap;
+}
+
+/* --- Project card "more actions" (⋮) menu --- */
+.menu-wrap {
+  position: relative;
+  flex: none;
+}
+/* Keep the trigger looking active while its menu is open. */
+.btn-icon.menu-open {
+  color: var(--text);
+  background: var(--bg-card-hover);
+}
+/* A viewport-filling catcher so a click anywhere else closes the menu. */
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+.card-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 50;
+  min-width: 190px;
+  display: flex;
+  flex-direction: column;
+  padding: 6px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+}
+.menu-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 10px 8px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+.menu-info-branch {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.menu-info-remote {
+  max-width: 220px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.menu-item {
+  text-align: left;
+  padding: 9px 10px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.menu-item:hover {
+  background: var(--bg-card-hover);
+}
+.menu-danger {
+  color: var(--danger);
+}
+.menu-danger:hover {
+  background: rgba(224, 85, 85, 0.12);
 }
 
 /* --- Run settings panel --- */

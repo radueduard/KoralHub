@@ -217,7 +217,7 @@ public:
     void Initialize() override;
     void Update() override;
     void Render(kor::CommandBuffer& commandBuffer) override;
-    void RenderUI(ImGuiContext* context) override;
+    void RenderUI() override;
 };
 "#;
 
@@ -240,7 +240,7 @@ void {NAME}::Render(kor::CommandBuffer& commandBuffer)
         .EndRendering();
 }
 
-void {NAME}::RenderUI(ImGuiContext* context)
+void {NAME}::RenderUI()
 {
     // TODO: define the scene UI
 }

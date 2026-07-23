@@ -30,6 +30,9 @@ pub struct Settings {
     pub default_ide: String,
     /// Framework version new projects target. Empty → newest installed, else the fallback.
     pub default_framework_version: String,
+    /// Linux only: windowing backend a launched app should use — `"wayland"`, `"x11"`, or empty for
+    /// the session default. Ignored on other platforms.
+    pub display_backend: String,
 }
 
 pub fn load() -> Settings {

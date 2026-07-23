@@ -6,7 +6,9 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
+use crate::auth::{self, AccountView, DeviceLogin, Provider};
 use crate::builder;
+use crate::collection::{self, CollectionManifest};
 use crate::framework::{self, AvailableFramework, InstalledFramework};
 use crate::git::{self, GitInfo};
 use crate::ide;
@@ -158,6 +160,426 @@ pub fn remove_project(path: String, delete_files: bool) -> Result<(), String> {
 #[tauri::command]
 pub fn project_config(path: String) -> Result<ProjectConfig, String> {
     project::load(Path::new(&path))
+}
+
+/// A subscribed lab collection as shown in the UI: its source URL, plus *either* the fetched
+/// manifest or the error fetching it produced. Carrying the error per-collection is deliberate —
+/// one unreachable or malformed collection must not blank out the others.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionView {
+    pub url: String,
+    pub manifest: Option<CollectionManifest>,
+    pub error: Option<String>,
+}
+
+impl CollectionView {
+    fn fetched(url: String) -> Self {
+        match collection::fetch(&url) {
+            Ok(manifest) => CollectionView { url, manifest: Some(manifest), error: None },
+            Err(e) => CollectionView { url, manifest: None, error: Some(e) },
+        }
+    }
+}
+
+/// Every collection the user has added, each re-fetched now. Hits the network once per collection;
+/// a slow or offline one surfaces as that collection's `error`, not as a failed command.
+#[tauri::command]
+pub fn list_collections() -> Vec<CollectionView> {
+    collection::subscribed_urls()
+        .into_iter()
+        .map(CollectionView::fetched)
+        .collect()
+}
+
+/// Add a collection by URL and return its freshly-fetched view.
+///
+/// Validates by fetching *before* remembering it: a URL that yields no manifest is not a
+/// collection, and persisting it would only add a permanently-broken row to the list.
+#[tauri::command]
+pub fn add_collection(url: String) -> Result<CollectionView, String> {
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Err("enter a collection URL".into());
+    }
+    let manifest = collection::fetch(&url)?;
+    collection::add(&url)?;
+    Ok(CollectionView { url, manifest: Some(manifest), error: None })
+}
+
+/// Forget a collection. Labs already downloaded from it are untouched — they are ordinary projects
+/// now, with no link back to the collection they came from.
+#[tauri::command]
+pub fn remove_collection(url: String) -> Result<(), String> {
+    collection::remove(&url)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadLabRequest {
+    /// HTTPS git URL of the lab's repository.
+    pub url: String,
+    /// Parent folder; the lab lands in `location/<repo-name>` as a fresh project.
+    pub location: String,
+}
+
+/// Download a lab into `location` as a fresh project, and add it to the recent list.
+///
+/// Blocking: clones on the command thread while the UI shows a pending state, exactly like
+/// [`import_project`]. The difference is the result — a lab download drops the upstream history so
+/// the copy is the student's own (see `collection::download_lab`).
+#[tauri::command]
+pub fn download_lab(req: DownloadLabRequest) -> Result<RecentProject, String> {
+    let (root, cfg) = collection::download_lab(&req.url, Path::new(&req.location))?;
+    Ok(RecentProject {
+        name: cfg.name,
+        git: git::info(&root),
+        path: root.to_string_lossy().into_owned(),
+        color: cfg.color,
+        framework_version: cfg.framework_version,
+        kind: cfg.kind,
+    })
+}
+
+/// A collection the user is authoring locally, for the "My Collections" list. `path` is machine-
+/// local; the rest is read from the collection's own committed `koral-collection.json`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthoredCollection {
+    pub path: String,
+    pub title: String,
+    pub description: String,
+    pub lab_count: usize,
+    /// The projects in the collection, in order — so the card can list, reorder and remove them.
+    pub labs: Vec<collection::Lab>,
+    /// Git status for the card (branch / dirty / remote) — a collection is always a repo.
+    pub git: Option<GitInfo>,
+}
+
+impl AuthoredCollection {
+    /// Build the view for a collection on disk, or `None` if its manifest no longer loads.
+    fn load(root: &Path) -> Option<Self> {
+        let manifest = collection::load_manifest(root).ok()?;
+        Some(AuthoredCollection {
+            path: root.to_string_lossy().into_owned(),
+            title: manifest.title,
+            description: manifest.description,
+            lab_count: manifest.labs.len(),
+            labs: manifest.labs,
+            git: git::info(root),
+        })
+    }
+}
+
+/// Collections the user is building locally (those whose manifest still loads).
+#[tauri::command]
+pub fn list_authored_collections() -> Vec<AuthoredCollection> {
+    collection::authored_paths()
+        .iter()
+        .filter_map(|p| AuthoredCollection::load(p))
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCollectionRequest {
+    /// Parent folder; the collection is created in `location/name`.
+    pub location: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Scaffold a new collection repo, record it in the authored index, and return its list entry.
+#[tauri::command]
+pub fn create_collection(req: CreateCollectionRequest) -> Result<AuthoredCollection, String> {
+    let root = collection::create(Path::new(&req.location), &req.name, &req.description)?;
+    collection::add_authored(&root)?;
+    AuthoredCollection::load(&root)
+        .ok_or_else(|| "created the collection but could not read it back".into())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddLabRequest {
+    /// The authored collection to add to.
+    pub path: String,
+    /// HTTPS git URL of the lab's repository, added as a submodule.
+    pub url: String,
+    /// Optional display name; defaults to the lab's repo name.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Add a lab to a local collection as a git submodule and return the updated list entry.
+///
+/// Blocking: the submodule clone reaches out to the remote, so the UI shows a pending state while
+/// it works, just like an import.
+#[tauri::command]
+pub fn add_lab_to_collection(req: AddLabRequest) -> Result<AuthoredCollection, String> {
+    let root = Path::new(&req.path);
+    let name = (!req.name.trim().is_empty()).then(|| req.name.as_str());
+    collection::add_lab(root, &req.url, name, &req.description)?;
+    AuthoredCollection::load(root)
+        .ok_or_else(|| "added the lab but could not read the collection back".into())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddProjectRequest {
+    /// The authored collection to add to.
+    pub path: String,
+    /// An existing local Koral project to add as a submodule.
+    pub project_path: String,
+    /// Optional description shown in the collection; the display name is the project's own.
+    #[serde(default)]
+    pub description: String,
+    /// Auto-publish parameters, used only when the project has no `origin` yet. `host` selects the
+    /// signed-in account to create the repo under; `repo_name` defaults to the project's name.
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub repo_name: String,
+    #[serde(default)]
+    pub private: bool,
+}
+
+/// Add an existing local project to a collection as a git submodule and return the updated entry.
+///
+/// A submodule tracks a URL, so a project that has never been pushed is published first: a remote
+/// repo is created under the chosen account, wired up as `origin` and pushed — then that URL is what
+/// the submodule follows. A project that already has an `origin` is added straight from it.
+///
+/// Blocking: publishing and the submodule clone are network round trips, so the UI shows a pending
+/// state, just like an import.
+#[tauri::command]
+pub fn add_project_to_collection(req: AddProjectRequest) -> Result<AuthoredCollection, String> {
+    let collection_root = Path::new(&req.path);
+    let project_root = Path::new(&req.project_path);
+
+    // Confirm it's a Koral project (and get its name for the display default) before touching git.
+    let cfg = project::load(project_root)
+        .map_err(|e| format!("that folder is not a Koral project: {e}"))?;
+
+    // A submodule needs a URL. Use the project's existing origin, or publish it to obtain one.
+    let url = match git::origin_url(project_root) {
+        Some(url) => url,
+        None => {
+            let host = req.host.trim();
+            let account = auth::account_for_host(host)
+                .ok_or_else(|| format!("not signed in to {host} — sign in first"))?;
+            // A Hub-made project is already a repo; a hand-made one might not be, and there'd be
+            // nothing to push. Ensure a repo (with an initial commit) exists first.
+            if git::info(project_root).is_none() {
+                git::init(project_root)?;
+            }
+            let repo_name = req.repo_name.trim();
+            let repo_name = if repo_name.is_empty() { cfg.name.trim() } else { repo_name };
+            let url = auth::create_remote_repo(&account, repo_name, "", req.private)?;
+            git::set_remote(project_root, "origin", &url)?;
+            git::push(project_root)?;
+            url
+        }
+    };
+
+    let name = cfg.name.trim();
+    let name = (!name.is_empty()).then_some(name);
+    collection::add_lab(collection_root, &url, name, &req.description)?;
+    AuthoredCollection::load(collection_root)
+        .ok_or_else(|| "added the project but could not read the collection back".into())
+}
+
+/// Remove one project from a collection (drop its submodule + manifest entry) and return the updated
+/// entry. Identified by URL, as the manifest stores it.
+#[tauri::command]
+pub fn remove_lab_from_collection(path: String, url: String) -> Result<AuthoredCollection, String> {
+    let root = Path::new(&path);
+    collection::remove_lab(root, &url)?;
+    AuthoredCollection::load(root)
+        .ok_or_else(|| "removed the project but could not read the collection back".into())
+}
+
+/// Move a project one place earlier (`up`) or later within a collection, and return the updated
+/// entry. Reordering is presentational only — it never re-clones a submodule.
+#[tauri::command]
+pub fn reorder_lab_in_collection(
+    path: String,
+    url: String,
+    up: bool,
+) -> Result<AuthoredCollection, String> {
+    let root = Path::new(&path);
+    collection::reorder_lab(root, &url, up)?;
+    AuthoredCollection::load(root)
+        .ok_or_else(|| "reordered but could not read the collection back".into())
+}
+
+/// Remove an authored collection from the list and, if asked, delete its folder from disk.
+///
+/// `delete_files` is irreversible — the UI must confirm it, and it defaults to off. Mirrors
+/// [`remove_project`].
+#[tauri::command]
+pub fn remove_authored_collection(path: String, delete_files: bool) -> Result<(), String> {
+    collection::delete_authored(Path::new(&path), delete_files)
+}
+
+/// Emitted as `device-login-finished` when a sign-in ends, successfully or not. The account (sans
+/// token) rides along on success so the UI can show who signed in without another round trip.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceLoginFinished {
+    success: bool,
+    account: Option<AccountView>,
+    error: Option<String>,
+}
+
+/// Begin an OAuth device-flow sign-in. Returns immediately with the code to show the user, then
+/// polls in the background and emits `device-login-finished` once they authorize (or it times out).
+///
+/// Not blocking: the poll can take a minute of the user typing a code into a browser, and holding
+/// the command open that whole time would freeze the invoke. The start request itself is quick.
+#[tauri::command]
+pub fn device_login_start(
+    app: AppHandle,
+    provider: Provider,
+    host: Option<String>,
+) -> Result<DeviceLogin, String> {
+    let (login, ctx) = auth::start_device_login(provider, host)?;
+    std::thread::spawn(move || {
+        let payload = match auth::poll_device_login(ctx) {
+            Ok(account) => DeviceLoginFinished { success: true, account: Some(account), error: None },
+            Err(e) => DeviceLoginFinished { success: false, account: None, error: Some(e) },
+        };
+        let _ = app.emit("device-login-finished", payload);
+    });
+    Ok(login)
+}
+
+/// Open a URL in the user's default browser — used by the sign-in dialog's "Open page" button to
+/// land them on the device-verification page. Local action only.
+#[tauri::command]
+pub fn open_url(url: String) -> Result<(), String> {
+    auth::open_browser(&url)
+}
+
+/// The GitHub/GitLab accounts signed in on this machine (never including their tokens).
+#[tauri::command]
+pub fn list_accounts() -> Vec<AccountView> {
+    auth::accounts()
+}
+
+/// Sign out of one account, forgetting its stored token.
+#[tauri::command]
+pub fn sign_out(provider: Provider, host: String) -> Result<(), String> {
+    auth::sign_out(provider, &host)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishRequest {
+    /// The authored collection to publish.
+    pub path: String,
+    /// Host of the signed-in account to publish under (`github.com`, a GitLab host).
+    pub host: String,
+    /// Name for the new remote repository.
+    pub repo_name: String,
+    #[serde(default)]
+    pub private: bool,
+}
+
+/// The outcome of publishing: the URL to share (students subscribe with it) and whether this call
+/// created the remote or just pushed updates to an existing one.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishResult {
+    pub url: String,
+    pub created: bool,
+}
+
+/// Publish an authored collection: create the remote repository (first time) and push to it.
+///
+/// Idempotent for re-publishing: once the collection has an `origin`, later publishes just push the
+/// new commits (the labs added since) rather than trying to create the repo again.
+///
+/// Blocking: creating a repo and pushing are network round trips, but small — the UI shows a pending
+/// state, like an import.
+#[tauri::command]
+pub fn publish_collection(req: PublishRequest) -> Result<PublishResult, String> {
+    let root = Path::new(&req.path);
+
+    // Only the *first* publish needs an account (to create the repo). Re-publishing pushes to the
+    // existing origin and authenticates via whatever token is stored for that remote's host, so it
+    // needs no account argument — which is why the UI sends an empty host in that case.
+    let (url, created) = match git::origin_url(root) {
+        Some(existing) => (existing, false),
+        None => {
+            let account = auth::account_for_host(&req.host)
+                .ok_or_else(|| format!("not signed in to {} — sign in first", req.host))?;
+            let manifest = collection::load_manifest(root)?;
+            let url = auth::create_remote_repo(
+                &account,
+                req.repo_name.trim(),
+                &manifest.description,
+                req.private,
+            )?;
+            git::set_remote(root, "origin", &url)?;
+            (url, true)
+        }
+    };
+
+    git::push(root)?;
+    Ok(PublishResult { url, created })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishProjectRequest {
+    /// The project to save to git.
+    pub path: String,
+    /// Host of the signed-in account to publish under, when a new repo has to be created.
+    #[serde(default)]
+    pub host: String,
+    /// Name for the new remote repository; defaults to the project's name.
+    #[serde(default)]
+    pub repo_name: String,
+    #[serde(default)]
+    pub private: bool,
+}
+
+/// Save a project to the user's own git, or push updates to it.
+///
+/// If the project already has an `origin` the signed-in user owns, this just pushes the new commits —
+/// the "update it" path for a lab they downloaded of their own. Otherwise (a fork with no remote, or
+/// someone else's repo) it creates a fresh repository under the chosen account, points `origin` at it
+/// and pushes — "save it to my git". Blocking: network round trips, like publishing a collection.
+#[tauri::command]
+pub fn publish_project(req: PublishProjectRequest) -> Result<PublishResult, String> {
+    let root = Path::new(&req.path);
+    let cfg = project::load(root).map_err(|e| format!("that folder is not a Koral project: {e}"))?;
+
+    // Push straight to an origin the user owns; otherwise create a repo under their account first.
+    let owned_origin = git::origin_url(root).filter(|u| auth::signed_in_owns(u));
+    let (url, created) = match owned_origin {
+        Some(existing) => (existing, false),
+        None => {
+            let host = req.host.trim();
+            let account = auth::account_for_host(host)
+                .ok_or_else(|| format!("not signed in to {host} — sign in first"))?;
+            // A Hub-made project is already a repo; a hand-made one might not be. Ensure one exists.
+            if git::info(root).is_none() {
+                git::init(root)?;
+            }
+            let repo_name = req.repo_name.trim();
+            let repo_name = if repo_name.is_empty() { cfg.name.trim() } else { repo_name };
+            let url = auth::create_remote_repo(&account, repo_name, "", req.private)?;
+            git::set_remote(root, "origin", &url)?;
+            (url, true)
+        }
+    };
+
+    git::push(root)?;
+    Ok(PublishResult { url, created })
 }
 
 /// Overwrite a project's `koral.json` with settings edited in the Hub.
