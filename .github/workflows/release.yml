@@ -64,10 +64,12 @@ jobs:
     needs: meta
     # The input is null on a tag push, which falls through to "all" — a tag builds everything.
     if: ${{ contains(fromJSON('["all", "linux"]'), github.event.inputs.platforms || 'all') }}
-    # Self-hosted Linux builder (label `koral-linux`). Note: unlike the old ubuntu-22.04 runner,
-    # this box builds against its own glibc, so the AppImage's minimum-glibc floor is whatever this
-    # machine ships — keep it on an older base if broad compatibility matters.
-    runs-on: [self-hosted, linux, koral-linux]
+    # GitHub-hosted Ubuntu 22.04. Pinned (not ubuntu-latest) on purpose: the AppImage's minimum-glibc
+    # floor is whatever this builder ships, and 22.04's glibc 2.35 keeps the bundle runnable on older
+    # distros — ubuntu-latest tracks a newer image and would raise that floor. The self-hosted
+    # `koral-linux` box is the alternative when it's available; swap the label back to
+    # `[self-hosted, linux, koral-linux]` to use it.
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
