@@ -51,6 +51,48 @@ src-tauri/
   capabilities/      webview permissions
 ```
 
+## Working against a framework you built yourself
+
+The Frameworks tab installs published releases. To build against your own source tree instead,
+install the SDK and register the prefix:
+
+```sh
+cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_INSTALL_PREFIX=~/koral-sdk <koral-source-dir>
+cmake --build build && cmake --install build
+```
+
+Then **Frameworks → Add source build** and give it that prefix. It gets **no version**: a source
+tree changes under you, so any number stamped on it would be stale by the next build. Projects
+target it by kind instead — set a project's framework to the source build and its `koral.json`
+records `"frameworkVersion": "source"` (or `"source:<name>"` when several are registered), which
+resolves fresh on every build.
+
+Only the path is remembered — nothing is copied and the prefix is never written to — so re-running
+`cmake --install` is picked up by the next build with no re-registration. Removing a source build
+forgets the registration; the Hub never deletes a tree it did not create.
+
+### Debugging into framework and module code
+
+A source build is the one framework a debugger can step into, so the Hub wires that up. When you
+register a prefix it finds the CMake build it came from (matching on `CMAKE_INSTALL_PREFIX`), and
+from that build's cache learns two things: the source tree, and whether it was built `Debug`. Both
+are shown on the framework's row — a `Release` build carries no debug info, so no amount of path
+configuration will make a crash inside it land on a line of source. If the build directory has
+since been cleaned, **Locate source** points at the tree by hand.
+
+Every build of a project on a source framework then regenerates:
+
+- `.koral/debug.gdb` — `directory` entries for the framework's tree and for every module project
+  the project loads, so gdb opens the right file even when the recorded build path has moved;
+- `.vscode/launch.json` — sources that script, and lists the module build directories under
+  `additionalSOLibSearchPath` so their symbols resolve as they are loaded;
+- `.vscode/c_cpp_properties.json` — the same trees on the browse path, so stepping into `kor::`
+  code lands in an editor that can navigate it.
+
+The last two are machine-local and git-ignored. For CLion or a bare `gdb`, pass the script
+yourself: `gdb -x .koral/debug.gdb`. Modules you wrote need none of this — the Hub builds them
+from source on this machine already, so their debug info points at code that is right here.
+
 ## Icons
 
 `src-tauri/icons/` currently holds placeholder PNGs. Generate the real set (all sizes plus

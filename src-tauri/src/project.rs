@@ -75,16 +75,31 @@ pub fn create(
     Ok(root)
 }
 
-/// Scaffold the sources for this kind of app.
+/// Scaffold the sources for this kind of library.
 ///
-/// The library exports exactly one entry point — `CreateScene` or `CreateJob` — and the engine
-/// decides which path to run by which symbol it finds. Exporting the wrong one for the kind would
-/// simply never be picked up.
+/// An app exports exactly one entry point — `CreateScene` or `CreateJob` — and the engine decides
+/// which path to run by which symbol it finds. Exporting the wrong one for the kind would simply
+/// never be picked up. A module instead exports the pair `KORAL_DECLARE_MODULE` defines, and its
+/// header is the *interface* other projects compile against, so the split between the two files is
+/// the whole lesson the template teaches.
 fn write_sources(root: &Path, name: &str, kind: Kind) -> Result<(), String> {
     let src = root.join("src");
+
+    if kind == Kind::Module {
+        // The module id consumers look the module up by. Lowercased so "MyCameras" and the
+        // library file it decorates to don't disagree about case across platforms.
+        let id = name.to_lowercase();
+        let header = MODULE_HEADER.replace("{NAME}", name).replace("{ID}", &id);
+        let source = MODULE_SOURCE.replace("{NAME}", name);
+        std::fs::write(src.join(format!("{name}.h")), header).map_err(|e| e.to_string())?;
+        std::fs::write(src.join(format!("{name}.cpp")), source).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
     let (header_tpl, source_tpl, export_tpl) = match kind {
         Kind::Scene => (SCENE_HEADER, SCENE_SOURCE, SCENE_EXPORT),
         Kind::Job => (JOB_HEADER, JOB_SOURCE, JOB_EXPORT),
+        Kind::Module => unreachable!("handled above"),
     };
 
     let header = header_tpl.replace("{NAME}", name);
@@ -287,6 +302,67 @@ kor::Task<void> {NAME}::Run()
 }
 "#;
 
+// The module templates split along the boundary that matters: the header is what *other projects*
+// include (pure-virtual interface, plain structs, nothing else), and the .cpp is what only this
+// module compiles. A consumer never links the module — it names it in koral.json and calls
+// kor::useModule<{NAME}>() at runtime.
+
+const MODULE_HEADER: &str = r#"#pragma once
+
+// {NAME}'s public interface: the only file consumers see. Keep it to pure-virtual methods and
+// plain structs — the implementation lives in the module and arrives at runtime, when a project
+// lists "{ID}" under "modules" in its koral.json and calls:
+//
+//     auto* {ID} = kor::useModule<{NAME}>();
+
+#include <koral.h>
+
+class {NAME} : public kor::Module
+{
+public:
+    static constexpr std::string_view kModuleId      = "{ID}";
+    static constexpr std::uint32_t    kModuleVersion = 1;   // bump on any change to this interface
+
+    // TODO: the interface consumers call, e.g.
+    // virtual kor::Resource<Thing> create(const Thing::Desc& desc) = 0;
+    virtual int answer() const = 0;
+};
+"#;
+
+const MODULE_SOURCE: &str = r#"#include "{NAME}.h"
+
+// The implementation. Nothing here is visible to consumers, so it can change freely between
+// releases — only the header is a contract.
+class {NAME}Impl final : public {NAME}
+{
+public:
+    int answer() const override { return 42; }
+
+private:
+    // The runtime-facing lifecycle, private on purpose: the runtime reaches these virtually
+    // through kor::Module*, while a consumer holding the {NAME} interface cannot call them.
+    void Initialize() override
+    {
+        // Every module is loaded and findable here; look up dependencies with kor::useModule<T>().
+    }
+
+    void Update() override
+    {
+        // Once per frame, before the scene's Update.
+    }
+
+    void Shutdown() override
+    {
+        // Dependencies are still alive here; modules shut down in reverse dependency order.
+    }
+};
+
+// The two symbols that make this library a module: a descriptor the loader reads before
+// constructing anything, and the factory. Use KORAL_DECLARE_MODULE_DEPS to declare dependencies
+// on other modules.
+KORAL_DECLARE_MODULE({NAME}Impl)
+"#;
+
 const JOB_EXPORT: &str = r#"#include "{HEADER}"
 
 #if defined(_WIN32)
@@ -335,20 +411,90 @@ mod tests {
 
         std::fs::remove_dir_all(&base).ok();
     }
+
+    /// Everything the Hub generates is ignored, because every one of them is derived from
+    /// `koral.json` and rewritten on the next build — a committed copy can only ever be stale.
+    /// The project's own sources and `koral.json` are what a clone needs, and must stay tracked.
+    #[test]
+    fn generated_build_files_are_ignored_but_the_project_is_not() {
+        let base = scratch();
+        std::fs::create_dir_all(&base).unwrap();
+        let root = create(&base, "Ignored", "0.0.9", [0.5, 0.5, 0.5], Kind::Scene).unwrap();
+
+        let rules: Vec<String> = std::fs::read_to_string(root.join(".gitignore"))
+            .unwrap()
+            .lines()
+            .map(|l| l.trim().to_string())
+            .collect();
+
+        for generated in [
+            "/CMakeLists.txt",
+            "/CMakePresets.json",
+            "/vcpkg.json",
+            "/.idea/",
+            "/.vscode/launch.json",
+            "/.vscode/c_cpp_properties.json",
+            "/.koral/",
+            "/cmake-build-*/",
+        ] {
+            assert!(rules.iter().any(|r| r == generated), "{generated} should be ignored");
+        }
+
+        // The line that matters in the other direction: ignoring the sources, or the config the
+        // whole scheme derives from, would make a shared project unbuildable.
+        for kept in ["koral.json", "/src/", "src", ".gitignore"] {
+            assert!(!rules.iter().any(|r| r == kept), "{kept} must NOT be ignored");
+        }
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A module scaffold is two files — the interface header and the implementation — with the
+    /// module id derived from the name, and no export.cpp: KORAL_DECLARE_MODULE *is* the export.
+    #[test]
+    fn create_module_scaffolds_interface_and_impl() {
+        let base = scratch();
+        std::fs::create_dir_all(&base).unwrap();
+
+        let root = create(&base, "MyCameras", "0.0.9", [0.5, 0.5, 0.5], Kind::Module).unwrap();
+        assert_eq!(load(&root).unwrap().kind, Kind::Module);
+
+        let header = std::fs::read_to_string(root.join("src/MyCameras.h")).unwrap();
+        assert!(header.contains("kModuleId      = \"mycameras\""), "{header}");
+        assert!(header.contains("public kor::Module"), "{header}");
+
+        let source = std::fs::read_to_string(root.join("src/MyCameras.cpp")).unwrap();
+        assert!(source.contains("KORAL_DECLARE_MODULE(MyCamerasImpl)"), "{source}");
+
+        assert!(
+            !root.join("src/export.cpp").exists(),
+            "a module's entry points come from KORAL_DECLARE_MODULE, not an export.cpp"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
 }
 
 const GITIGNORE: &str = r#"# Build output
 /build/
 /cmake-build-*/
 
-# Machine-specific, regenerated by Koral Hub each build (absolute SDK/vcpkg paths)
+# Generated by Koral Hub from koral.json, on every build and every "Open in IDE". Editing one is
+# pointless — the next build overwrites it — and committing one just puts a copy of what
+# koral.json already says into the history, where it goes stale. koral.json is the source of
+# truth; these are derived from it. CMakePresets.json additionally holds this machine's absolute
+# SDK paths, so it could never be shared anyway.
+/CMakeLists.txt
 /CMakePresets.json
+/vcpkg.json
 
 # Hub-generated IDE state (absolute paths — regenerated on each build).
-# .vscode/tasks.json and .vscode/extensions.json are portable and *are* committed, so that a
-# fresh clone can build and run from the IDE without opening the Hub first.
+# .vscode/tasks.json, settings.json and extensions.json carry no absolute paths and *are*
+# committed — though they still need the Hub (or a manual cmake configure) to produce
+# CMakePresets.json before they can run anything.
 /.idea/
 /.vscode/launch.json
+/.vscode/c_cpp_properties.json
 
 # Hub-managed local state
 /.koral/

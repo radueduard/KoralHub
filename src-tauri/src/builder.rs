@@ -3,16 +3,83 @@
 //! Given a project folder, this resolves (installing if needed) the framework version it
 //! declares, regenerates the build scaffolding against that SDK, drives CMake to configure
 //! and build, and launches the SDK's runtime on the resulting scene library. Output is
-//! streamed to the UI as `build-output` events; completion as `build-finished`.
+//! streamed to the UI as `build-output` events; completion as `build-finished`. Every one of
+//! those events names the project it belongs to, because each project has its own console.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
-use crate::{framework, project, scaffold};
+use crate::{framework, modules, project, scaffold};
+
+/// One job's console: the project the user started it on, and the handle its output goes out on.
+///
+/// Jobs are per project, not per app — two projects can be building at once, and each has its own
+/// Build and Output tabs — so every event carries the project it belongs to. Module dependencies
+/// are compiled as part of their dependent's job, and this deliberately stays on the *originating*
+/// project throughout: a module's compile output belongs on the console of the project that asked
+/// for it, which is the only one the user is looking at.
+#[derive(Clone)]
+pub struct Console {
+    app: AppHandle,
+    /// The project's path exactly as the UI named it. The UI keys its consoles by this string, so
+    /// it must round-trip unchanged rather than being canonicalized on the way through.
+    project: String,
+}
+
+/// A chunk of output, addressed to one project's console.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Line<'a> {
+    project: &'a str,
+    text: &'a str,
+}
+
+/// Emitted as `build-finished` when a build/run job ends.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Finished<'a> {
+    project: &'a str,
+    success: bool,
+    error: Option<&'a str>,
+}
+
+impl Console {
+    pub fn new(app: &AppHandle, project: &str) -> Self {
+        Self { app: app.clone(), project: project.to_string() }
+    }
+
+    /// The project folder this job runs in.
+    pub fn root(&self) -> &Path {
+        Path::new(&self.project)
+    }
+
+    /// Build-tab output: configure/compile progress and diagnostics.
+    fn build(&self, text: &str) {
+        let _ = self.app.emit("build-output", Line { project: &self.project, text });
+    }
+
+    /// Output-tab output: the launch line and the running app's own stdout/stderr.
+    fn run(&self, text: &str) {
+        let _ = self.app.emit("run-output", Line { project: &self.project, text });
+    }
+
+    /// The job is over — the project's console stops showing a build in progress.
+    pub fn finished(&self, result: &Result<(), String>) {
+        let _ = self.app.emit(
+            "build-finished",
+            Finished {
+                project: &self.project,
+                success: result.is_ok(),
+                error: result.as_ref().err().map(String::as_str),
+            },
+        );
+    }
+}
 
 /// Build a `Command` for an external tool with any inherited loader environment stripped out.
 ///
@@ -67,16 +134,27 @@ struct BuildOutcome {
     lib_path: PathBuf,
 }
 
-/// Configure + build the project, streaming output to the UI. Returns where the built
-/// scene library should be.
-fn build(app: &AppHandle, project_root: &Path, profile: &str) -> Result<BuildOutcome, String> {
+/// Configure + build one project (or module) tree, streaming output to the UI. Returns the SDK it
+/// was built against.
+///
+/// Split out from [`build`] because a project's module dependencies are ordinary projects and get
+/// built exactly the same way — there is no second build path to keep in step.
+fn compile_tree(
+    console: &Console,
+    project_root: &Path,
+    profile: &str,
+) -> Result<(PathBuf, framework::FrameworkManifest), String> {
     let cfg = project::load(project_root)?;
 
-    emit(app, &format!("Resolving koral {}…\n", cfg.framework_version));
-    let sdk_root = framework::ensure_installed(&cfg.framework_version)?;
-    let manifest = framework::read_manifest(&sdk_root)?;
+    console.build(&format!("Resolving koral {}…\n", cfg.framework_version));
+    // resolve(), not ensure_installed(): a version the user registered from a local build must be
+    // used as-is rather than downloaded, and it carries no framework.json of its own.
+    let (sdk_root, manifest) = framework::resolve(&cfg.framework_version)?;
+    if framework::local::find(&cfg.framework_version).is_some() {
+        console.build(&format!("Using local build at {}\n", sdk_root.display()));
+    }
 
-    emit(app, "Generating build files…\n");
+    console.build("Generating build files…\n");
     scaffold::generate(project_root, &cfg, &sdk_root, &manifest, profile)?;
 
     let configure = || {
@@ -84,9 +162,9 @@ fn build(app: &AppHandle, project_root: &Path, profile: &str) -> Result<BuildOut
         c.arg("--preset").arg(profile).current_dir(project_root);
         c
     };
-    emit(app, &format!("$ cmake --preset {profile}\n"));
+    console.build(&format!("$ cmake --preset {profile}\n"));
 
-    if let Err(e) = run_step(app, &mut configure()) {
+    if let Err(e) = run_step(console, &mut configure()) {
         // A CMakeCache.txt pins the toolchain, compiler and SDK paths it was first configured
         // with, and keeps honouring them even after the preset stops setting them. So a cache
         // left behind by a stale SDK — or by a preset we have since fixed — fails identically
@@ -96,11 +174,11 @@ fn build(app: &AppHandle, project_root: &Path, profile: &str) -> Result<BuildOut
         if !build_dir.exists() {
             return Err(e);
         }
-        emit(app, "\nConfigure failed — clearing the build directory and retrying…\n");
+        console.build("\nConfigure failed — clearing the build directory and retrying…\n");
         std::fs::remove_dir_all(&build_dir)
             .map_err(|e| format!("failed to clear {}: {e}", build_dir.display()))?;
-        emit(app, &format!("$ cmake --preset {profile}\n"));
-        run_step(app, &mut configure())?;
+        console.build(&format!("$ cmake --preset {profile}\n"));
+        run_step(console, &mut configure())?;
     }
 
     let mut compile = external_command("cmake");
@@ -109,28 +187,77 @@ fn build(app: &AppHandle, project_root: &Path, profile: &str) -> Result<BuildOut
         .arg("--preset")
         .arg(profile)
         .current_dir(project_root);
-    emit(app, &format!("$ cmake --build --preset {profile}\n"));
-    run_step(app, &mut compile)?;
+    console.build(&format!("$ cmake --build --preset {profile}\n"));
+    run_step(console, &mut compile)?;
 
-    let lib_path = project_root
-        .join(scaffold::build_dir_name(profile))
-        .join(lib_file_name(&cfg.name));
+    Ok((sdk_root, manifest))
+}
+
+/// Build the project and everything it needs to run: its own library, plus each module it lists
+/// that is a module project registered on this machine.
+///
+/// A module project's library is built into *its* build tree, which the runtime never searches. So
+/// after building, each one is copied in beside the scene library — a directory the runtime does
+/// search — which is what makes `"modules": ["MyCameras"]` resolve for the Hub's ▶ and, because the
+/// staged copies stay there, for a subsequent Run from an IDE too. Modules that come from the SDK,
+/// or that are written as paths, are left alone: the runtime finds those itself.
+fn build(console: &Console, profile: &str) -> Result<BuildOutcome, String> {
+    let project_root = console.root();
+    let cfg = project::load(project_root)?;
+
+    // Which of this project's module entries are projects we can build. Resolved before anything
+    // is compiled, so a typo'd module name is reported as "no such module" rather than after a
+    // full build of everything else.
+    let module_roots: Vec<(String, PathBuf)> = cfg
+        .modules
+        .iter()
+        .filter_map(|name| modules::find_project_module(name).map(|root| (name.clone(), root)))
+        .collect();
+
+    for (name, root) in &module_roots {
+        console.build(&format!("\n=== Building module {name} ===\n"));
+        compile_tree(console, root, profile)?;
+    }
+    if !module_roots.is_empty() {
+        console.build(&format!("\n=== Building {} ===\n", cfg.name));
+    }
+
+    let (sdk_root, manifest) = compile_tree(console, project_root, profile)?;
+
+    let build_dir = project_root.join(scaffold::build_dir_name(profile));
+    if !module_roots.is_empty() {
+        console.build("Staging modules beside the scene library…\n");
+        modules::stage(&cfg.modules, &module_roots, &build_dir, profile)?;
+    }
 
     Ok(BuildOutcome {
         sdk_root,
         runtime_rel: manifest.runtime,
-        lib_path,
+        lib_path: build_dir.join(lib_file_name(&cfg.name)),
     })
 }
 
 /// Build the project (as a `build-*` event stream) and return once done.
-pub fn build_only(app: &AppHandle, project_root: &Path, profile: &str) -> Result<(), String> {
-    build(app, project_root, profile).map(|_| ())
+pub fn build_only(console: &Console, profile: &str) -> Result<(), String> {
+    build(console, profile).map(|_| ())
 }
 
 /// Build the project, then launch the SDK runtime on its scene library.
-pub fn run(app: &AppHandle, project_root: &Path, profile: &str) -> Result<(), String> {
-    let outcome = build(app, project_root, profile)?;
+pub fn run(console: &Console, profile: &str) -> Result<(), String> {
+    // A module has no app to start — the runtime would load it, find neither CreateScene nor
+    // CreateJob, and fail with a much less helpful message than this one. Checked before the
+    // build so the user is told immediately, not after a full compile.
+    let cfg = project::load(console.root())?;
+    if !cfg.kind.is_runnable() {
+        return Err(format!(
+            "'{}' is a module — it cannot run on its own. Build it here, then run a project that \
+             lists \"{}\" under \"modules\" in its koral.json.",
+            cfg.name,
+            cfg.name.to_lowercase()
+        ));
+    }
+
+    let outcome = build(console, profile)?;
 
     if !outcome.lib_path.exists() {
         return Err(format!(
@@ -143,10 +270,7 @@ pub fn run(app: &AppHandle, project_root: &Path, profile: &str) -> Result<(), St
     let args = runtime_args(&outcome.lib_path);
 
     // The launch line and everything the app prints belong on the Output tab, not the Build tab.
-    emit_run(
-        app,
-        &format!("$ {} {}\n", runtime.display(), args.join(" ")),
-    );
+    console.run(&format!("$ {} {}\n", runtime.display(), args.join(" ")));
 
     // Launch the app under a pseudo-terminal. Attached to a PTY it sees a real, colour-capable TTY
     // and so emits ANSI colour exactly as it would in a terminal — which piping its stdout could
@@ -181,27 +305,28 @@ pub fn run(app: &AppHandle, project_root: &Path, profile: &str) -> Result<(), St
         .master
         .try_clone_reader()
         .map_err(|e| format!("failed to read the app's output: {e}"))?;
-    let app_out = app.clone();
+    // The app outlives the job that launched it, so these threads carry their own handle on the
+    // project's console — its output keeps landing on that project's Output tab, whichever project
+    // the user has selected by then.
+    let console_out = console.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let _ = app_out.emit("run-output", String::from_utf8_lossy(&buf[..n]).into_owned());
-                }
+                Ok(n) => console_out.run(&String::from_utf8_lossy(&buf[..n])),
             }
         }
     });
 
     // Wait for the app in the background, holding the master open for its whole lifetime (dropping it
     // early would SIGHUP the app), then note the exit code on the Output tab.
-    let app_wait = app.clone();
+    let console_wait = console.clone();
     std::thread::spawn(move || {
         let status = child.wait();
         drop(pair.master);
         if let Ok(status) = status {
-            let _ = app_wait.emit("run-output", format!("\n[app exited: {}]\n", status.exit_code()));
+            console_wait.run(&format!("\n[app exited: {}]\n", status.exit_code()));
         }
     });
     Ok(())
@@ -245,31 +370,21 @@ pub fn runtime_args(lib: &Path) -> Vec<String> {
 
 /// Run one child process to completion, forwarding its stdout+stderr to the UI. Errors if
 /// the process can't launch or exits non-zero.
-fn run_step(app: &AppHandle, cmd: &mut Command) -> Result<(), String> {
+fn run_step(console: &Console, cmd: &mut Command) -> Result<(), String> {
     let output = cmd
         .output()
         .map_err(|e| format!("failed to launch {:?}: {e}", cmd.get_program()))?;
 
     if !output.stdout.is_empty() {
-        emit(app, &String::from_utf8_lossy(&output.stdout));
+        console.build(&String::from_utf8_lossy(&output.stdout));
     }
     if !output.stderr.is_empty() {
-        emit(app, &String::from_utf8_lossy(&output.stderr));
+        console.build(&String::from_utf8_lossy(&output.stderr));
     }
     if !output.status.success() {
         return Err(format!("command failed ({})", output.status));
     }
     Ok(())
-}
-
-/// Build-tab output: configure/compile progress and diagnostics.
-fn emit(app: &AppHandle, text: &str) {
-    let _ = app.emit("build-output", text.to_string());
-}
-
-/// Output-tab output: the launch line and the running app's own stdout/stderr.
-fn emit_run(app: &AppHandle, text: &str) {
-    let _ = app.emit("run-output", text.to_string());
 }
 
 #[cfg(all(test, target_os = "linux"))]

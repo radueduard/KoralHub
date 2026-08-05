@@ -38,9 +38,17 @@ pub struct ProjectConfig {
     /// public headers expose (glm, imgui, spdlog, fmt), so a scene that only uses Koral needs no
     /// package manager at all. This list is what decides whether vcpkg is set up — see
     /// `scaffold::vcpkg_toolchain`. The ABI baseline is NOT stored here; it is inherited from the
-    /// resolved SDK's manifest so Hub and framework releases can version independently.
+    /// resolved SDK's manifest so Hub and framework versions can version independently.
     #[serde(default)]
     pub libraries: Vec<Library>,
+    /// Koral modules the runtime loads for this project — optional engine features (cameras,
+    /// importers, ...) shipped as shared libraries, named here by bare name ("koral-camera",
+    /// decorated per platform by the runtime) or project-relative path. The runtime reads this
+    /// list itself; the Hub only edits it. Order does not matter — the runtime sorts modules by
+    /// their declared dependencies — but every module must be listed, including the dependencies
+    /// of other modules. Skipped when empty so older projects are not churned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modules: Vec<String>,
 }
 
 impl ProjectConfig {
@@ -69,14 +77,17 @@ impl ProjectConfig {
             rendering,
             paths: Paths::default(),
             libraries: Vec::new(),
+            modules: Vec::new(),
         }
     }
 }
 
-/// The two shapes a Koral app can take.
+/// The shapes a Koral library can take.
 ///
-/// The engine picks between them by which symbol it finds exported from the scene library —
-/// `CreateScene` or `CreateJob` — so a project is one or the other, never both.
+/// The engine tells apps apart by which symbol it finds exported — `CreateScene` or `CreateJob` —
+/// so a project is one or the other, never both. A Module exports a third pair
+/// (`korModuleDescriptor`/`korCreateModule`) and is not an app at all: it is loaded *by* projects
+/// that name it under `"modules"` in their koral.json.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Kind {
     /// A realtime app: owns a window, runs an Update/Render loop until closed.
@@ -85,13 +96,23 @@ pub enum Kind {
     /// A windowless app: `Run()` once to completion on a headless device context, then exit.
     /// Offscreen rendering, compute, asset processing.
     Job,
+    /// A reusable engine feature (cameras, physics, importers…) other projects load at runtime.
+    /// Builds like any project, but cannot run on its own — there is no app to start.
+    Module,
 }
 
 impl Kind {
-    /// Does this kind open a window? Job runs on `Context::InitHeadless`, so the window settings
-    /// are meaningless for it — the Hub neither passes nor offers them.
+    /// Does this kind open a window? Job runs on `Context::InitHeadless` and a Module never runs
+    /// by itself, so the window settings are meaningless for both — the Hub neither passes nor
+    /// offers them.
     pub fn has_window(self) -> bool {
         matches!(self, Kind::Scene)
+    }
+
+    /// Can ▶ launch this on its own? A Module is loaded by other projects, so the only way to see
+    /// it working is to run a project that lists it.
+    pub fn is_runnable(self) -> bool {
+        !matches!(self, Kind::Module)
     }
 }
 
@@ -115,6 +136,13 @@ pub struct Paths {
     #[serde(default = "default_shader_dirs", alias = "shadersDir",
             deserialize_with = "one_or_many")]
     pub shader_directories: Vec<String>,
+    /// Searched for the libraries named in [`ProjectConfig::modules`], ahead of the modules that
+    /// ship with the framework — so a project can carry (or override) a module by dropping its
+    /// build in one of these. Empty is the common case: bare module names resolve against the
+    /// framework's own module directory without any configuration. Skipped when empty so older
+    /// projects are not churned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub module_directories: Vec<String>,
 }
 
 fn default_asset_dirs() -> Vec<String> {
@@ -154,6 +182,7 @@ impl Default for Paths {
         Self {
             asset_directories: default_asset_dirs(),
             shader_directories: default_shader_dirs(),
+            module_directories: Vec::new(),
         }
     }
 }
@@ -271,6 +300,85 @@ mod contract_tests {
     fn dump_fresh_project_config() {
         let cfg = ProjectConfig::new("MyProject", "0.0.1", [0.55, 0.72, 0.61], Kind::Scene);
         println!("{}", serde_json::to_string_pretty(&cfg).unwrap());
+    }
+
+    /// The modules list is the runtime's feature switch; the Hub carrying it through a load/save
+    /// round trip is what makes editing any *other* setting safe for a project that uses modules.
+    #[test]
+    fn modules_survive_a_round_trip() {
+        let cfg: ProjectConfig = serde_json::from_str(
+            r#"{ "schemaVersion":1, "name":"Modular", "color":[1,0,0], "frameworkVersion":"0.0.9",
+                 "modules": ["koral-camera", "modules/libphysics.so"],
+                 "paths": { "moduleDirectories": ["modules"] } }"#,
+        )
+        .expect("a config with modules should parse");
+        assert_eq!(cfg.modules, vec!["koral-camera", "modules/libphysics.so"]);
+        assert_eq!(cfg.paths.module_directories, vec!["modules".to_string()]);
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("koral-camera"), "saving must not drop the modules list");
+        assert!(json.contains("moduleDirectories"));
+    }
+
+    /// A project with no modules must not gain the keys just because the Hub saved it.
+    #[test]
+    fn absent_modules_stay_absent() {
+        let cfg = ProjectConfig::new("Plain", "0.0.9", [0.0, 0.0, 0.0], Kind::Scene);
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("\"modules\""));
+        assert!(!json.contains("moduleDirectories"));
+    }
+
+    /// The Module kind serializes as plain "Module" and round-trips; its flags say what the UI
+    /// and builder need them to: buildable, not runnable, no window.
+    #[test]
+    fn module_kind_round_trips_and_is_not_runnable() {
+        let cfg = ProjectConfig::new("Cameras", "0.0.9", [0.1, 0.2, 0.3], Kind::Module);
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"kind\":\"Module\""));
+
+        let back: ProjectConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kind, Kind::Module);
+        assert!(!back.kind.is_runnable());
+        assert!(!back.kind.has_window());
+        assert!(Kind::Scene.is_runnable() && Kind::Job.is_runnable());
+    }
+
+    /// The exact document shipped with the CameraDemo sample project, which is also the shape a
+    /// hand-written module-using project takes. `list_recent_projects` drops a project whose
+    /// config fails to parse, so a missing required key here would show up only as a card that
+    /// silently never appears — this is the test that catches it instead.
+    #[test]
+    fn parses_the_camera_demo_project() {
+        let cfg: ProjectConfig = serde_json::from_str(
+            r#"{
+              "schemaVersion": 1,
+              "name": "CameraDemo",
+              "color": [0.31, 0.76, 0.79],
+              "frameworkVersion": "0.0.10",
+              "kind": "Scene",
+              "rendering": {
+                "api": "Vulkan",
+                "platform": "auto",
+                "window": { "width": 1280, "height": 720, "resizable": true,
+                            "fullscreen": false, "borderless": false, "transparent": false,
+                            "vsync": true, "imguiIni": "imgui.ini" }
+              },
+              "paths": {
+                "assetDirectories": ["assets"],
+                "shaderDirectories": ["shaders"]
+              },
+              "libraries": [],
+              "modules": ["koral-camera"]
+            }"#,
+        )
+        .expect("the shipped CameraDemo config must load");
+
+        assert_eq!(cfg.name, "CameraDemo");
+        assert_eq!(cfg.kind, Kind::Scene);
+        assert!(cfg.kind.is_runnable());
+        assert_eq!(cfg.modules, vec!["koral-camera".to_string()]);
+        assert_eq!(cfg.paths.shader_directories, vec!["shaders".to_string()]);
     }
 
     /// A project written before the directory lists existed must still load.

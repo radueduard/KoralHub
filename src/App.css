@@ -1,3 +1,13 @@
+/* Component styles.
+ *
+ * Shape language: One UI. Three rules do most of the work, and breaking one is what makes a
+ * control look out of place here:
+ *   1. Containers are very round (--r-card / --r-panel); controls are fully round (--r-pill).
+ *   2. Surfaces separate by *fill*, not by outline. Borders appear only where a hairline is the
+ *      only thing that would keep two near-identical surfaces apart (light mode's white on grey).
+ *   3. Padding is generous, and touch targets are large — nothing is smaller than 34px.
+ */
+
 .app {
   display: flex;
   flex-direction: column;
@@ -9,58 +19,58 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 14px 22px;
-  border-bottom: 1px solid var(--border);
+  padding: 14px 18px 14px 24px;
   background: var(--bg-elevated);
+  flex: none;
 }
 
 .brand {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   font-weight: 700;
-  font-size: 15px;
-  letter-spacing: 0.2px;
+  font-size: 16px;
+  letter-spacing: -0.01em;
   /* The title bar is the window drag handle; letting clicks fall through the brand to the
      header (which carries data-tauri-drag-region) makes the whole left side draggable. */
   pointer-events: none;
 }
 
 .brand-logo {
-  width: 26px;
-  height: 26px;
-  border-radius: 6px;
+  width: 28px;
+  height: 28px;
+  border-radius: 9px;
   display: block;
 }
 
 .titlebar-actions {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
 }
 
 /* --- Custom window controls (native decorations are disabled) --- */
 .window-controls {
   display: flex;
   gap: 2px;
-  margin-left: 8px;
+  margin-left: 10px;
 }
 
 .win-btn {
-  width: 36px;
-  height: 30px;
+  width: 38px;
+  height: 34px;
   display: grid;
   place-items: center;
   padding: 0;
   border: none;
-  border-radius: 7px;
+  border-radius: var(--r-small);
   background: transparent;
   color: var(--text-dim);
   cursor: pointer;
-  transition: background 120ms ease, color 120ms ease;
+  transition: background 160ms ease, color 160ms ease;
 }
 .win-btn:hover {
-  background: var(--bg-card-hover);
+  background: var(--overlay);
   color: var(--text);
 }
 .win-btn svg {
@@ -73,98 +83,69 @@
 }
 
 /* --- Buttons --- */
+/* Fully round, and filled rather than outlined: One UI has no outlined button. */
 .btn {
-  border: 1px solid transparent;
-  border-radius: 8px;
-  padding: 8px 16px;
-  font-size: 13px;
+  border: none;
+  border-radius: var(--r-pill);
+  padding: 10px 20px;
+  font-size: 13.5px;
   font-weight: 600;
+  letter-spacing: -0.01em;
   cursor: pointer;
-  transition: background 120ms ease, border-color 120ms ease, transform 60ms ease;
+  transition: background 160ms ease, color 160ms ease, transform 120ms ease, opacity 160ms ease;
 }
-.btn:active {
-  transform: translateY(1px);
+.btn:active:not(:disabled) {
+  transform: scale(0.96);
+}
+.btn:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .btn-primary {
   background: var(--accent);
-  color: white;
+  color: #fff;
 }
-.btn-primary:hover {
+.btn-primary:hover:not(:disabled) {
   background: var(--accent-hover);
 }
 
+/* The secondary button: a filled neutral pill, not an outline. */
 .btn-ghost {
-  background: transparent;
-  color: var(--text-dim);
-  border-color: var(--border);
-}
-.btn-ghost:hover {
+  background: var(--bg-input);
   color: var(--text);
+}
+.btn-ghost:hover:not(:disabled) {
   background: var(--bg-card-hover);
 }
 
-/* The round icon buttons on a project card sit in one row, so they share their box metrics —
-   only colour distinguishes them. Diverging sizes here read as a misalignment bug. */
-.btn-play,
-.btn-build,
+/* A round icon button. Sized to a comfortable target rather than to its glyph. */
 .btn-icon {
   background: transparent;
   border-radius: 50%;
-  width: 38px;
-  height: 38px;
+  width: 40px;
+  height: 40px;
   padding: 0;
   font-size: 17px;
   line-height: 1;
   display: grid;
   place-items: center;
   flex: none;
-}
-
-.btn-play {
   color: var(--text-dim);
 }
-.btn-play:hover {
-  color: var(--play);
-  background: rgba(26, 200, 26, 0.12);
-}
-
-.btn-icon {
-  color: var(--text-faint);
-}
-.btn-icon:hover {
+.btn-icon:hover:not(:disabled) {
   color: var(--text);
-  background: var(--bg-card-hover);
-}
-
-/* The hammer build button — same round metrics as ▶ (shared above), sitting just left of it.
-   Neutral until hovered so ▶ stays the primary action. */
-.btn-build {
-  color: var(--text-dim);
-}
-.btn-build:hover:not(:disabled) {
-  color: var(--text);
-  background: var(--bg-card-hover);
-}
-.btn-build:disabled {
-  opacity: 0.3;
-  cursor: default;
-}
-/* Monochrome via currentColor; mirrored so the head faces the same way as the ▶ beside it. */
-.hammer-icon {
-  width: 18px;
-  height: 18px;
-  transform: scaleX(-1);
-}
-
-/* Destructive actions only — the neutral .btn-icon hover must not look like a delete. */
-.btn-danger:hover {
-  color: #e05555;
-  background: rgba(224, 85, 85, 0.12);
+  background: var(--overlay);
 }
 .btn-icon:disabled {
   opacity: 0.3;
   cursor: default;
+}
+
+/* Destructive actions only — the neutral .btn-icon hover must not look like a delete. */
+.btn-danger:hover:not(:disabled) {
+  color: var(--danger);
+  background: var(--danger-soft);
 }
 /* Reordering is not destructive — it shouldn't wear the delete button's red. */
 .btn-move:hover:not(:disabled) {
@@ -172,102 +153,29 @@
   background: var(--overlay);
 }
 
-/* Compact pill buttons that share a row with cards' icon buttons — kept vertically centred (no
-   align-self override) so they line up with the round .btn-icon / .btn-play beside them. */
 .btn-small {
-  padding: 7px 14px;
+  padding: 8px 16px;
   font-size: 13px;
 }
 
-/* One entry of a search list: the path, then reorder and remove. */
-.dir-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+.btn-destructive {
+  background: var(--danger);
+  color: #fff;
 }
-.dir-row .input {
-  flex: 1;
-  min-width: 0;
+.btn-destructive:hover:not(:disabled) {
+  background: #e8695c;
 }
 
-.error {
-  color: var(--danger);
-  background: rgba(224, 85, 85, 0.1);
-  border: 1px solid rgba(224, 85, 85, 0.3);
-  border-radius: 8px;
-  padding: 10px 14px;
-  margin-bottom: 16px;
-  font-size: 13px;
-}
-
-/* --- Build console --- */
-.console {
-  border-top: 1px solid var(--border);
-  background: var(--console-bg);
-  display: flex;
-  flex-direction: column;
-  max-height: 240px;
-}
-
-.console-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 4px 8px 4px 16px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-dim);
-  border-bottom: 1px solid var(--border);
-}
-
-/* Build / Output tabs inside the console header. */
-.console-tabs {
-  display: flex;
-  gap: 2px;
-}
-.console-tab {
-  padding: 6px 12px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-faint);
-  background: transparent;
+/* An action that belongs mid-sentence in a hint, so it reads as part of the explanation rather
+   than as another control competing with the panel's buttons. */
+.link-button {
+  padding: 0;
+  font: inherit;
+  color: var(--accent);
+  background: none;
   border: none;
-  border-bottom: 2px solid transparent;
+  text-decoration: underline;
   cursor: pointer;
-  transition: color 120ms ease, border-color 120ms ease;
-}
-.console-tab:hover {
-  color: var(--text-dim);
-}
-.console-tab.active {
-  color: var(--text);
-  border-bottom-color: var(--accent);
-}
-
-.console-body {
-  margin: 0;
-  padding: 12px 16px;
-  overflow-y: auto;
-  font-family: "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--console-text);
-  white-space: pre-wrap;
-  word-break: break-word;
-  user-select: text;
-}
-
-/* --- Content --- */
-.content {
-  flex: 1;
-  overflow-y: auto;
-  padding: 28px 32px;
-}
-
-.section-title {
-  font-size: 22px;
-  font-weight: 800;
-  margin-bottom: 20px;
 }
 
 .muted {
@@ -280,94 +188,423 @@
 }
 
 .empty {
-  padding: 48px 0;
+  padding: 56px 0;
   text-align: center;
 }
 
-/* --- Project cards --- */
-.project-list {
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  /* Separates the last card from the next section heading, which carries no top margin.
-     Same value as .fw-list. */
-  margin-bottom: 32px;
+.error {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-radius: var(--r-control);
+  padding: 13px 18px;
+  margin-bottom: 16px;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
-.project-card {
+/* --- Library: sidebar list + detail panel --- */
+/* The two halves scroll independently and the page itself never does, so the list stays put while
+   you read a long settings panel — the whole point of the split. */
+.library {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(260px, 320px) 1fr;
+  background: var(--bg);
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-elevated);
+}
+
+.sidebar-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px 12px;
+}
+.sidebar-filter {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 16px;
+  font-size: 13px;
+  border-radius: var(--r-pill);
+}
+/* A menu hanging off the left edge of its button, for a trigger near the sidebar's left margin —
+   the default right-alignment would run it off the panel. */
+.card-menu.menu-left {
+  right: auto;
+  left: 0;
+}
+/* A trigger at the bottom of the window has nowhere below it to put a menu. */
+.card-menu.menu-up {
+  top: auto;
+  bottom: calc(100% + 8px);
+}
+.menu-note {
+  margin: 8px 12px 4px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-faint);
+}
+.menu-divider {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 6px 8px;
+}
+
+.sidebar-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 10px 16px;
+}
+.sidebar-empty {
+  padding: 24px 10px;
+}
+
+/* The Hub's own actions, pinned under the list. A hairline is the only thing separating them from
+   the rows above — both sit on the elevated surface. */
+.sidebar-foot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 12px 12px 14px;
+  border-top: 1px solid var(--border);
+}
+
+/* A round icon that grows its label on hover: four labels at once would shout over the list, but a
+   bare icon has to be able to say what it is. The icon never moves — only the label's width
+   animates — so the row reads as still until it is pointed at. */
+.btn-foot {
+  flex: 0 1 auto;
+  min-width: 36px;
+  height: 36px;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 0;
+  font-size: 13px;
+  white-space: nowrap;
+  transition: background 160ms ease, color 160ms ease, transform 120ms ease, gap 200ms ease;
+}
+.btn-foot svg {
+  flex: none;
+  display: block;
+}
+.btn-foot-label {
+  min-width: 0;
+  max-width: 0;
+  overflow: hidden;
+  /* Only reached on a sidebar too narrow for the open label — better a trailing … than a hard cut. */
+  text-overflow: ellipsis;
+  opacity: 0;
+  transition: max-width 200ms ease, opacity 140ms ease;
+}
+/* Keyboard focus opens the label too — otherwise tabbing through gives four unlabelled circles. And
+   a menu holds its trigger open, since the pointer has left the button to reach the menu. */
+.btn-foot:hover:not(:disabled),
+.btn-foot:focus-visible,
+.btn-foot.menu-open {
+  gap: 8px;
+}
+.btn-foot:hover:not(:disabled) .btn-foot-label,
+.btn-foot:focus-visible .btn-foot-label,
+.btn-foot.menu-open .btn-foot-label {
+  max-width: 130px;
+  opacity: 1;
+}
+.btn-foot.menu-open {
+  background: var(--bg-card-hover);
+}
+
+/* New Project wears its label from the start — starting one is what the panel is for — and gives it
+   up while a neighbour is being pointed at, so exactly one label is ever open. Where `:has` is
+   missing this rule drops and the label simply stays out, which is the harmless half of the pair. */
+.btn-foot-open {
+  gap: 8px;
+}
+.btn-foot-open .btn-foot-label {
+  max-width: 130px;
+  opacity: 1;
+}
+.sidebar-foot:has(.btn-foot:hover, .btn-foot:focus-visible, .btn-foot.menu-open)
+  .btn-foot-open:not(:hover):not(:focus-visible) {
+  gap: 0;
+}
+.sidebar-foot:has(.btn-foot:hover, .btn-foot:focus-visible, .btn-foot.menu-open)
+  .btn-foot-open:not(:hover):not(:focus-visible)
+  .btn-foot-label {
+  max-width: 0;
+  opacity: 0;
+}
+
+/* A group heading — Scenes / Jobs / Modules / Collections. Deliberately unlike an item row: small,
+   quiet and uppercase, so it reads as a label over the list rather than as another thing to open. */
+.group-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 6px;
+  margin-top: 8px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  transition: color 160ms ease;
+}
+.group-row:first-child {
+  margin-top: 0;
+}
+.group-row:hover {
+  color: var(--text-dim);
+}
+.group-chevron {
+  flex: none;
+  width: 10px;
+  font-size: 9px;
+  transition: transform 200ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+.group-chevron.open {
+  transform: rotate(90deg);
+}
+.group-label {
+  flex: 1;
+  text-align: left;
+}
+.group-count {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+/* Every row in the tree — a project, a collection, or an entry inside one — shares its metrics, so
+   nesting reads as hierarchy rather than as differently-sized things. */
+.row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  margin-bottom: 2px;
+  text-align: left;
+  background: transparent;
+  border: none;
+  /* Rounded far enough to read as a One UI list pill, but not fully round: these stack. */
+  border-radius: 18px;
+  color: var(--text);
+  cursor: pointer;
+  transition: background 160ms ease;
+}
+.row:hover {
+  background: var(--overlay);
+}
+/* Selection is a tinted fill. An outline would fight the round corners and the swatch inside. */
+.row-active,
+.row-active:hover {
+  background: var(--accent-soft);
+}
+/* Entries belong to the collection above them; the indent is what says so. */
+.row-lab {
+  padding-left: 28px;
+}
+
+.row-swatch {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  font-size: 14px;
+  color: white;
+}
+/* An entry that is not on this machine yet: outlined rather than filled, since there is no project
+   to take a colour from. */
+.row-swatch-ghost {
+  color: var(--text-faint);
+  border: 1.5px dashed var(--border-strong);
+  background: transparent;
+}
+
+.row-meta {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  gap: 2px;
+}
+.row-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row-sub {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row-kind {
+  flex: none;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 3px 9px;
+  background: var(--bg-input);
+  border-radius: var(--r-pill);
+}
+
+/* A job running on a project that may not be the one on screen: a slow pulse, sized like the
+   git dot so a row's right edge stays quiet. */
+.row-building {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: row-building-pulse 1.4s ease-in-out infinite;
+}
+@keyframes row-building-pulse {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.row-chevron {
+  flex: none;
+  width: 34px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-faint);
+  transition: transform 200ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+.row-chevron.open {
+  transform: rotate(90deg);
+}
+
+/* --- Detail panel --- */
+.detail {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 26px 32px 40px;
+}
+
+.detail-head {
   display: flex;
   align-items: center;
   gap: 16px;
-  padding: 14px 16px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  transition: background 120ms ease, border-color 120ms ease;
-}
-.project-card:hover {
-  background: var(--bg-card-hover);
-  border-color: var(--border-strong);
 }
 
-.project-swatch {
-  flex-shrink: 0;
-  width: 46px;
-  height: 46px;
-  border-radius: 11px;
+.detail-swatch {
+  flex: none;
+  width: 56px;
+  height: 56px;
+  border-radius: 20px;
   display: grid;
   place-items: center;
   font-weight: 800;
-  font-size: 20px;
+  font-size: 24px;
   color: white;
 }
-
-.project-meta {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  flex: 1;
+.detail-swatch-collection {
+  color: var(--text-dim);
+  background: var(--bg-input);
 }
-
-.project-name {
-  font-weight: 700;
-  font-size: 15px;
-}
-
-.project-path {
+.detail-swatch-ghost {
   color: var(--text-faint);
-  font-size: 12.5px;
-  white-space: nowrap;
+  border: 2px dashed var(--border-strong);
+}
+
+.detail-title-block {
+  flex: 1;
+  min-width: 0;
+}
+.detail-title {
+  margin: 0;
+  font-size: 27px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+.detail-path {
+  margin: 4px 0 0;
+  font-family: "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
+  font-size: 11.5px;
+  color: var(--text-faint);
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
-
-.project-fw {
-  flex-shrink: 0;
+.detail-desc {
+  margin: 18px 0 0;
+  font-size: 14px;
+  line-height: 1.55;
   color: var(--text-dim);
+}
+.detail-remote {
   font-size: 12px;
-  font-variant-numeric: tabular-nums;
-  padding: 4px 10px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
+  color: var(--text-faint);
 }
 
-/* Git badge: branch name in a pill, matching the framework pill's metrics. */
+.detail-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.badge-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+/* Badges: filled pills, no outlines. */
+.project-kind,
+.project-fw,
 .project-git {
-  flex-shrink: 0;
+  flex: none;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  max-width: 160px;
+  gap: 6px;
+  font-size: 11.5px;
+  font-weight: 600;
   color: var(--text-dim);
-  font-size: 12px;
-  padding: 4px 10px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
+  background: var(--bg-input);
+  padding: 5px 12px;
+  border-radius: var(--r-pill);
 }
-.git-icon {
-  flex: none;
-  opacity: 0.75;
+.project-kind {
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+.project-fw {
+  font-variant-numeric: tabular-nums;
+}
+.project-git {
+  max-width: 200px;
 }
 .git-branch-name {
   overflow: hidden;
@@ -382,498 +619,80 @@
   line-height: 1;
 }
 
-/* --- Framework cards --- */
-.fw-list {
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  margin-bottom: 32px;
-}
 
-.fw-card {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 14px 16px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-}
-.fw-card:hover {
-  background: var(--bg-card-hover);
-}
-/* An installed SDK reads as "present", not as another thing to act on. */
-.fw-installed {
-  border-color: #2f6f4f;
-}
-
-.fw-meta {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-width: 0;
-}
-
-.fw-version {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-weight: 600;
-}
-
-.fw-sub {
-  color: var(--text-faint);
-  font-size: 13px;
-  margin-top: 4px;
-  /* Asset names are long; never let one push the buttons off the card. */
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.fw-tag {
-  padding: 2px 8px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  color: var(--text-faint);
-  font-size: 11px;
-  font-weight: 500;
-  text-transform: uppercase;
-}
-
-.fw-progress {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-/* No `value` attribute => the browser renders this indeterminate, which is exactly what we
-   want when the server sends no Content-Length. */
-.fw-bar {
-  width: 160px;
-  height: 6px;
-}
-
-/* --- Tabs --- */
-.tabs {
-  display: flex;
-  gap: 4px;
-  margin-bottom: 24px;
-  border-bottom: 1px solid var(--border);
-}
-
-.tab {
-  position: relative;
-  padding: 10px 16px;
-  border: none;
-  background: transparent;
-  color: var(--text-dim);
-  font-size: 14px;
-  font-weight: 600;
-  cursor: pointer;
-  /* Sit on top of the row's bottom border so the active underline replaces it. */
-  margin-bottom: -1px;
-  border-bottom: 2px solid transparent;
-  transition: color 120ms ease, border-color 120ms ease;
-}
-.tab:hover {
-  color: var(--text);
-}
-.tab-active {
-  color: var(--text);
-  border-bottom-color: var(--accent);
-}
-
-/* --- Lab collections --- */
-/* A heading with a trailing action (Add collection) on the same baseline. The section-title keeps
-   its own bottom margin, so the row that holds it must not add another. */
-.section-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-}
-.section-head .section-title {
-  margin-bottom: 0;
-}
-.section-head + * {
-  margin-top: 20px;
-}
-
-.collection-list {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  margin-bottom: 32px;
-}
-
-.collection-card {
-  padding: 16px;
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-}
-/* Authored collections are list items rather than <section>s; keep the card look. */
-li.collection-card {
-  list-style: none;
-}
-
-/* Intro copy above the authored list. It also carries .field-hint, whose negative top margin
-   (meant for hints tucked under a form label) would otherwise pull this up into the title — so
-   raise specificity here to reinstate a normal top gap and separation from the cards below. */
-p.collections-blurb {
-  margin: 6px 0 18px;
-}
-
-.collection-head {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-/* Chevron that folds a collection card. Sits flush-left of the title; a hair smaller than the
-   card's danger button so it reads as a disclosure control, not a primary action. */
-.collapse-toggle {
-  width: 30px;
-  height: 30px;
-  font-size: 12px;
-  color: var(--text-faint);
-}
-.collapse-toggle:hover {
-  color: var(--text);
-  background: var(--bg-card-hover);
-}
-/* The whole title block toggles too — hint that with a pointer, and keep the fold obvious. */
-.collection-meta {
-  cursor: pointer;
-}
-.collection-card.collapsed .collection-head {
-  /* No body follows when folded; drop the head's reliance on card padding for bottom breathing. */
-  margin: 0;
-}
-
-/* The source of a collection (its git URL, or an authored one's local path) — the extra locating
-   detail. Monospace and dim so it stays secondary to the title/description. */
-.collection-source {
-  margin-top: 3px;
-  font-family: "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
-  font-size: 11.5px;
-  color: var(--text-faint);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* Lab-count pill on an authored collection, matching the framework/kind pills. */
-.collection-count {
-  flex-shrink: 0;
-  color: var(--text-dim);
-  font-size: 12px;
-  padding: 4px 10px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-}
-
-.collection-meta {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-width: 0;
-}
-
-.collection-title {
-  font-weight: 700;
-  font-size: 15px;
-}
-
-.collection-sub {
-  color: var(--text-faint);
-  font-size: 12.5px;
-  margin-top: 3px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* The card owns its error, so drop the list-spacing margin and give it a little breathing room. */
-.collection-card .error {
-  margin: 12px 0 0;
-}
-
-/* The member projects of an authored collection, listed under the card head with reorder/remove. */
-.collection-empty {
-  margin: 14px 0 0;
-}
-.member-list {
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  margin-top: 14px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
-}
-.member-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 6px 8px;
-  border-radius: 8px;
-}
-.member-row:hover {
-  background: var(--bg-card-hover);
-}
-.member-index {
-  flex: none;
-  width: 18px;
-  text-align: center;
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-  color: var(--text-faint);
-}
-.member-meta {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-width: 0;
-}
-.member-name {
-  font-size: 13.5px;
-  font-weight: 600;
-}
-.member-sub {
-  margin-top: 1px;
-  font-size: 12px;
-  color: var(--text-faint);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.member-actions {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  flex: none;
-}
-/* Row controls are a touch smaller than a project card's icon buttons. */
-.member-actions .btn-icon {
-  width: 30px;
-  height: 30px;
-  font-size: 15px;
-}
-
-.lab-list {
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-  margin-top: 12px;
-  border-top: 1px solid var(--border);
-}
-
-.lab-row {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 11px 2px;
-  border-bottom: 1px solid var(--border);
-}
-.lab-row:last-child {
-  border-bottom: none;
-}
-
-.lab-meta {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-width: 0;
-}
-
-.lab-name {
-  font-weight: 600;
-  font-size: 13.5px;
-}
-
-.lab-desc {
-  color: var(--text-faint);
-  font-size: 12px;
-  margin-top: 2px;
-}
-
-/* Ordinal for a project inside an imported collection — matches the authored .member-index. */
-.lab-index {
-  flex: none;
-  width: 18px;
-  text-align: center;
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-  color: var(--text-faint);
-}
-
-/* Where the project's repo lives — the extra "information on their projects" the header asked for. */
-.lab-repo {
-  margin-top: 3px;
-  font-family: "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
-  font-size: 11px;
-  color: var(--text-faint);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* "Downloaded" flag beside a project already on disk. Quiet green so it informs without shouting. */
-.lab-badge {
-  margin-left: 8px;
-  padding: 1px 7px;
-  border-radius: 999px;
-  font-size: 10.5px;
-  font-weight: 600;
-  vertical-align: middle;
-  color: var(--play);
-  background: rgba(26, 200, 26, 0.12);
-}
-
-/* --- Accounts (sign-in) --- */
-.modal-divider {
-  border: none;
-  border-top: 1px solid var(--border);
-  margin: 6px 0 2px;
-}
-
-.account-list {
-  list-style: none;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.account-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg);
-}
-
-.account-meta {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-width: 0;
-}
-
-.account-name {
-  font-weight: 600;
-  font-size: 13px;
-}
-.account-host {
-  color: var(--text-faint);
-  font-weight: 400;
-}
-.account-provider {
-  color: var(--text-faint);
-  font-size: 11px;
-  text-transform: uppercase;
-  margin-top: 2px;
-}
-
-/* Rows of sign-in controls (a bare button, or the GitLab host input + button). */
-.account-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.account-host-input {
-  flex: 1;
-  min-width: 0;
-}
-
-/* The big, copyable user code in the device-flow dialog. */
-.device-code {
-  align-self: center;
-  padding: 12px 20px;
-  font-family: "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
-  font-size: 26px;
-  font-weight: 700;
-  letter-spacing: 4px;
-  color: var(--text);
-  background: var(--bg);
-  border: 1px solid var(--border-strong);
-  border-radius: 10px;
-  user-select: all;
-}
-
-/* A URL shown for the user to open/copy — selectable, wrapping, never overflowing the dialog. */
-.device-uri {
-  display: block;
-  padding: 8px 10px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  font-size: 12.5px;
-  color: var(--text-dim);
-  user-select: all;
-  overflow-wrap: anywhere;
-}
-
-/* --- New-project dialog --- */
-.modal-scrim {
-  position: fixed;
-  inset: 0;
-  z-index: 10;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  background: var(--scrim);
-}
-
-.modal {
-  width: 100%;
-  max-width: 460px;
+/* --- Inline settings --- */
+/* The stack every detail panel's body sits in. `.detail` itself is a plain block, so a panel put
+   straight into it would have no separation at all from the badge row above — this is what gives
+   the sections their rhythm, and every kind of detail (project, collection, entry) needs it. */
+.settings,
+.detail-sections {
   display: flex;
   flex-direction: column;
   gap: 14px;
-  padding: 22px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--bg-elevated);
+  margin-top: 22px;
+}
+/* A hint's pull-up margin is meant for tucking it under a form label; inside a gap-ed stack it
+   would instead drag it into the panel above. */
+.detail-sections > .field-hint {
+  margin-top: 0;
+}
+
+/* One group of settings — the One UI "settings card": a big rounded block per section. */
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 20px 22px;
+  background: var(--bg-card);
+  border: 1px solid var(--card-border);
+  border-radius: var(--r-card);
+}
+.panel-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: var(--accent);
+}
+/* Inside a panel the fields already sit in a gap-ed column, so a hint's pull-up margin (meant for
+   tucking under a label) would collide with the field above it. */
+.panel > .field-hint {
+  margin-top: -6px;
+}
+.self-start {
+  align-self: flex-start;
+}
+
+/* Only present while there is something to save, and pinned so it is reachable from anywhere in a
+   long panel. */
+.save-bar {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+  background: var(--bg-card);
+  border: 1px solid var(--accent);
+  border-radius: var(--r-card);
   box-shadow: var(--shadow);
 }
-
-/* A modal whose content can exceed the viewport (Settings): cap its height and let the middle
-   scroll, so the title stays at the top and the Cancel/Save row stays pinned at the bottom. */
-.modal-tall {
-  max-height: calc(100vh - 48px);
-}
-.modal-scroll {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+.save-note {
   flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  /* Keep focus rings and the divider off the scrollbar edge. */
-  padding-right: 10px;
-  margin-right: -10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
 }
 
-.modal-title {
-  margin: 0;
-  font-size: 16px;
-  font-weight: 700;
-}
-
+/* --- Fields --- */
 .field {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
 .field-label {
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 600;
   color: var(--text-dim);
 }
@@ -891,121 +710,309 @@ p.collections-blurb {
   flex: none;
 }
 
+/* Filled, not outlined — the border is transparent until focus, so focus does not shift layout. */
 .input {
   width: 100%;
-  padding: 9px 12px;
-  font-size: 13px;
+  padding: 12px 16px;
+  font-size: 13.5px;
+  font-family: inherit;
   color: var(--text);
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  transition: border-color 120ms ease;
+  background: var(--bg-input);
+  border: 1.5px solid transparent;
+  border-radius: var(--r-control);
+  transition: border-color 160ms ease, background 160ms ease;
 }
 .input:focus {
   outline: none;
   border-color: var(--accent);
 }
+.input:disabled {
+  color: var(--text-faint);
+}
+
+/* The dropdown trigger. A button rather than a <select>, because a native select draws both its
+   own button chrome *and* an OS popup, neither of which CSS can reach — see the `Select`
+   component. Wearing `.input` too, so it is the same box as every text field beside it. */
+.select-trigger {
+  display: flex;
+  align-items: center;
+  text-align: left;
+  cursor: pointer;
+  padding-right: 42px;
+  background-image: var(--chevron);
+  background-repeat: no-repeat;
+  background-position: right 16px center;
+}
+.select-trigger:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+}
+.select-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The list, drawn by us so it matches everything else. Positioned against the viewport (see
+   `place`), so it is never clipped by a scrolling panel or a modal. */
+.select-menu {
+  position: fixed;
+  z-index: 60;
+  max-height: 288px;
+  overflow-y: auto;
+  padding: 6px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--card-border);
+  border-radius: var(--r-control);
+  box-shadow: var(--shadow);
+  transform-origin: top center;
+  animation: select-pop 140ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+.select-menu-up {
+  transform-origin: bottom center;
+}
+@keyframes select-pop {
+  from {
+    opacity: 0;
+    transform: scaleY(0.9);
+  }
+  to {
+    opacity: 1;
+    transform: scaleY(1);
+  }
+}
+
+.select-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 12px;
+  border-radius: var(--r-small);
+  font-size: 13.5px;
+  color: var(--text);
+  cursor: pointer;
+}
+/* Hover and keyboard both drive the same highlight, so the two never disagree about what Enter
+   would pick. */
+.select-option.active {
+  background: var(--overlay);
+}
+.select-option.selected {
+  color: var(--accent);
+  font-weight: 600;
+}
+.select-option.selected::after {
+  content: "✓";
+  margin-left: auto;
+  font-size: 12px;
+}
+
+/* The browser's spinner buttons are a chunk of chrome nothing else here has, and they sit badly
+   inside a filled pill. A window size is dragged or typed — see `scrubNumber`. */
+.input[type="number"] {
+  appearance: textfield;
+  -moz-appearance: textfield;
+  cursor: ew-resize;
+}
+.input[type="number"]::-webkit-outer-spin-button,
+.input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+/* The search field's clear button, same reasoning. */
+.input[type="search"]::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+}
 
 .field-hint {
-  margin: -4px 0 0;
-  font-size: 12px;
+  margin: -2px 0 0;
+  font-size: 12.5px;
+  line-height: 1.5;
   color: var(--text-faint);
   overflow-wrap: anywhere;
 }
 .field-hint code {
   color: var(--text-dim);
+  font-size: 12px;
 }
 .field-bad {
   color: var(--danger);
 }
 
-.modal-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 10px;
-  margin-top: 4px;
+.field-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 14px;
 }
 
-/* The dialog owns its error, so drop the list-spacing margin. */
-.modal .error {
-  margin-bottom: 0;
-}
-
-/* --- Add-project dialog: mode toggle + project picker --- */
-.segmented {
+/* One entry of a search list: the path, then reorder and remove. */
+.dir-row {
   display: flex;
-  gap: 4px;
-  padding: 3px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 9px;
+  align-items: center;
+  gap: 8px;
 }
-.segmented button {
+.dir-row .input {
   flex: 1;
-  padding: 6px 10px;
-  font-size: 12.5px;
-  font-weight: 600;
-  color: var(--text-dim);
-  background: transparent;
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
-  transition: background 120ms ease, color 120ms ease;
-}
-.segmented button:hover {
-  color: var(--text);
-}
-.segmented button.active {
-  color: var(--text);
-  background: var(--bg-card-hover);
+  min-width: 0;
 }
 
-/* Scrollable radio list of the user's projects, one selectable per add. */
+/* --- Switches --- */
+/* The One UI toggle: a pill track with a sliding knob, replacing the browser checkbox entirely. */
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13.5px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.toggle:hover {
+  color: var(--text);
+}
+.toggle input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: none;
+  position: relative;
+  width: 46px;
+  height: 27px;
+  margin: 0;
+  border-radius: var(--r-pill);
+  background: var(--switch-off);
+  cursor: pointer;
+  transition: background 200ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+.toggle input[type="checkbox"]::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 21px;
+  height: 21px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  transition: transform 200ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+.toggle input[type="checkbox"]:checked {
+  background: var(--accent);
+}
+.toggle input[type="checkbox"]:checked::after {
+  transform: translateX(19px);
+}
+.toggle input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Window flags: several switches, each needing room for a 46px track plus its label. Columns are
+   even, but each switch keeps its natural width inside its column — stretching them would strand
+   the label a long way from the control it belongs to. */
+.toggle-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  justify-items: start;
+  gap: 14px 20px;
+}
+
+/* The one toggle that arms an irreversible action, so it does not read as an ordinary option. */
+.danger-toggle {
+  padding: 14px 16px;
+  border-radius: var(--r-control);
+  background: var(--bg-input);
+}
+.danger-toggle:has(input:checked) {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+.danger-toggle input[type="checkbox"]:checked {
+  background: var(--danger);
+}
+
+/* --- Grouped selection lists (module checklist, collection picker) --- */
+/* A One UI grouped list: one sunken rounded block, rows divided by hairlines rather than gaps. */
+.module-picker,
 .project-picker {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  max-height: 220px;
+  max-height: 260px;
   overflow-y: auto;
-  padding: 4px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg);
+  border-radius: var(--r-control);
+  background: var(--bg-input);
 }
 .pick-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
-  border-radius: 6px;
+  gap: 14px;
+  padding: 13px 16px;
   cursor: pointer;
-  transition: background 120ms ease;
+  transition: background 160ms ease;
+}
+.pick-row + .pick-row {
+  box-shadow: inset 0 1px 0 var(--border);
 }
 .pick-row:hover {
-  background: var(--bg-card-hover);
+  background: var(--overlay);
 }
 .pick-row.selected {
-  background: var(--bg-card-hover);
-  box-shadow: inset 0 0 0 1px var(--accent);
+  background: var(--accent-soft);
 }
+
+/* Round check/radio marks, filled with the accent when set. */
+.pick-row input[type="checkbox"],
 .pick-row input[type="radio"] {
-  accent-color: var(--accent);
+  appearance: none;
+  -webkit-appearance: none;
   flex: none;
+  position: relative;
+  width: 22px;
+  height: 22px;
+  margin: 0;
+  border: 2px solid var(--border-strong);
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+  transition: background 160ms ease, border-color 160ms ease;
 }
+.pick-row input:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.pick-row input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 2px;
+  width: 5px;
+  height: 10px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.pick-row input[type="radio"]:checked::after {
+  content: "";
+  position: absolute;
+  inset: 4px;
+  border-radius: 50%;
+  background: #fff;
+}
+
 .pick-meta {
   display: flex;
   flex-direction: column;
   flex: 1;
   min-width: 0;
+  gap: 3px;
 }
 .pick-name {
-  font-size: 13px;
+  font-size: 13.5px;
   font-weight: 600;
 }
 .pick-sub {
   color: var(--text-faint);
   font-size: 11.5px;
-  margin-top: 2px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1015,41 +1022,214 @@ p.collections-blurb {
   font-size: 10.5px;
   font-weight: 600;
   color: var(--text-dim);
-  padding: 2px 7px;
-  border: 1px solid var(--border-strong);
-  border-radius: 999px;
+  padding: 3px 10px;
+  background: var(--bg-card);
+  border-radius: var(--r-pill);
 }
 
-/* Drafts are only installable by whoever can see them (a signed-in maintainer), so they
-   should never be mistaken for a normal release. */
-.fw-tag-draft {
-  color: #e3b341;
-  border-color: rgba(227, 179, 65, 0.4);
-  background: rgba(227, 179, 65, 0.1);
-}
-
-/* --- Open-in-IDE actions --- */
-.project-ides {
+/* --- A collection's entries --- */
+.member-list {
+  list-style: none;
   display: flex;
-  gap: 6px;
+  flex-direction: column;
+  border-radius: var(--r-control);
+  overflow: hidden;
+  background: var(--bg-input);
+}
+.member-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 13px 16px;
+  transition: background 160ms ease;
+}
+.member-row + .member-row {
+  box-shadow: inset 0 1px 0 var(--border);
+}
+.member-row:hover {
+  background: var(--overlay);
+}
+.member-index {
+  flex: none;
+  width: 20px;
+  text-align: center;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+}
+.member-meta {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  gap: 3px;
+}
+.member-name {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.member-sub {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.member-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+/* Row controls are a touch smaller than the panel's own buttons. */
+.member-actions .btn-icon {
+  width: 34px;
+  height: 34px;
+  font-size: 15px;
 }
 
-.btn-ide {
-  padding: 8px 16px;
-  font-size: 13px;
+/* Small status flags on an entry. */
+.lab-badge {
+  margin-left: 8px;
+  padding: 2px 9px;
+  border-radius: var(--r-pill);
+  font-size: 10.5px;
   font-weight: 600;
+  vertical-align: middle;
+  color: var(--play);
+  background: rgba(36, 163, 36, 0.14);
+}
+/* Overrides the green of .lab-badge, which means "on disk" — this flag says something else. */
+.lab-badge-module {
+  color: var(--text-dim);
+  background: var(--bg-input);
+}
+
+/* --- Framework cards --- */
+.fw-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 30px;
+}
+
+.fw-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 18px 20px;
+  background: var(--bg-card);
+  border: 1px solid var(--card-border);
+  border-radius: var(--r-panel);
+  transition: background 160ms ease;
+}
+.fw-card:hover {
+  background: var(--bg-card-hover);
+}
+/* An installed SDK reads as "present", not as another thing to act on. */
+.fw-installed {
+  border-color: rgba(36, 163, 36, 0.4);
+}
+
+.fw-meta {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  gap: 4px;
+}
+
+.fw-version {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  font-size: 14.5px;
+}
+
+.fw-sub {
+  color: var(--text-faint);
+  font-size: 12.5px;
+  /* Asset names and paths are long; never let one push the buttons off the card. */
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-/* --- Project card "more actions" (⋮) menu --- */
+.fw-tag {
+  padding: 3px 10px;
+  border-radius: var(--r-pill);
+  background: var(--bg-input);
+  color: var(--text-dim);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+
+/* Drafts are only installable by whoever can see them (a signed-in maintainer), so they
+   should never be mistaken for a normal release. Also used for a non-Debug source build, which
+   is the same kind of "careful, this is not what you assume" flag. */
+.fw-tag-draft {
+  color: #e3b341;
+  background: rgba(227, 179, 65, 0.14);
+}
+
+/* What a project has to write to target a source build — worth showing, since it has no version
+   to copy and the pin is the only handle on it. */
+.fw-pin {
+  flex: none;
+  font-family: "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  padding: 6px 12px;
+  border-radius: var(--r-small);
+  background: var(--bg-input);
+}
+
+/* Section heading inside the Frameworks dialog, splitting source builds from published releases. */
+.fw-local-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 22px 0 12px;
+}
+/* The dialog title already spaces the first section, and the Done row spaces the last list. */
+.modal-scroll > .fw-local-head:first-child {
+  margin-top: 0;
+}
+.modal-scroll > .fw-list:last-child {
+  margin-bottom: 0;
+}
+.fw-local-title {
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+.fw-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* No `value` attribute => the browser renders this indeterminate, which is exactly what we
+   want when the server sends no Content-Length. */
+.fw-bar {
+  width: 170px;
+  height: 8px;
+  border-radius: var(--r-pill);
+  overflow: hidden;
+}
+
+/* --- Menus --- */
 .menu-wrap {
   position: relative;
   flex: none;
-}
-/* Keep the trigger looking active while its menu is open. */
-.btn-icon.menu-open {
-  color: var(--text);
-  background: var(--bg-card-hover);
 }
 /* A viewport-filling catcher so a click anywhere else closes the menu. */
 .menu-backdrop {
@@ -1059,23 +1239,35 @@ p.collections-blurb {
 }
 .card-menu {
   position: absolute;
-  top: calc(100% + 6px);
+  top: calc(100% + 8px);
   right: 0;
   z-index: 50;
-  min-width: 190px;
+  min-width: 210px;
   display: flex;
   flex-direction: column;
-  padding: 6px;
+  padding: 8px;
   background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  border: 1px solid var(--card-border);
+  border-radius: var(--r-panel);
   box-shadow: var(--shadow);
+}
+/* The right-click menu is placed against the viewport, not a card. Its width is fixed rather than
+   grown to the longest label, so it stays a menu rather than a banner; the last resort for a window
+   too short even for the fitted menu is to scroll it. */
+.context-menu {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 216px;
+  min-width: 0;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
 }
 .menu-info {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: 4px 10px 8px;
+  gap: 3px;
+  padding: 8px 12px 12px;
   margin-bottom: 4px;
   border-bottom: 1px solid var(--border);
 }
@@ -1085,7 +1277,6 @@ p.collections-blurb {
   color: var(--text-dim);
 }
 .menu-info-remote {
-  max-width: 220px;
   font-size: 11.5px;
   color: var(--text-faint);
   overflow: hidden;
@@ -1094,137 +1285,312 @@ p.collections-blurb {
 }
 .menu-item {
   text-align: left;
-  padding: 9px 10px;
+  padding: 10px 12px;
   font-size: 13px;
   font-weight: 500;
+  /* One line each, always: an IDE with a long name must not turn its item into a paragraph. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--text);
   background: transparent;
   border: none;
-  border-radius: 6px;
+  border-radius: var(--r-small);
   cursor: pointer;
-  transition: background 120ms ease;
+  transition: background 160ms ease;
 }
-.menu-item:hover {
-  background: var(--bg-card-hover);
+.menu-item:hover:not(:disabled) {
+  background: var(--overlay);
+}
+.menu-item:disabled {
+  color: var(--text-faint);
+  cursor: default;
 }
 .menu-danger {
   color: var(--danger);
 }
-.menu-danger:hover {
-  background: rgba(224, 85, 85, 0.12);
+.menu-danger:hover:not(:disabled) {
+  background: var(--danger-soft);
 }
 
-/* --- Run settings panel --- */
-.field-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  gap: 12px;
-}
-
-select.input {
-  cursor: pointer;
-}
-
-.toggle-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 16px;
-  margin-top: -4px;
-}
-
-.toggle {
+/* --- Dialogs --- */
+.modal-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
   display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  color: var(--text-dim);
-  cursor: pointer;
-}
-.toggle input {
-  accent-color: var(--accent);
-  cursor: pointer;
-}
-.toggle:hover {
-  color: var(--text);
+  justify-content: center;
+  padding: 24px;
+  background: var(--scrim);
+  /* Backdrop blur is part of the One UI dialog look; harmless where unsupported. */
+  backdrop-filter: blur(3px);
 }
 
-/* --- Template picker (New Project) --- */
+.modal {
+  width: 100%;
+  max-width: 500px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 26px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--card-border);
+  /* Dialogs are the roundest thing on screen. */
+  border-radius: 30px;
+  box-shadow: var(--shadow);
+}
+
+/* Framework cards are a row of their own — version, pin, and two buttons — and need more width
+   than a form dialog. */
+.modal-wide {
+  max-width: 720px;
+}
+
+/* A modal whose content can exceed the viewport (Settings): cap its height and let the middle
+   scroll, so the title stays at the top and the Cancel/Save row stays pinned at the bottom. */
+.modal-tall {
+  max-height: calc(100vh - 48px);
+}
+.modal-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  /* Keep focus rings and the divider off the scrollbar edge. */
+  padding-right: 10px;
+  margin-right: -10px;
+}
+
+.modal-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+}
+
+.modal-divider {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 4px 0;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 4px;
+}
+/* Dialog buttons are wider than inline ones — they are the sentence's full stop. */
+.modal-actions .btn {
+  padding: 11px 26px;
+}
+
+/* The dialog owns its error, so drop the list-spacing margin. */
+.modal .error {
+  margin-bottom: 0;
+}
+
+/* The big, copyable user code in the device-flow dialog. */
+.device-code {
+  align-self: center;
+  padding: 16px 26px;
+  font-family: "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
+  font-size: 27px;
+  font-weight: 700;
+  letter-spacing: 5px;
+  color: var(--text);
+  background: var(--bg-input);
+  border-radius: var(--r-control);
+  user-select: all;
+}
+
+/* A URL shown for the user to open/copy — selectable, wrapping, never overflowing the dialog. */
+.device-uri {
+  display: block;
+  padding: 12px 14px;
+  background: var(--bg-input);
+  border-radius: var(--r-small);
+  font-size: 12.5px;
+  color: var(--text-dim);
+  user-select: all;
+  overflow-wrap: anywhere;
+}
+
+/* --- Template picker (New Project / collection contents) --- */
 .template-picker {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 10px;
-  margin-top: -4px;
 }
 
 .template-card {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 12px;
+  gap: 5px;
+  padding: 16px;
   text-align: left;
   cursor: pointer;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--bg);
-  transition: border-color 120ms ease, background 120ms ease;
+  border: 1.5px solid transparent;
+  border-radius: var(--r-control);
+  background: var(--bg-input);
+  transition: border-color 160ms ease, background 160ms ease;
 }
-.template-card:hover {
+.template-card:hover:not(:disabled) {
   background: var(--bg-card-hover);
 }
 .template-active {
   border-color: var(--accent);
-  background: var(--bg-card-hover);
+  background: var(--accent-soft);
+}
+.template-card:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 
 .template-name {
-  font-size: 13px;
-  font-weight: 600;
+  font-size: 13.5px;
+  font-weight: 700;
   color: var(--text);
 }
 
 .template-blurb {
-  font-size: 11px;
-  line-height: 1.4;
+  font-size: 11.5px;
+  line-height: 1.45;
   color: var(--text-faint);
 }
 
-/* --- Kind badge on the project card --- */
-.project-kind {
-  padding: 2px 8px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
+/* --- Accounts --- */
+.account-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--r-control);
+  overflow: hidden;
+  background: var(--bg-input);
+}
+
+.account-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 16px;
+}
+.account-row + .account-row {
+  box-shadow: inset 0 1px 0 var(--border);
+}
+
+.account-meta {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  gap: 3px;
+}
+
+.account-name {
+  font-weight: 600;
+  font-size: 13.5px;
+}
+.account-host {
+  color: var(--text-faint);
+  font-weight: 400;
+}
+.account-provider {
   color: var(--text-faint);
   font-size: 11px;
-  font-weight: 500;
   text-transform: uppercase;
-}
-.kind-job {
-  color: #b98af5;
-  border-color: rgba(185, 138, 245, 0.4);
-  background: rgba(185, 138, 245, 0.1);
+  letter-spacing: 0.03em;
 }
 
-/* --- Destructive confirmation --- */
-.btn-destructive {
-  background: #d24545;
-  color: white;
-}
-.btn-destructive:hover {
-  background: #e05555;
+.account-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
-/* The one toggle that arms an irreversible action, so it does not read as an ordinary option. */
-.danger-toggle {
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg);
+/* --- Build console --- */
+.console {
+  flex: none;
+  background: var(--console-bg);
+  display: flex;
+  flex-direction: column;
+  max-height: 260px;
+  /* Lifted off the bottom edge like a One UI sheet. */
+  border-radius: var(--r-card) var(--r-card) 0 0;
+  overflow: hidden;
+  box-shadow: 0 -8px 28px rgba(0, 0, 0, 0.28);
 }
-.danger-toggle:has(input:checked) {
-  color: var(--danger);
-  border-color: rgba(224, 85, 85, 0.4);
-  background: rgba(224, 85, 85, 0.08);
+
+.console-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px 8px 18px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
 }
-.danger-toggle input {
-  accent-color: #e05555;
+
+/* Build / Output tabs inside the console header. */
+.console-tabs {
+  display: flex;
+  gap: 4px;
+}
+.console-tab {
+  padding: 7px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-faint);
+  background: transparent;
+  border: none;
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  transition: color 160ms ease, background 160ms ease;
+}
+.console-tab:hover {
+  color: var(--console-text);
+}
+.console-tab.active {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.console-body {
+  margin: 0;
+  padding: 12px 18px 18px;
+  overflow-y: auto;
+  font-family: "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--console-text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}
+
+/* --- Scrollbars --- */
+/* Thin and unobtrusive: One UI scrollbars are a floating hint, not a rail. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: var(--r-pill);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
+  background-clip: padding-box;
 }

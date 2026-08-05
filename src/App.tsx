@@ -1,5 +1,5 @@
 import { createEffect, createResource, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { createStore } from "solid-js/store";
+import { createStore, produce } from "solid-js/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -10,9 +10,9 @@ import "./App.css";
 // Mirrors the `RecentProject` DTO returned by the Rust commands.
 // Scene = realtime app with an Update/Render loop and a window.
 // Job   = single-dispatch headless app: Run() once to completion, then exit.
-type Kind = "Scene" | "Job";
+type Kind = "Scene" | "Job" | "Module";
 
-// Mirrors `GitInfo` — the bit of git status shown on a card. Null when the folder isn't a repo.
+// Mirrors `GitInfo` — the bit of git status shown beside a project. Null when it isn't a repo.
 type GitInfo = {
   branch: string | null;
   dirty: boolean;
@@ -41,35 +41,80 @@ type AvailableFramework = {
   installed: boolean;
 };
 
-// Mirrors `Lab` — one downloadable lab in a collection, hosted in its own git repo.
-type Lab = { name: string; description: string; url: string };
-
-// Mirrors `CollectionManifest` — the document an instructor publishes to describe a course's labs.
-type CollectionManifest = {
-  schemaVersion: number;
-  title: string;
+// Mirrors `LabView` — one entry of a collection, plus every copy of it on this machine.
+//
+// A non-empty `localPaths` means the entry *is* a project here: selectable, buildable, runnable,
+// and `[0]` is the copy to open. Empty means it is still just a repository to download. There can
+// be more than one copy (see the Rust side), and all of them matter — a project the sidebar shows
+// under a collection must not also show as a loose project.
+type Lab = {
+  name: string;
   description: string;
-  labs: Lab[];
+  url: string;
+  kind?: Kind;
+  localPaths: string[];
 };
 
-// Mirrors `CollectionView` — a subscribed collection with either its fetched manifest or the error
-// fetching it produced. The error is per-collection so one bad URL never blanks the rest.
+/// The copy of a collection entry to open, or undefined when it is not on this machine.
+function labPath(lab: Lab): string | undefined {
+  return lab.localPaths[0];
+}
+
+// What a collection holds — fixed at creation, enforced when adding.
+type Contents = "projects" | "modules" | "mixed";
+
+// Mirrors `ModuleView` — one module this machine can offer a project. `id` is the exact string
+// stored under "modules" in koral.json; `path` is set only for the user's own module projects.
+// `hasSource` says whether a debugger can step into it from here.
+type ModuleView = {
+  id: string;
+  name: string;
+  source: "project" | "framework";
+  path?: string;
+  hasSource: boolean;
+};
+
+// Mirrors `CollectionView` — a subscribed collection, already flattened: either its fetched
+// contents or the error fetching it produced. The error is per-collection so one bad URL never
+// blanks the rest.
 type CollectionView = {
   url: string;
-  manifest: CollectionManifest | null;
+  title: string;
+  description: string;
+  contents: Contents;
+  labs: Lab[];
   error: string | null;
+  /// Set when this subscription points at a collection the user authors locally — the same
+  /// collection, reached by its published URL. The sidebar then shows only the authored copy.
+  authoredPath?: string;
 };
 
-// Mirrors `AuthoredCollection` — a collection the user is building locally, listed under
-// "My Collections". `path` is machine-local; the rest is read from its koral-collection.json.
+// Mirrors `AuthoredCollection` — a collection the user is building locally. `path` is
+// machine-local; the rest is read from its koral-collection.json.
 type AuthoredCollection = {
   path: string;
   title: string;
   description: string;
+  /// What it holds — decides which of the user's projects may be added.
+  contents: Contents;
   labCount: number;
   labs: Lab[];
   git: GitInfo | null;
 };
+
+// The noun a collection's UI uses for its entries, so a module registry doesn't call its modules
+// "projects" in empty states and buttons.
+function entryWord(contents: Contents | undefined): string {
+  return contents === "modules" ? "module" : contents === "mixed" ? "entry" : "project";
+}
+
+// Whether a project of this kind may be added to a collection with these contents. Mirrors the
+// backend's Contents::accepts, which enforces it for real — this copy only filters the pickers.
+function contentsAccepts(contents: Contents | undefined, kind: Kind): boolean {
+  if (contents === "modules") return kind === "Module";
+  if (contents === "mixed") return true;
+  return kind !== "Module";
+}
 
 // A normalized target for the publish dialog — either a collection or a project, so one dialog
 // serves both "publish/update this collection" and "save this project to my git".
@@ -82,13 +127,25 @@ type PublishTarget = {
   ownsRemote: boolean;
 };
 
-// Mirrors `InstalledFramework` — an SDK unpacked on this machine.
+// Mirrors `InstalledFramework`. `local` marks a build from source, registered from a path: it has
+// no version (a working tree has nothing stable to number), so `version` carries its *pin* —
+// what a project writes to target it — while `name` is what to show a human.
 type InstalledFramework = {
   version: string;
+  name: string;
   platform: string;
   path: string;
   sizeBytes: number;
+  local: boolean;
+  /// The tree it was built from, when the Hub could find it. This is what a debugger steps into.
+  sourceDir?: string;
+  /// CMAKE_BUILD_TYPE of the build it was installed from — a Release build has no debug info.
+  buildType?: string;
 };
+
+// Mirrors `DetectedSource` — what the Hub can work out about an install prefix before it is
+// registered, so the Add dialog can show it rather than asking blind.
+type DetectedSource = { sourcePath: string; buildPath: string; buildType: string };
 
 // Mirrors `ProjectConfig` (koral.json). Only the fields the settings panel edits are spelled
 // out; the rest ride along untouched so saving never drops data the Hub doesn't understand.
@@ -115,7 +172,15 @@ type ProjectConfig = {
   };
   // Search lists, not single folders: a project can keep its own assets/ and also pull from a
   // shared library next door. Searched in order; the engine's built-in content comes after.
-  paths: { assetDirectories: string[]; shaderDirectories: string[] };
+  // moduleDirectories is carried through but not edited here (like imguiIni): bare module names
+  // resolve against the framework's own modules with no configuration, and pointing at a custom
+  // build directory is a hand edit.
+  paths: { assetDirectories: string[]; shaderDirectories: string[]; moduleDirectories?: string[] };
+  // Koral modules the runtime loads for this project — optional engine features shipped as
+  // shared libraries, by bare name ("koral-camera") or project-relative path. Order is
+  // irrelevant: the runtime sorts them by their declared dependencies. Absent and empty mean
+  // the same thing; saveSettings drops the key when the list is empty.
+  modules?: string[];
   [key: string]: unknown;
 };
 
@@ -157,17 +222,43 @@ type DeviceLoginFinished = { success: boolean; account: AccountView | null; erro
 // Result of publishing an authored collection.
 type PublishResult = { url: string; created: boolean };
 
-type Finished = { success: boolean; error: string | null };
+// Build and run events carry the project they belong to, because each project has its own console.
+// Mirrors `builder::Line` and `builder::Finished`; `project` is the path the job was started with.
+type ConsoleLine = { project: string; text: string };
+type Finished = { project: string; success: boolean; error: string | null };
 type InstallProgress = { version: string; downloaded: number; total: number };
 type InstallFinished = { version: string; success: boolean; error: string | null };
 
-// The main content is split across these tabs so no single screen carries every list at once.
-type Tab = "projects" | "collections" | "framework";
-const TABS: readonly (readonly [Tab, string])[] = [
-  ["projects", "Projects"],
-  ["collections", "Collections"],
-  ["framework", "Framework"],
-] as const;
+// What is selected in the sidebar, and so what the detail panel shows.
+//
+// A collection entry that exists on this machine is selected as the *project* it is — the panel
+// for a lab you have downloaded is the panel for the project, with everything that implies. Only
+// an entry with nothing on disk is a `lab`, whose panel offers to download it.
+type Selection =
+  | { kind: "project"; path: string }
+  | { kind: "collection"; key: string }
+  | { kind: "lab"; key: string; url: string };
+
+function sameSelection(a: Selection | null, b: Selection | null): boolean {
+  if (!a || !b || a.kind !== b.kind) return false;
+  if (a.kind === "project") return a.path === (b as typeof a).path;
+  if (a.kind === "collection") return a.key === (b as typeof a).key;
+  const lab = b as Extract<Selection, { kind: "lab" }>;
+  return a.kind === "lab" && a.key === lab.key && a.url === lab.url;
+}
+
+// One collection in the sidebar, whether it is one the user authors or one they subscribe to.
+// Keyed by path (authored) or URL (subscribed) — both unique, and never confusable.
+type SidebarCollection = {
+  key: string;
+  title: string;
+  subtitle: string;
+  contents: Contents;
+  labs: Lab[];
+  error: string | null;
+  authored: AuthoredCollection | null;
+  subscribed: CollectionView | null;
+};
 
 function rgb([r, g, b]: [number, number, number]): string {
   return `rgb(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)})`;
@@ -175,6 +266,43 @@ function rgb([r, g, b]: [number, number, number]): string {
 
 function mb(bytes: number): string {
   return `${(bytes / 1_048_576).toFixed(1)} MB`;
+}
+
+// Does this `frameworkVersion` name a build from source rather than a release? Mirrors the
+// backend's `framework::source_pin` — "source", or "source:<name>" for a specific one.
+function isSourcePin(version: string): boolean {
+  return version === "source" || version.startsWith("source:");
+}
+
+// How a framework pin reads in the UI. A source build has no version to show, so it is named by
+// what it is; a release shows its number.
+function frameworkLabel(version: string): string {
+  if (!version) return "no framework";
+  if (version === "source") return "source build";
+  if (version.startsWith("source:")) return `source · ${version.slice("source:".length)}`;
+  return `koral ${version}`;
+}
+
+// Can a debugger step into framework code built this way? Debug obviously; RelWithDebInfo too —
+// it is optimised, but the debug info is there, and calling it "no debug info" would be untrue.
+// Anything else (Release, MinSizeRel) carries none.
+function carriesDebugInfo(buildType: string | undefined): boolean {
+  return buildType === "Debug" || buildType === "RelWithDebInfo";
+}
+
+// What to say about a source build's build type, given it is the one thing that decides whether
+// debugging can step into engine code.
+function buildTypeHint(buildType: string): string {
+  if (buildType === "Debug") {
+    return "Built with debug info — debugging can step into engine code";
+  }
+  if (buildType === "RelWithDebInfo") {
+    return (
+      "Built optimised, but with debug info — debugging can still step into engine code, " +
+      "though inlining makes it jump around"
+    );
+  }
+  return `Built ${buildType}: no debug info, so a crash inside the framework won't open its source`;
 }
 
 // The name becomes a C++ class, its source filenames and the CMake project name (see the
@@ -188,6 +316,50 @@ function nameProblem(name: string): string | null {
     return "Use letters, digits and underscores only; can't start with a digit.";
   }
   return null;
+}
+
+// Widest window either dimension may be dragged (or typed) to. 8K covers every real display and
+// then some, and caps a typo that would otherwise ask the runtime for a surface it cannot make.
+const SIZE_MIN = 0;
+const SIZE_MAX = 8192;
+
+const clampSize = (v: number) => Math.min(SIZE_MAX, Math.max(SIZE_MIN, Math.round(v) || 0));
+
+// Make a number field scrub: drag left/right to change its value, the way a DAW or a 3D tool does.
+//
+// A plain click must still put a caret in the box, so the drag only takes over once the pointer
+// has actually travelled — under that threshold the gesture is left alone and behaves as a click.
+// Holding shift drops to 1px-per-unit for fine adjustment.
+function scrubNumber(get: () => number, set: (value: number) => void) {
+  return (e: PointerEvent & { currentTarget: HTMLInputElement }) => {
+    if (e.button !== 0) return;
+    const input = e.currentTarget;
+    const startX = e.clientX;
+    const startValue = get();
+    let dragging = false;
+
+    const onMove = (ev: PointerEvent) => {
+      const dx = ev.clientX - startX;
+      if (!dragging) {
+        if (Math.abs(dx) < 4) return; // still indistinguishable from a click
+        dragging = true;
+        // Hand the gesture to the drag: no caret, no text selection, and a cursor that says so.
+        input.blur();
+        document.body.style.cursor = "ew-resize";
+        document.body.style.userSelect = "none";
+      }
+      set(clampSize(startValue + dx * (ev.shiftKey ? 1 : 8)));
+    };
+
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp, { once: true });
+  };
 }
 
 function joinPath(location: string, name: string): string {
@@ -324,6 +496,180 @@ function AnsiLog(props: { text: string }) {
   );
 }
 
+type SelectOption = { value: string; label: string };
+
+// A dropdown drawn by us rather than by the platform.
+//
+// A native <select> renders its popup as an OS widget — GTK here — which takes the *system*
+// theme's colours, corners and metrics and cannot be styled from CSS at all. Stripping the
+// trigger's appearance (see `.select-trigger`) fixes the closed state but the open list still
+// arrives looking like something from another application. The only way to make it match is to
+// stop using the native control for the list.
+//
+// Behaves as a combobox is expected to: the trigger keeps focus while the list is open and drives
+// it from the keyboard, so nothing here relies on the pointer.
+function Select(props: {
+  value: string;
+  options: SelectOption[];
+  onChange: (value: string) => void;
+  /** Shown when the current value is not among the options — never silently blank. */
+  placeholder?: string;
+  disabled?: boolean;
+}) {
+  const [open, setOpen] = createSignal(false);
+  const [active, setActive] = createSignal(0);
+  const [anchor, setAnchor] = createSignal({ left: 0, width: 0, top: 0, bottom: 0, up: false });
+  let trigger!: HTMLButtonElement;
+  let list: HTMLDivElement | undefined;
+
+  const selectedIndex = () => props.options.findIndex((o) => o.value === props.value);
+  const label = () => props.options[selectedIndex()]?.label ?? props.placeholder ?? props.value;
+
+  // Positioned against the viewport, not the trigger's parent: these live inside scrolling panels
+  // and modals, and an absolutely-positioned list would be clipped by the first one with
+  // `overflow` set. Flips above the trigger when there is no room below.
+  function place() {
+    const r = trigger.getBoundingClientRect();
+    const wanted = Math.min(288, props.options.length * 42 + 12);
+    const below = window.innerHeight - r.bottom - 12;
+    const up = below < wanted && r.top > below;
+    setAnchor({
+      left: r.left,
+      width: r.width,
+      top: r.bottom + 6,
+      bottom: window.innerHeight - r.top + 6,
+      up,
+    });
+  }
+
+  function openMenu() {
+    if (props.disabled || props.options.length === 0) return;
+    place();
+    setActive(Math.max(0, selectedIndex()));
+    setOpen(true);
+  }
+
+  function choose(index: number) {
+    const option = props.options[index];
+    if (option) props.onChange(option.value);
+    setOpen(false);
+    trigger.focus();
+  }
+
+  // Keep the highlighted row on screen when arrowing through a long list.
+  createEffect(() => {
+    if (!open()) return;
+    const row = list?.children[active()] as HTMLElement | undefined;
+    row?.scrollIntoView({ block: "nearest" });
+  });
+
+  // The list is anchored to where the trigger *was*, so anything that moves it invalidates the
+  // position. Closing is the honest response, and matches what a native popup does.
+  createEffect(() => {
+    if (!open()) return;
+    const close = () => setOpen(false);
+    window.addEventListener("resize", close);
+    window.addEventListener("scroll", close, true);
+    onCleanup(() => {
+      window.removeEventListener("resize", close);
+      window.removeEventListener("scroll", close, true);
+    });
+  });
+
+  function onKeyDown(e: KeyboardEvent) {
+    const last = props.options.length - 1;
+    if (!open()) {
+      if (["ArrowDown", "ArrowUp", "Enter", " "].includes(e.key)) {
+        e.preventDefault();
+        openMenu();
+      }
+      return;
+    }
+    switch (e.key) {
+      case "ArrowDown":
+        e.preventDefault();
+        setActive((i) => Math.min(last, i + 1));
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        setActive((i) => Math.max(0, i - 1));
+        break;
+      case "Home":
+        e.preventDefault();
+        setActive(0);
+        break;
+      case "End":
+        e.preventDefault();
+        setActive(last);
+        break;
+      case "Enter":
+      case " ":
+        e.preventDefault();
+        choose(active());
+        break;
+      case "Escape":
+        e.preventDefault();
+        setOpen(false);
+        break;
+      case "Tab":
+        setOpen(false);
+        break;
+    }
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        ref={trigger}
+        class="input select-trigger"
+        disabled={props.disabled}
+        aria-haspopup="listbox"
+        aria-expanded={open()}
+        onClick={() => (open() ? setOpen(false) : openMenu())}
+        onKeyDown={onKeyDown}
+      >
+        <span class="select-value">{label()}</span>
+      </button>
+
+      <Show when={open()}>
+        <div class="menu-backdrop" onPointerDown={() => setOpen(false)} />
+        <div
+          ref={list}
+          class="select-menu"
+          classList={{ "select-menu-up": anchor().up }}
+          role="listbox"
+          style={{
+            left: `${anchor().left}px`,
+            width: `${anchor().width}px`,
+            ...(anchor().up
+              ? { bottom: `${anchor().bottom}px` }
+              : { top: `${anchor().top}px` }),
+          }}
+        >
+          <For each={props.options}>
+            {(option, i) => (
+              <div
+                class="select-option"
+                classList={{
+                  active: active() === i(),
+                  selected: option.value === props.value,
+                }}
+                role="option"
+                aria-selected={option.value === props.value}
+                onPointerEnter={() => setActive(i())}
+                onClick={() => choose(i())}
+              >
+                {option.label}
+              </div>
+            )}
+          </For>
+        </div>
+      </Show>
+    </>
+  );
+}
+
 export default function App() {
   const [projects, { refetch }] = createResource<RecentProject[]>(() =>
     invoke("list_recent_projects"),
@@ -373,22 +719,48 @@ export default function App() {
   const [maximized, setMaximized] = createSignal(false);
 
   // Build output (compile progress/diagnostics) and run output (the launched app's stdout/stderr)
-  // are kept apart so the console can show them on separate tabs. Each is capped so a chatty app
-  // can't grow the log unbounded.
-  const [buildLog, setBuildLog] = createSignal<string>("");
-  const [runLog, setRunLog] = createSignal<string>("");
-  const [consoleTab, setConsoleTab] = createSignal<"build" | "output">("build");
-  const [running, setRunning] = createSignal(false);
-  // Whether the current/last job was a run (▶) rather than a build-only, so we know to flip to the
-  // Output tab once its build succeeds.
-  const [lastJobRun, setLastJobRun] = createSignal(false);
+  // are kept apart so the console can show them on separate tabs — and kept per project, keyed by
+  // path, because a build belongs to the project it was started on and not to the app. Switching
+  // projects switches consoles: the output of a build you started an hour ago is still there when
+  // you come back to it, and two projects building at once never interleave.
+  type ProjectConsole = {
+    build: string;
+    run: string;
+    tab: "build" | "output";
+    /** A job is in flight — this project's Run/Build are held, but nobody else's. */
+    running: boolean;
+    /** The job was a run (▶) rather than build-only, so we know to flip to the Output tab once
+     *  its build succeeds. */
+    wasRun: boolean;
+  };
+  const emptyConsole = (): ProjectConsole => ({
+    build: "",
+    run: "",
+    tab: "build",
+    running: false,
+    wasRun: false,
+  });
+  const [consoles, setConsoles] = createStore<Record<string, ProjectConsole>>({});
 
+  /** Is a build/run job in flight for this project? */
+  const isRunning = (path: string) => !!consoles[path]?.running;
+
+  // Output can arrive for a project whose console was never opened here (the app keeps printing
+  // after its job finished, and the user may have closed the panel since), so every write starts
+  // by making sure there is something to write into.
+  const openConsoleFor = (path: string) => {
+    if (!consoles[path]) setConsoles(path, emptyConsole());
+  };
+
+  // Each log is capped so a chatty app can't grow it unbounded.
   const LOG_CAP = 200_000;
-  const appendCapped = (setter: (fn: (prev: string) => string) => void, chunk: string) =>
-    setter((prev) => {
+  const appendCapped = (path: string, stream: "build" | "run", chunk: string) => {
+    openConsoleFor(path);
+    setConsoles(path, stream, (prev) => {
       const next = prev + chunk;
       return next.length > LOG_CAP ? next.slice(next.length - LOG_CAP) : next;
     });
+  };
 
   // New-project dialog. `location` outlives the dialog so it remembers the last folder used.
   const [showCreate, setCreating] = createSignal(false);
@@ -403,9 +775,9 @@ export default function App() {
   const [gitUrl, setGitUrl] = createSignal("");
   const canImport = () => !!gitUrl().trim() && !!location() && !busy();
 
-  // Lab collections: catalogs of downloadable starter projects. Fetched off the network on every
-  // open (a course can revise its labs after subscribing), so the resource can be slow — but a
-  // single unreachable collection surfaces as that row's error, not a rejected resource.
+  // Collections the user subscribes to. Fetched off the network on every open (a course can revise
+  // its labs after subscribing), so the resource can be slow — but a single unreachable collection
+  // surfaces as that row's error, not a rejected resource.
   const [collections, { refetch: refetchCollections }] = createResource<CollectionView[]>(() =>
     invoke("list_collections"),
   );
@@ -416,57 +788,56 @@ export default function App() {
   // The lab currently downloading (its git URL), so only its button shows the pending state.
   const [downloadingLab, setDownloadingLab] = createSignal<string | null>(null);
 
-  // Collapsed collection cards, keyed by URL (imported) or path (authored). Default expanded;
-  // adding a key hides that card's body so a long list of collections stays scannable.
-  const [collapsed, setCollapsed] = createSignal<Set<string>>(new Set());
-  const isCollapsed = (key: string) => collapsed().has(key);
-  function toggleCollapsed(key: string) {
-    setCollapsed((prev) => {
-      const next = new Set(prev);
-      next.has(key) ? next.delete(key) : next.add(key);
-      return next;
-    });
-  }
+  // The frameworks dialog: installing releases and registering source builds. A dialog rather than
+  // a place of its own, because it is something you go and do, then come back from.
+  const [showFrameworks, setShowFrameworks] = createSignal(false);
 
-  // Which tab is showing. Projects first — it's what most sessions open for.
-  const [tab, setTab] = createSignal<Tab>("projects");
-
-  // Collections the user is authoring locally ("My Collections"). Local repos, always readable.
+  // Collections the user is authoring locally. Local repos, always readable.
   const [authored, { refetch: refetchAuthored }] = createResource<AuthoredCollection[]>(() =>
     invoke("list_authored_collections"),
   );
   // Create-collection dialog. Shares the create dialog's `location` (same default folder).
+  // `collectionSeed` is the project a right-click started this from, which is then added to the
+  // collection the moment it exists — that being the only way to make one now.
   const [showCreateCollection, setCreatingCollection] = createSignal(false);
   const [collectionName, setCollectionName] = createSignal("");
   const [collectionDescription, setCollectionDescription] = createSignal("");
+  const [collectionContents, setCollectionContents] = createSignal<Contents>("projects");
+  const [collectionSeed, setCollectionSeed] = createSignal<RecentProject | null>(null);
   const canCreateCollection = () => !!collectionName().trim() && !!location() && !busy();
-  // Add-project dialog: the authored collection being added to. Two modes — pick one of your own
-  // projects (default), or add any repo by git URL. A local-only project is published first, so the
-  // picker mode also carries the publish fields (account/name/private).
-  const [addProjectTo, setAddProjectTo] = createSignal<AuthoredCollection | null>(null);
-  const [addMode, setAddMode] = createSignal<"project" | "url">("project");
-  const [addProjectPath, setAddProjectPath] = createSignal("");
+
+  // "Add to an existing collection": the project being filed, and which collection to file it in.
+  // A project with no remote is published first, so this also carries the publish fields.
+  const [addToCollection, setAddToCollection] = createSignal<RecentProject | null>(null);
+  const [targetCollection, setTargetCollection] = createSignal("");
   const [addProjectHost, setAddProjectHost] = createSignal("");
   const [addProjectRepoName, setAddProjectRepoName] = createSignal("");
   const [addProjectPrivate, setAddProjectPrivate] = createSignal(false);
-  // Shared "add by URL" fields (URL mode).
+  const [labDescription, setLabDescription] = createSignal("");
+
+  // Add-by-URL dialog, for putting a repository that is not one of your projects into a collection.
+  const [addUrlTo, setAddUrlTo] = createSignal<AuthoredCollection | null>(null);
   const [labUrl, setLabUrl] = createSignal("");
   const [labName, setLabName] = createSignal("");
-  // Description shown in the collection — used by both modes.
-  const [labDescription, setLabDescription] = createSignal("");
-  // The project currently selected in the picker, and whether it still needs publishing.
-  const selectedProject = () => projects()?.find((p) => p.path === addProjectPath()) ?? null;
-  const selectedNeedsPublish = () => {
-    const p = selectedProject();
-    return !!p && !p.git?.remote;
-  };
-  const canAddProject = () => {
-    if (busy()) return false;
-    if (addMode() === "url") return !!labUrl().trim();
-    if (!selectedProject()) return false;
-    if (selectedNeedsPublish()) return !!addProjectHost() && !!addProjectRepoName().trim();
+
+  // Whether the project being filed still needs a remote before it can be a submodule.
+  const seedNeedsPublish = (p: RecentProject | null) => !!p && !p.git?.remote;
+  // The collections a project may actually go into: those whose contents accept its kind.
+  const eligibleCollections = (p: RecentProject | null) =>
+    (authored() ?? []).filter((c) => !!p && contentsAccepts(c.contents, p.kind));
+  const canAddToCollection = () => {
+    const p = addToCollection();
+    if (busy() || !p || !targetCollection()) return false;
+    if (seedNeedsPublish(p)) return !!addProjectHost() && !!addProjectRepoName().trim();
     return true;
   };
+  const canCreateWithSeed = () => {
+    if (!canCreateCollection()) return false;
+    const p = collectionSeed();
+    if (!p || !seedNeedsPublish(p)) return true;
+    return !!addProjectHost() && !!addProjectRepoName().trim();
+  };
+
   // Remove-collection confirmation, with the same explicit delete-files opt-in as removing a project.
   const [removingCollection, setRemovingCollection] = createSignal<AuthoredCollection | null>(null);
   const [deleteCollectionFiles, setDeleteCollectionFiles] = createSignal(false);
@@ -524,32 +895,57 @@ export default function App() {
   // "Macintosh").
   const isLinux = /linux/i.test(navigator.userAgent);
 
-  // Every version you could pin a new project to: what is installed, plus what GitHub offers.
-  // Both, because pinning a version you have not downloaded yet is legitimate — the Hub fetches
-  // it on the first build.
-  const frameworkChoices = () => {
-    const versions = new Map<string, boolean>(); // version -> already installed
-    for (const f of installed() ?? []) versions.set(f.version, true);
-    for (const f of available() ?? []) {
-      if (!versions.has(f.version)) versions.set(f.version, f.installed);
+  // Every framework a project could target: this machine's source builds first (someone who has
+  // one is working on the framework itself), then what is installed, then what GitHub offers —
+  // pinning a release you have not downloaded is legitimate, since the first build fetches it.
+  type FrameworkChoice = { value: string; label: string; installed: boolean; local: boolean };
+  const frameworkChoices = (): FrameworkChoice[] => {
+    const out: FrameworkChoice[] = [];
+    const seen = new Set<string>();
+    const add = (choice: FrameworkChoice) => {
+      if (seen.has(choice.value)) return;
+      seen.add(choice.value);
+      out.push(choice);
+    };
+
+    for (const f of installed() ?? []) {
+      if (!f.local) continue;
+      add({ value: f.version, label: `Source build — ${f.name}`, installed: true, local: true });
     }
-    return [...versions]
-      .map(([version, isInstalled]) => ({ version, installed: isInstalled }))
+    for (const f of installed() ?? []) {
+      if (f.local) continue;
+      add({ value: f.version, label: `koral ${f.version}`, installed: true, local: false });
+    }
+    const releases = (available() ?? [])
+      .filter((f) => !seen.has(f.version))
       .sort((a, b) => b.version.localeCompare(a.version, undefined, { numeric: true }));
+    for (const f of releases) {
+      add({
+        value: f.version,
+        label: `koral ${f.version}${f.installed ? "" : " (not installed — will download)"}`,
+        installed: f.installed,
+        local: false,
+      });
+    }
+    return out;
   };
+
   // Path of the project currently being opened, so only its buttons show the pending state.
   const [opening, setOpening] = createSignal<string | null>(null);
-  // Path of the project whose "more actions" (⋮) menu is open — only one at a time.
-  const [menuFor, setMenuFor] = createSignal<string | null>(null);
 
   // The framework versions offered in a project's settings: the usual choices, plus the project's
-  // own pinned version if it isn't among them (offline, or an old release GitHub no longer lists),
-  // so the dropdown always shows what the project is actually on.
-  const projectFwChoices = () => {
+  // own pin if it isn't among them (offline, an old release GitHub no longer lists, or a source
+  // build that is no longer registered), so the dropdown always shows what it is actually on.
+  const projectFwChoices = (): FrameworkChoice[] => {
     const list = frameworkChoices();
     const cur = draft.cfg?.frameworkVersion;
-    if (cur && !list.some((v) => v.version === cur)) {
-      return [{ version: cur, installed: (installed() ?? []).some((f) => f.version === cur) }, ...list];
+    if (cur && !list.some((v) => v.value === cur)) {
+      const label = !isSourcePin(cur)
+        ? `koral ${cur}`
+        : sourcePinAmbiguous(cur)
+          ? "source build (several registered — pick one)"
+          : `${frameworkLabel(cur)} (not registered here)`;
+      return [{ value: cur, label, installed: false, local: isSourcePin(cur) }, ...list];
     }
     return list;
   };
@@ -558,10 +954,310 @@ export default function App() {
   const [removing, setRemoving] = createSignal<RecentProject | null>(null);
   const [deleteFiles, setDeleteFiles] = createSignal(false);
 
-  // Settings panel: which project is open, plus a working copy of its koral.json that is only
-  // written back on Save — so Cancel genuinely discards.
+  // --- Sidebar: one list of everything, projects and the collections that group them ---
+
+  const [selected, setSelected] = createSignal<Selection | null>(null);
+  const [expanded, setExpanded] = createSignal<Set<string>>(new Set());
+  const [filter, setFilter] = createSignal("");
+  // The Import menu under the list: bringing in work that already exists, from either end of it —
+  // one project, or a whole collection.
+  const [importMenu, setImportMenu] = createSignal(false);
+  // Right-click menu: what it acts on, and where to draw it.
+  const [contextMenu, setContextMenu] = createSignal<{
+    x: number;
+    y: number;
+    project?: RecentProject;
+    collection?: SidebarCollection;
+  } | null>(null);
+
+  const isExpanded = (key: string) => expanded().has(key);
+  function toggleExpanded(key: string) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      next.has(key) ? next.delete(key) : next.add(key);
+      return next;
+    });
+  }
+
+  // The sidebar's top-level groups. A project's kind is what separates it from its neighbours, so
+  // the list says it once per group instead of tagging every row with it.
+  const [collapsedGroups, setCollapsedGroups] = createSignal<Set<string>>(new Set());
+  // While filtering, a collapsed group would hide its own matches — so filtering opens everything
+  // and the result reads as one flat answer.
+  const groupOpen = (key: string) => !!filter().trim() || !collapsedGroups().has(key);
+  function toggleGroup(key: string) {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      next.has(key) ? next.delete(key) : next.add(key);
+      return next;
+    });
+  }
+
+  const KIND_GROUPS = [
+    ["Scene", "Scenes"],
+    ["Job", "Jobs"],
+    ["Module", "Modules"],
+  ] as const;
+
+  // Empty groups are left out rather than shown at zero: a permanent "Jobs 0" is noise on a
+  // machine that has never made one.
+  const projectGroups = () =>
+    KIND_GROUPS.map(([kind, label]) => ({
+      key: kind,
+      label,
+      items: looseProjects().filter((p) => p.kind === kind),
+    })).filter((group) => group.items.length > 0);
+
+  // Every collection, authored and subscribed, in one shape the sidebar can render uniformly.
+  //
+  // A subscription to a collection you author is the *same* collection — an easy thing to end up
+  // with, since pasting your own published link is how you check it worked. It is listed once, as
+  // the authored copy, which can do everything the subscription can and more. The subscription is
+  // still there and still cancellable, from that collection's own panel.
+  const sidebarCollections = (): SidebarCollection[] => [
+    ...(authored() ?? []).map((c) => ({
+      key: c.path,
+      title: c.title,
+      subtitle: c.path,
+      contents: c.contents,
+      labs: c.labs,
+      error: null,
+      authored: c,
+      subscribed: null,
+    })),
+    ...(collections() ?? [])
+      .filter((c) => !c.authoredPath)
+      .map((c) => ({
+        key: c.url,
+        title: c.title || c.url,
+        subtitle: repoLabel(c.url),
+        contents: c.contents,
+        labs: c.labs,
+        error: c.error,
+        authored: null,
+        subscribed: c,
+      })),
+  ];
+
+  /// The subscription that points at an authored collection, when the user has one.
+  const subscriptionFor = (path: string) =>
+    (collections() ?? []).find((c) => c.authoredPath === path);
+
+  // Projects that a collection already accounts for. Listing one twice — once loose, once under
+  // the collection it belongs to — would make the same folder look like two projects.
+  //
+  // *Every* copy is claimed, not just the one the collection opens: with your own collection you
+  // can easily have both the project you added and a copy downloaded from it, and the leftover
+  // would otherwise reappear as an unrelated loose project.
+  const claimedPaths = () => {
+    const claimed = new Set<string>();
+    for (const c of sidebarCollections()) {
+      for (const lab of c.labs) for (const path of lab.localPaths) claimed.add(path);
+    }
+    return claimed;
+  };
+
+  const matches = (text: string) => text.toLowerCase().includes(filter().trim().toLowerCase());
+
+  const looseProjects = () =>
+    (projects() ?? [])
+      .filter((p) => !claimedPaths().has(p.path))
+      .filter((p) => !filter().trim() || matches(p.name) || matches(p.path));
+
+  // A collection stays visible while filtering if it matches itself or holds something that does;
+  // its entry list narrows to the matches, so a filter reads as one flat answer.
+  const visibleLabs = (c: SidebarCollection) =>
+    !filter().trim() ? c.labs : c.labs.filter((l) => matches(l.name) || matches(l.url));
+  const visibleCollections = () =>
+    sidebarCollections().filter(
+      (c) => !filter().trim() || matches(c.title) || visibleLabs(c).length > 0,
+    );
+  // While filtering, a collection that only matched through its entries is opened, so the hit is
+  // actually on screen rather than hidden behind a chevron.
+  const showLabs = (c: SidebarCollection) =>
+    isExpanded(c.key) || (!!filter().trim() && visibleLabs(c).length > 0);
+
+  const projectAt = (path: string) => (projects() ?? []).find((p) => p.path === path);
+
+  // A project selected from a collection may not be on the recent list at all — an authored
+  // collection's entries are its own submodule checkouts, which nobody ever "opened". They are
+  // still real projects, so the panel reads them from disk instead; this holds the last one read.
+  const [offListProject, setOffListProject] = createSignal<RecentProject | null>(null);
+  const projectOrOffList = (path: string) => {
+    const known = projectAt(path);
+    if (known) return known;
+    const loaded = offListProject();
+    return loaded?.path === path ? loaded : undefined;
+  };
+  const labProject = (lab: Lab) => {
+    const path = labPath(lab);
+    return path ? projectOrOffList(path) : undefined;
+  };
+
+  const selectedProject = (): RecentProject | undefined => {
+    const sel = selected();
+    return sel?.kind === "project" ? projectOrOffList(sel.path) : undefined;
+  };
+  // The console the bottom panel shows: the selected project's, once it has something in it. Only
+  // a project has one, so selecting a collection puts the panel away — a lab that has been
+  // downloaded selects as its project, so its console shows here like any other.
+  const shownConsole = () => {
+    const sel = selected();
+    if (sel?.kind !== "project") return undefined;
+    const c = consoles[sel.path];
+    return c && (c.build || c.run) ? { path: sel.path, ...c } : undefined;
+  };
+
+  const selectedCollection = (): SidebarCollection | undefined => {
+    const sel = selected();
+    return sel?.kind === "collection"
+      ? sidebarCollections().find((c) => c.key === sel.key)
+      : undefined;
+  };
+  const selectedLab = (): { collection: SidebarCollection; lab: Lab } | undefined => {
+    const sel = selected();
+    if (sel?.kind !== "lab") return undefined;
+    const collection = sidebarCollections().find((c) => c.key === sel.key);
+    const lab = collection?.labs.find((l) => l.url === sel.url);
+    return collection && lab ? { collection, lab } : undefined;
+  };
+
+  // Selecting a project loads its koral.json into the editor on the right, so switching selection
+  // is what opens settings — there is no separate panel to go and find.
+  function select(next: Selection) {
+    if (sameSelection(next, selected())) return;
+    // Never lose an edit to a click: switching away from a project with unsaved settings asks
+    // first. (This is the only place a selection changes, so the guard cannot be bypassed.)
+    if (settingsDirty()) {
+      setPendingSelection(next);
+      return;
+    }
+    applySelection(next);
+  }
+
+  function applySelection(next: Selection) {
+    setSelected(next);
+    if (next.kind === "project") loadProjectSettings(next.path);
+    else closeProjectSettings();
+  }
+
+  // --- Project settings, edited inline in the detail panel ---
+
   const [settingsPath, setSettingsPath] = createSignal<string | null>(null);
   const [draft, setDraft] = createStore<{ cfg: ProjectConfig | null }>({ cfg: null });
+  // The config as loaded, so "dirty" is a fact rather than a guess and Revert has something to
+  // revert to.
+  const [savedConfig, setSavedConfig] = createSignal<string>("");
+  // The modules this machine can offer the selected project, refreshed on every selection (the set
+  // changes as the user creates, downloads or removes module projects).
+  const [availableModules, setAvailableModules] = createSignal<ModuleView[]>([]);
+  // A selection waiting on the user to decide what to do with unsaved settings.
+  const [pendingSelection, setPendingSelection] = createSignal<Selection | null>(null);
+
+  const settingsDirty = () =>
+    !!draft.cfg && !!savedConfig() && JSON.stringify(draft.cfg) !== savedConfig();
+
+  async function loadProjectSettings(path: string) {
+    setError(null);
+    closeProjectSettings();
+    setSettingsPath(path);
+    try {
+      // A collection's own checkout is not on the recent list, so its header details have to be
+      // read from the folder. Skipped for the ordinary case, where the list already has them.
+      if (!projectAt(path)) {
+        const details = await invoke<RecentProject>("project_details", { path });
+        if (settingsPath() !== path) return;
+        setOffListProject(details);
+      }
+      const cfg = await invoke<ProjectConfig>("project_config", { path });
+      // The backend omits an empty modules list entirely; the editor needs an array to exist so
+      // its store paths ("cfg", "modules", i) have something to write into.
+      cfg.modules ??= [];
+      // The selection may have moved on while this was in flight — don't clobber the new one.
+      if (settingsPath() !== path) return;
+      setDraft("cfg", cfg);
+      setSavedConfig(JSON.stringify(cfg));
+      // What this machine can offer depends on the project's framework, so it is fetched per
+      // project rather than once. Local-only, so it is quick.
+      const mods = await invoke<ModuleView[]>("available_modules", {
+        frameworkVersion: cfg.frameworkVersion,
+      });
+      if (settingsPath() === path) setAvailableModules(mods);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  function closeProjectSettings() {
+    setSettingsPath(null);
+    setDraft("cfg", null);
+    setSavedConfig("");
+    setAvailableModules([]);
+  }
+
+  function revertSettings() {
+    const saved = savedConfig();
+    if (saved) setDraft("cfg", JSON.parse(saved));
+  }
+
+  /** Is this module id in the project's list? */
+  const hasModule = (id: string) => (draft.cfg?.modules ?? []).includes(id);
+
+  /** Tick / untick a module. Order is irrelevant — the runtime sorts by declared dependencies. */
+  function toggleModule(id: string) {
+    setDraft("cfg", "modules", (mods) => {
+      const current = mods ?? [];
+      return current.includes(id) ? current.filter((m) => m !== id) : [...current, id];
+    });
+  }
+
+  /** Entries in the file that the picker cannot show, because this machine doesn't have them. */
+  const unregisteredModules = () => {
+    const offered = new Set((availableModules() ?? []).map((m) => m.id));
+    return (draft.cfg?.modules ?? []).filter((m) => !offered.has(m));
+  };
+
+  const sourceBuilds = () => (installed() ?? []).filter((f) => f.local);
+
+  // The registered source build a pin resolves to, when the selected project targets one — what
+  // the panel needs to say whether debugging can step into framework code. Mirrors the backend's
+  // `local::resolve_pin`, including its one refusal: a bare `source` with several builds
+  // registered is ambiguous, and the build would fail rather than pick one.
+  const pinnedSourceBuild = (version: string): InstalledFramework | undefined => {
+    if (!isSourcePin(version)) return undefined;
+    const sources = sourceBuilds();
+    if (version === "source") return sources.length === 1 ? sources[0] : undefined;
+    return sources.find((f) => f.name === version.slice("source:".length));
+  };
+  const sourcePinAmbiguous = (version: string) =>
+    version === "source" && sourceBuilds().length > 1;
+
+  async function saveSettings(e?: Event) {
+    e?.preventDefault();
+    const path = settingsPath();
+    const config = draft.cfg;
+    if (!path || !config) return false;
+
+    setBusy(true);
+    setError(null);
+    try {
+      // Entries the user added and left blank would be launch-time "module not found" errors;
+      // drop them here, where the mistake is visible, rather than there.
+      const cleaned = {
+        ...config,
+        modules: (config.modules ?? []).map((m) => m.trim()).filter(Boolean),
+      };
+      await invoke("save_project_config", { path, config: cleaned });
+      setSavedConfig(JSON.stringify(draft.cfg));
+      await refetch();
+      return true;
+    } catch (e) {
+      setError(String(e));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
 
   // Live build output streamed from the Rust builder. onCleanup is registered
   // synchronously (outside the async body) so it reliably binds to this component's scope.
@@ -578,21 +1274,23 @@ export default function App() {
     );
 
     unlisten.push(
-      await listen<string>("build-output", (e) => appendCapped(setBuildLog, e.payload)),
+      await listen<ConsoleLine>("build-output", (e) =>
+        appendCapped(e.payload.project, "build", e.payload.text),
+      ),
     );
     unlisten.push(
-      await listen<string>("run-output", (e) => appendCapped(setRunLog, e.payload)),
+      await listen<ConsoleLine>("run-output", (e) =>
+        appendCapped(e.payload.project, "run", e.payload.text),
+      ),
     );
     unlisten.push(
       await listen<Finished>("build-finished", (e) => {
-        setRunning(false);
-        appendCapped(
-          setBuildLog,
-          e.payload.success ? "\n✓ done\n" : `\n✗ ${e.payload.error ?? "failed"}\n`,
-        );
+        const { project, success, error: failure } = e.payload;
+        appendCapped(project, "build", success ? "\n✓ done\n" : `\n✗ ${failure ?? "failed"}\n`);
+        setConsoles(project, "running", false);
         // A successful run has now launched — show its Output tab. A failed one (or a build-only)
         // stays on Build so the errors are in view.
-        if (e.payload.success && lastJobRun()) setConsoleTab("output");
+        if (success && consoles[project].wasRun) setConsoles(project, "tab", "output");
         refetch();
       }),
     );
@@ -629,6 +1327,14 @@ export default function App() {
     );
   });
 
+  // Open the first project as soon as there is one, so the app never starts on an empty panel
+  // asking the user to click something to see anything at all.
+  createEffect(() => {
+    if (!selected() && !projects.loading && (projects()?.length ?? 0) > 0) {
+      applySelection({ kind: "project", path: projects()![0].path });
+    }
+  });
+
   function installFramework(version: string) {
     setError(null);
     setProgress((p) => ({ ...p, [version]: 0 }));
@@ -644,6 +1350,106 @@ export default function App() {
     try {
       await invoke("uninstall_framework", { version });
       await Promise.all([refetchInstalled(), refetchAvailable()]);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  // --- Frameworks built from source ---
+  const [showAddLocal, setAddingLocal] = createSignal(false);
+  const [localPath, setLocalPath] = createSignal("");
+  const [localSource, setLocalSource] = createSignal("");
+  // What the Hub worked out about the prefix that was typed/picked, so the dialog can show the
+  // source tree it found instead of registering a build that cannot be stepped into.
+  const [detected, setDetected] = createSignal<DetectedSource | null>(null);
+  const canAddLocal = () => !!localPath().trim() && !busy();
+
+  // Probe whatever prefix is in the box. Debounced by being called only on blur/Browse rather than
+  // on every keystroke — it walks the filesystem.
+  async function probeLocalPath(path: string) {
+    const trimmed = path.trim();
+    if (!trimmed) {
+      setDetected(null);
+      return;
+    }
+    try {
+      setDetected(await invoke<DetectedSource>("detect_framework_source", { path: trimmed }));
+    } catch {
+      // Purely advisory — a prefix that cannot be probed is still registrable, and `add` is what
+      // says whether it is a real SDK.
+      setDetected(null);
+    }
+  }
+
+  async function browseLocalFramework() {
+    const picked = await open({ directory: true, multiple: false, title: "Koral SDK install prefix" });
+    if (typeof picked === "string") {
+      setLocalPath(picked);
+      await probeLocalPath(picked);
+    }
+  }
+
+  async function browseLocalSource() {
+    const picked = await open({
+      directory: true,
+      multiple: false,
+      title: "Koral source tree",
+      defaultPath: localSource() || detected()?.sourcePath || undefined,
+    });
+    if (typeof picked === "string") setLocalSource(picked);
+  }
+
+  function openAddLocal() {
+    setError(null);
+    setLocalPath("");
+    setLocalSource("");
+    setDetected(null);
+    setAddingLocal(true);
+  }
+
+  async function submitAddLocal(e: Event) {
+    e.preventDefault();
+    if (!canAddLocal()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("add_local_framework", {
+        req: { path: localPath().trim(), sourcePath: localSource().trim() },
+      });
+      await Promise.all([refetchInstalled(), refetchAvailable()]);
+      setAddingLocal(false);
+    } catch (e) {
+      // Stay open: the message names what is wrong with the directory, and the path is right here.
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeSourceBuild(name: string) {
+    setError(null);
+    try {
+      await invoke("remove_local_framework", { name });
+      await Promise.all([refetchInstalled(), refetchAvailable()]);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  // Point a registered build at its source tree by hand — the fix for a build directory that has
+  // since been cleaned, which is what leaves a source build undebuggable.
+  async function locateSource(fw: InstalledFramework) {
+    const picked = await open({
+      directory: true,
+      multiple: false,
+      title: `Source tree for ${fw.name}`,
+      defaultPath: fw.sourceDir || undefined,
+    });
+    if (typeof picked !== "string") return;
+    setError(null);
+    try {
+      await invoke("set_framework_source", { name: fw.name, sourcePath: picked });
+      await refetchInstalled();
     } catch (e) {
       setError(String(e));
     }
@@ -682,12 +1488,14 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      await invoke("create_project", {
+      const created = await invoke<RecentProject>("create_project", {
         req: { location: location(), name: trimmed, kind: kind() },
       });
       await refetch();
       setCreating(false);
       setName("");
+      // Land on what was just made — the next thing anyone does is open its settings or run it.
+      applySelection({ kind: "project", path: created.path });
     } catch (e) {
       // Stay in the dialog so the name/location can be corrected — the most likely
       // failure is "a folder named X already exists".
@@ -701,6 +1509,7 @@ export default function App() {
   // create dialog) so an import is one paste-and-go in the common case.
   async function openImport() {
     setError(null);
+    setImportMenu(false);
     setGitUrl("");
     if (!location()) {
       try {
@@ -720,10 +1529,13 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      await invoke("import_project", { req: { url, location: location() } });
+      const imported = await invoke<RecentProject>("import_project", {
+        req: { url, location: location() },
+      });
       await refetch();
       setImporting(false);
       setGitUrl("");
+      applySelection({ kind: "project", path: imported.path });
     } catch (e) {
       // Stay in the dialog so the URL can be fixed — the usual failures are a bad URL, a private
       // repo, or a clone that isn't a Koral project.
@@ -746,6 +1558,7 @@ export default function App() {
 
   function openAddCollection() {
     setError(null);
+    setImportMenu(false);
     setCollectionUrl("");
     setAddingCollection(true);
   }
@@ -758,10 +1571,12 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
-      await invoke("add_collection", { url });
+      const added = await invoke<CollectionView>("add_collection", { url });
       await refetchCollections();
       setAddingCollection(false);
       setCollectionUrl("");
+      setExpanded((prev) => new Set(prev).add(added.url));
+      applySelection({ kind: "collection", key: added.url });
     } catch (e) {
       // Stay in the dialog so the URL can be fixed — the usual failure is a link that doesn't
       // resolve to a collection manifest.
@@ -775,21 +1590,26 @@ export default function App() {
     setError(null);
     try {
       await invoke("remove_collection", { url });
+      // Only if *this* collection was showing. Unsubscribing from a collection you also author is
+      // done from the authored one's own panel, which must stay put underneath you.
+      if (sameSelection(selected(), { kind: "collection", key: url })) setSelected(null);
       await refetchCollections();
     } catch (e) {
       setError(String(e));
     }
   }
 
-  // Download a lab into the default project folder as a fresh project, then surface it in Recent
-  // Projects. No dialog — a lab is meant to be one click from the collection into your workspace.
+  // Download a lab into the default project folder as a fresh project, then select it. No dialog —
+  // a lab is meant to be one click from the collection into your workspace.
   async function downloadLab(url: string) {
     setError(null);
     setDownloadingLab(url);
     try {
       const loc = await ensureLocation();
-      await invoke("download_lab", { req: { url, location: loc } });
-      await refetch();
+      const project = await invoke<RecentProject>("download_lab", { req: { url, location: loc } });
+      // Both lists change: the project is new, and the collection entry now has a local path.
+      await Promise.all([refetch(), refetchCollections(), refetchAuthored()]);
+      applySelection({ kind: "project", path: project.path });
     } catch (e) {
       setError(String(e));
     } finally {
@@ -799,10 +1619,21 @@ export default function App() {
 
   // --- Authoring a collection ---
 
-  async function openCreateCollection() {
+  // Collections are made *from* a project: right-click one and file it. That keeps a collection
+  // from ever existing as an empty shell nobody remembers making.
+  async function openCreateCollection(seed: RecentProject) {
     setError(null);
+    setContextMenu(null);
+    setCollectionSeed(seed);
     setCollectionName("");
     setCollectionDescription("");
+    // A module registry and a lab list are different things, and the project being filed says
+    // which this is. Still editable, for a collection meant to hold both.
+    setCollectionContents(seed.kind === "Module" ? "modules" : "projects");
+    setLabDescription("");
+    setAddProjectHost(accounts()?.[0]?.host ?? "");
+    setAddProjectRepoName(seed.name);
+    setAddProjectPrivate(false);
     if (!location()) {
       try {
         setLocation(await invoke<string>("default_project_location"));
@@ -815,77 +1646,80 @@ export default function App() {
 
   async function submitCreateCollection(e: Event) {
     e.preventDefault();
-    const name = collectionName().trim();
-    if (!name || !location()) return;
+    const collectionTitle = collectionName().trim();
+    const seed = collectionSeed();
+    if (!collectionTitle || !location() || !seed) return;
 
     setBusy(true);
     setError(null);
     try {
-      await invoke("create_collection", {
-        req: { location: location(), name, description: collectionDescription() },
+      const created = await invoke<AuthoredCollection>("create_collection", {
+        req: {
+          location: location(),
+          name: collectionTitle,
+          description: collectionDescription(),
+          contents: collectionContents(),
+        },
       });
-      await refetchAuthored();
+      // The collection exists now, so a failure adding the project leaves something real and
+      // visible rather than nothing — and the error says what to retry.
+      await invoke("add_project_to_collection", {
+        req: {
+          path: created.path,
+          projectPath: seed.path,
+          description: labDescription(),
+          // A project with a remote is added straight from it; only a local-only one is published.
+          host: seed.git?.remote ? "" : addProjectHost(),
+          repoName: addProjectRepoName().trim(),
+          private: addProjectPrivate(),
+        },
+      });
+      await Promise.all([refetchAuthored(), refetch()]);
       setCreatingCollection(false);
-      setCollectionName("");
-      setCollectionDescription("");
+      setCollectionSeed(null);
+      setExpanded((prev) => new Set(prev).add(created.path));
+      applySelection({ kind: "collection", key: created.path });
     } catch (e) {
-      // Stay in the dialog so the name/location can be corrected — usually "already exists".
       setError(String(e));
+      await Promise.all([refetchAuthored(), refetch()]);
     } finally {
       setBusy(false);
     }
   }
 
-  function openAddProject(c: AuthoredCollection) {
+  function openAddToCollection(project: RecentProject) {
     setError(null);
-    setAddMode("project");
-    setAddProjectPath("");
-    setAddProjectHost(accounts()?.[0]?.host ?? "");
-    setAddProjectRepoName("");
-    setAddProjectPrivate(false);
-    setLabUrl("");
-    setLabName("");
+    setContextMenu(null);
+    setAddToCollection(project);
+    setTargetCollection(eligibleCollections(project)[0]?.path ?? "");
     setLabDescription("");
-    setAddProjectTo(c);
+    setAddProjectHost(accounts()?.[0]?.host ?? "");
+    setAddProjectRepoName(project.name);
+    setAddProjectPrivate(false);
   }
 
-  // Selecting a project in the picker defaults its publish repo name to the project's own name.
-  function pickProject(p: RecentProject) {
-    setAddProjectPath(p.path);
-    setAddProjectRepoName(p.name);
-  }
-
-  async function submitAddProject(e: Event) {
+  async function submitAddToCollection(e: Event) {
     e.preventDefault();
-    const c = addProjectTo();
-    if (!c || !canAddProject()) return;
+    const project = addToCollection();
+    if (!project || !canAddToCollection()) return;
 
     setBusy(true);
     setError(null);
     try {
-      if (addMode() === "url") {
-        await invoke("add_lab_to_collection", {
-          req: { path: c.path, url: labUrl().trim(), name: labName(), description: labDescription() },
-        });
-      } else {
-        const p = selectedProject();
-        if (!p) return;
-        await invoke("add_project_to_collection", {
-          req: {
-            path: c.path,
-            projectPath: p.path,
-            description: labDescription(),
-            // A project with a remote is added straight from it; only a local-only one is published.
-            host: p.git?.remote ? "" : addProjectHost(),
-            repoName: addProjectRepoName().trim(),
-            private: addProjectPrivate(),
-          },
-        });
-      }
-      await refetchAuthored();
-      // Auto-publishing gives the project a remote, so refresh the project cards too.
-      await refetch();
-      setAddProjectTo(null);
+      await invoke("add_project_to_collection", {
+        req: {
+          path: targetCollection(),
+          projectPath: project.path,
+          description: labDescription(),
+          host: project.git?.remote ? "" : addProjectHost(),
+          repoName: addProjectRepoName().trim(),
+          private: addProjectPrivate(),
+        },
+      });
+      const key = targetCollection();
+      await Promise.all([refetchAuthored(), refetch()]);
+      setAddToCollection(null);
+      setExpanded((prev) => new Set(prev).add(key));
     } catch (e) {
       // Stay in the dialog — the usual failures are not signed in, a private repo, or already added.
       setError(String(e));
@@ -894,8 +1728,36 @@ export default function App() {
     }
   }
 
-  // Path of the collection whose member-project list is doing a remove/reorder, so its controls show
-  // a pending state and don't fire twice mid-commit.
+  function openAddUrl(c: AuthoredCollection) {
+    setError(null);
+    setLabUrl("");
+    setLabName("");
+    setLabDescription("");
+    setAddUrlTo(c);
+  }
+
+  async function submitAddUrl(e: Event) {
+    e.preventDefault();
+    const c = addUrlTo();
+    if (!c || !labUrl().trim() || busy()) return;
+
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("add_lab_to_collection", {
+        req: { path: c.path, url: labUrl().trim(), name: labName(), description: labDescription() },
+      });
+      await refetchAuthored();
+      setAddUrlTo(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Path of the collection whose entry list is doing a remove/reorder, so its controls show a
+  // pending state and don't fire twice mid-commit.
   const [collectionBusy, setCollectionBusy] = createSignal<string | null>(null);
 
   async function removeLab(c: AuthoredCollection, url: string) {
@@ -928,6 +1790,7 @@ export default function App() {
 
   function askRemoveCollection(c: AuthoredCollection) {
     setError(null);
+    setContextMenu(null);
     setDeleteCollectionFiles(false);
     setRemovingCollection(c);
   }
@@ -945,7 +1808,8 @@ export default function App() {
         deleteFiles: deleteCollectionFiles(),
       });
       setRemovingCollection(null);
-      await refetchAuthored();
+      if (selected()?.kind === "collection") setSelected(null);
+      await Promise.all([refetchAuthored(), refetch()]);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -1021,14 +1885,6 @@ export default function App() {
     return repoPath ? `${info.host} · ${repoPath}` : info.host;
   }
 
-  // Whether a project from this lab's repo is already on disk — matched by "host · owner/repo" so
-  // https and ssh forms of the same repo still line up. Only true when we can prove it, so an owned
-  // clone that kept its origin shows "Downloaded"; a stripped copy simply won't (no false positives).
-  function labDownloaded(url: string): boolean {
-    const target = repoLabel(url);
-    return (projects() ?? []).some((p) => !!p.git?.remote && repoLabel(p.git.remote) === target);
-  }
-
   // Whether a signed-in account owns `remote` — mirrors the backend's `auth::signed_in_owns`, so the
   // UI can label an owned repo "Update" (push) versus "Save to Git" (fork into a new repo).
   function ownRemote(remote: string | null | undefined): boolean {
@@ -1044,8 +1900,13 @@ export default function App() {
 
   const folderName = (path: string) => path.replace(/[/\\]+$/, "").split(/[/\\]/).pop() ?? "";
 
+  /** Signed-in accounts as dropdown options — the same list wherever one has to be picked. */
+  const accountOptions = () =>
+    (accounts() ?? []).map((a) => ({ value: a.host, label: `${a.username}@${a.host}` }));
+
   function openPublish(target: PublishTarget, defaultName: string) {
     setError(null);
+    setContextMenu(null);
     setPublishResult(null);
     setPublishTarget(target);
     setPublishRepoName(defaultName);
@@ -1102,8 +1963,7 @@ export default function App() {
       });
       setPublishResult(result);
       // Refresh both lists — a published project or collection now shows a remote.
-      await refetchAuthored();
-      await refetch();
+      await Promise.all([refetchAuthored(), refetch()]);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -1118,12 +1978,15 @@ export default function App() {
     showImport() ||
     showAddCollection() ||
     showCreateCollection() ||
-    !!addProjectTo() ||
-    !!settingsPath() ||
+    !!addToCollection() ||
+    !!addUrlTo() ||
     !!removing() ||
     !!removingCollection() ||
     !!deviceLogin() ||
     !!publishTarget() ||
+    !!pendingSelection() ||
+    showAddLocal() ||
+    showFrameworks() ||
     showSettings();
 
   // Removal is confirmed, and deleting the folder is a separate, explicit opt-in that resets each
@@ -1138,12 +2001,27 @@ export default function App() {
     try {
       await invoke("remove_project", { path: project.path, deleteFiles: deleteFiles() });
       setRemoving(null);
-      await refetch();
+      // The project is gone, and so is its console — nothing would ever show it again, and a
+      // project later re-added at the same path must not inherit an old build's output.
+      setConsoles(produce((all) => delete all[project.path]));
+      if (selected()?.kind === "project") {
+        setSelected(null);
+        closeProjectSettings();
+      }
+      await Promise.all([refetch(), refetchCollections(), refetchAuthored()]);
     } catch (e) {
       setError(String(e));
     } finally {
       setBusy(false);
     }
+  }
+
+  // The release list is fetched once at startup, so a session that has been open a while would
+  // otherwise show a stale list — and a failed fetch would stay failed. Re-check on every open.
+  function openFrameworks() {
+    setError(null);
+    setShowFrameworks(true);
+    refetchAvailable();
   }
 
   async function openSettingsPanel() {
@@ -1190,43 +2068,9 @@ export default function App() {
 
   function askRemove(project: RecentProject) {
     setError(null);
+    setContextMenu(null);
     setDeleteFiles(false);
     setRemoving(project);
-  }
-
-  async function openSettings(path: string) {
-    setError(null);
-    try {
-      setDraft("cfg", await invoke<ProjectConfig>("project_config", { path }));
-      setSettingsPath(path);
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  async function saveSettings(e: Event) {
-    e.preventDefault();
-    const path = settingsPath();
-    const config = draft.cfg;
-    if (!path || !config) return;
-
-    setBusy(true);
-    setError(null);
-    try {
-      await invoke("save_project_config", { path, config });
-      setSettingsPath(null);
-      setDraft("cfg", null);
-      await refetch();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function closeSettings() {
-    setSettingsPath(null);
-    setDraft("cfg", null);
   }
 
   // Regenerates the IDE's build/run config before launching, so the editor is useful the moment
@@ -1234,6 +2078,7 @@ export default function App() {
   // `ideId` omitted → the backend uses the default from Settings.
   async function openInIde(path: string, ideId?: string) {
     setError(null);
+    setContextMenu(null);
     setOpening(path);
     try {
       // Explicit null, not undefined — an omitted key would not reach the Option<String> arg.
@@ -1245,34 +2090,77 @@ export default function App() {
     }
   }
 
-  async function runProject(path: string) {
+  // Start a job on one project: its console is reset to an empty Build tab, and only its own
+  // buttons are held while it runs. Another project's console is left exactly as it was.
+  async function startJob(path: string, command: "run_project" | "build_project") {
     setError(null);
-    setBuildLog("");
-    setRunLog("");
-    setLastJobRun(true);
-    setConsoleTab("build");
-    setRunning(true);
+    setContextMenu(null);
+    setConsoles(path, { ...emptyConsole(), running: true, wasRun: command === "run_project" });
     try {
-      await invoke("run_project", { path });
+      await invoke(command, { path });
     } catch (e) {
-      setRunning(false);
+      setConsoles(path, "running", false);
       setError(String(e));
     }
   }
 
-  async function buildProject(path: string) {
-    setError(null);
-    setBuildLog("");
-    setRunLog("");
-    setLastJobRun(false);
-    setConsoleTab("build");
-    setRunning(true);
-    try {
-      await invoke("build_project", { path });
-    } catch (e) {
-      setRunning(false);
-      setError(String(e));
-    }
+  const runProject = (path: string) => startJob(path, "run_project");
+  const buildProject = (path: string) => startJob(path, "build_project");
+
+  // One project's row in the sidebar. Extracted because it is rendered once per kind group, and a
+  // second copy would be a second place to keep the selection and context-menu wiring correct.
+  const projectRow = (p: RecentProject) => (
+    <button
+      type="button"
+      class="row row-project"
+      classList={{ "row-active": sameSelection(selected(), { kind: "project", path: p.path }) }}
+      onClick={() => select({ kind: "project", path: p.path })}
+      onContextMenu={(e) => {
+        select({ kind: "project", path: p.path });
+        openContextMenu(e, { project: p });
+      }}
+    >
+      <span class="row-swatch" style={{ "background-color": rgb(p.color) }}>
+        {p.name.charAt(0).toUpperCase()}
+      </span>
+      <span class="row-meta">
+        <span class="row-name">{p.name}</span>
+        <span class="row-sub">{frameworkLabel(p.frameworkVersion)}</span>
+      </span>
+      {/* A build only shows its output on its own project's console, so a project building in the
+          background would otherwise be invisible. This is the row saying it is still going. */}
+      <Show when={isRunning(p.path)}>
+        <span class="row-building" title="Building…" />
+      </Show>
+    </button>
+  );
+
+  // Right-click anywhere on a row, opening the menu at the pointer — `fitContextMenu` is what keeps
+  // it inside the window.
+  //
+  // Always swallows the event, even when there is nothing to offer (an entry that is not on this
+  // machine yet), so a right-click never falls through to the webview's own menu. And never opens
+  // over the unsaved-changes prompt, which the same click may have just raised.
+  function openContextMenu(
+    e: MouseEvent,
+    on: { project?: RecentProject; collection?: SidebarCollection },
+  ) {
+    e.preventDefault();
+    if (pendingSelection() || (!on.project && !on.collection)) return;
+    setContextMenu({ x: e.clientX, y: e.clientY, ...on });
+  }
+
+  // How big the menu is depends on what was right-clicked — a project offers three times what a
+  // collection does, and a repo adds a header — so it can only be fitted once it exists. Measure on
+  // mount and pull it back inside the window, rather than guessing a size up front and clamping to
+  // that: guess low and a menu opened near the bottom hangs off the edge.
+  function fitContextMenu(el: HTMLElement) {
+    const margin = 8;
+    const r = el.getBoundingClientRect();
+    const x = Math.min(r.left, window.innerWidth - r.width - margin);
+    const y = Math.min(r.top, window.innerHeight - r.height - margin);
+    el.style.left = `${Math.max(margin, x)}px`;
+    el.style.top = `${Math.max(margin, y)}px`;
   }
 
   return (
@@ -1289,15 +2177,6 @@ export default function App() {
             onClick={toggleTheme}
           >
             {theme() === "dark" ? "☀" : "☾"}
-          </button>
-          <button class="btn btn-ghost" onClick={openSettingsPanel}>
-            Settings
-          </button>
-          <button class="btn btn-ghost" disabled={busy()} onClick={openImport}>
-            Import
-          </button>
-          <button class="btn btn-primary" disabled={busy()} onClick={openCreate}>
-            New Project
           </button>
 
           {/* Native decorations are off, so we draw the window controls ourselves. */}
@@ -1336,502 +2215,1461 @@ export default function App() {
         </div>
       </header>
 
-      <main class="content">
-        <Show when={error() && !anyModalOpen()}>
-          <p class="error">{error()}</p>
-        </Show>
+      {/* --- Library: the sidebar of everything, and the panel for whatever is selected --- */}
+      <div class="library">
+        <aside class="sidebar">
+          <div class="sidebar-tools">
+            <input
+              class="input sidebar-filter"
+              type="search"
+              value={filter()}
+              placeholder="Filter…"
+              onInput={(e) => setFilter(e.currentTarget.value)}
+            />
+          </div>
 
-        <nav class="tabs">
-          <For each={TABS}>
-            {([id, label]) => (
-              <button
-                type="button"
-                class="tab"
-                classList={{ "tab-active": tab() === id }}
-                onClick={() => setTab(id)}
+          <div class="sidebar-list">
+            <Show when={!projects.loading} fallback={<p class="sidebar-empty muted-sm">Loading…</p>}>
+              <Show
+                when={looseProjects().length > 0 || visibleCollections().length > 0}
+                fallback={
+                  <p class="sidebar-empty muted-sm">
+                    {filter().trim() ? "Nothing matches that filter." : "No projects yet."}
+                  </p>
+                }
               >
-                {label}
-              </button>
-            )}
-          </For>
-        </nav>
-
-        <Show when={tab() === "projects"}>
-        <h1 class="section-title">Recent Projects</h1>
-
-        <Show when={!projects.loading} fallback={<p class="muted">Loading…</p>}>
-          <Show
-            when={(projects()?.length ?? 0) > 0}
-            fallback={
-              <div class="empty">
-                <p class="muted">No projects yet.</p>
-                <p class="muted-sm">Create one to get started.</p>
-              </div>
-            }
-          >
-            <ul class="project-list">
-              <For each={projects()}>
-                {(p) => (
-                  <li class="project-card">
-                    <span class="project-swatch" style={{ "background-color": rgb(p.color) }}>
-                      {p.name.charAt(0).toUpperCase()}
-                    </span>
-                    <span class="project-meta">
-                      <span class="project-name">{p.name}</span>
-                      <span class="project-path">{p.path}</span>
-                    </span>
-                    <span class="project-kind" classList={{ "kind-job": p.kind === "Job" }}>
-                      {p.kind}
-                    </span>
-                    <span class="project-fw">koral {p.frameworkVersion}</span>
-                    <Show when={defaultIde()}>
+                {/* Scenes, Jobs and Modules, each its own collapsible group. The group heading
+                    is what says a project's kind, so the rows themselves carry no kind tag. */}
+                <For each={projectGroups()}>
+                  {(group) => (
+                    <>
                       <button
-                        class="btn btn-ghost btn-ide"
-                        title={`Open in ${defaultIde()!.name} (${defaultIde()!.command}) — change the default in Settings`}
-                        disabled={opening() !== null}
-                        onClick={() => openInIde(p.path)}
+                        type="button"
+                        class="group-row"
+                        aria-expanded={groupOpen(group.key)}
+                        onClick={() => toggleGroup(group.key)}
                       >
-                        {opening() === p.path ? "Opening…" : `Open in ${defaultIde()!.name}`}
+                        <span class="group-chevron" classList={{ open: groupOpen(group.key) }}>
+                          ▸
+                        </span>
+                        <span class="group-label">{group.label}</span>
+                        <span class="group-count">{group.items.length}</span>
+                      </button>
+                      <Show when={groupOpen(group.key)}>
+                        <For each={group.items}>{(p) => projectRow(p)}</For>
+                      </Show>
+                    </>
+                  )}
+                </For>
+
+                <Show when={visibleCollections().length > 0}>
+                  <button
+                    type="button"
+                    class="group-row"
+                    aria-expanded={groupOpen("collections")}
+                    onClick={() => toggleGroup("collections")}
+                  >
+                    <span class="group-chevron" classList={{ open: groupOpen("collections") }}>
+                      ▸
+                    </span>
+                    <span class="group-label">Collections</span>
+                    <span class="group-count">{visibleCollections().length}</span>
+                  </button>
+                </Show>
+
+                <Show when={groupOpen("collections")}>
+                <For each={visibleCollections()}>
+                  {(c) => (
+                    <>
+                      <button
+                        type="button"
+                        class="row row-collection"
+                        classList={{ "row-active": sameSelection(selected(), { kind: "collection", key: c.key }) }}
+                        onClick={() => {
+                          select({ kind: "collection", key: c.key });
+                          toggleExpanded(c.key);
+                        }}
+                        onContextMenu={(e) => {
+                          select({ kind: "collection", key: c.key });
+                          openContextMenu(e, { collection: c });
+                        }}
+                      >
+                        <span class="row-chevron" classList={{ open: showLabs(c) }}>
+                          ▸
+                        </span>
+                        <span class="row-meta">
+                          <span class="row-name">{c.title}</span>
+                          <span class="row-sub">
+                            {c.error
+                              ? "unavailable"
+                              : `${c.labs.length} ${entryWord(c.contents)}${c.labs.length === 1 ? "" : "s"}`}
+                          </span>
+                        </span>
+                        <Show when={!c.authored}>
+                          <span class="row-kind">shared</span>
+                        </Show>
+                      </button>
+
+                      <Show when={showLabs(c)}>
+                        <For each={visibleLabs(c)}>
+                          {(lab) => {
+                            const local = () => labProject(lab);
+                            const sel = (): Selection =>
+                              labPath(lab)
+                                ? { kind: "project", path: labPath(lab)! }
+                                : { kind: "lab", key: c.key, url: lab.url };
+                            return (
+                              <button
+                                type="button"
+                                class="row row-lab"
+                                classList={{ "row-active": sameSelection(selected(), sel()) }}
+                                onClick={() => select(sel())}
+                                onContextMenu={(e) => {
+                                  select(sel());
+                                  // Only a project has actions worth a menu; an entry not on
+                                  // disk yet has exactly one, and the panel offers it.
+                                  openContextMenu(e, { project: local() });
+                                }}
+                              >
+                                <Show
+                                  when={local()}
+                                  fallback={<span class="row-swatch row-swatch-ghost">↓</span>}
+                                >
+                                  {(p) => (
+                                    <span
+                                      class="row-swatch"
+                                      style={{ "background-color": rgb(p().color) }}
+                                    >
+                                      {p().name.charAt(0).toUpperCase()}
+                                    </span>
+                                  )}
+                                </Show>
+                                <span class="row-meta">
+                                  <span class="row-name">{lab.name}</span>
+                                  <span class="row-sub">
+                                    {labPath(lab) ?? "not downloaded"}
+                                  </span>
+                                </span>
+                                <Show when={lab.kind === "Module"}>
+                                  <span class="row-kind">Module</span>
+                                </Show>
+                              </button>
+                            );
+                          }}
+                        </For>
+                      </Show>
+                    </>
+                  )}
+                </For>
+                </Show>
+              </Show>
+            </Show>
+          </div>
+
+          {/* Everything that belongs to the Hub rather than to any one project, under the list and
+              out of the way of the work. Each is a round icon that grows its label on hover — except
+              New Project, which wears its label until a neighbour is pointed at, because starting
+              one is what this panel is for. */}
+          <div class="sidebar-foot">
+            <button class="btn btn-ghost btn-foot" onClick={openFrameworks}>
+              {/* A package: the framework as a thing you install. */}
+              <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+                <path
+                  d="M8 1.7 14 5v6l-6 3.3L2 11V5z"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.4"
+                  stroke-linejoin="round"
+                />
+                <path
+                  d="M2 5l6 3.3L14 5M8 8.3v6"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.4"
+                  stroke-linejoin="round"
+                />
+              </svg>
+              <span class="btn-foot-label">Frameworks</span>
+            </button>
+            <button class="btn btn-ghost btn-foot" onClick={openSettingsPanel}>
+              {/* Sliders rather than a gear: these are preferences, and it reads at 16px. */}
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 16 16"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+                aria-hidden="true"
+              >
+                <path d="M2 4.5h12M2 11.5h12" />
+                {/* Solid knobs, so they read on whatever the button's fill happens to be. */}
+                <circle cx="10" cy="4.5" r="2" fill="currentColor" stroke="none" />
+                <circle cx="5.5" cy="11.5" r="2" fill="currentColor" stroke="none" />
+              </svg>
+              <span class="btn-foot-label">Settings</span>
+            </button>
+
+            {/* One Import, two ends of the same act: a single project, or a whole collection. */}
+            <div class="menu-wrap">
+              <button
+                class="btn btn-ghost btn-foot"
+                classList={{ "menu-open": importMenu() }}
+                onClick={() => setImportMenu(!importMenu())}
+              >
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 16 16"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.4"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M8 2v7.6M5 6.9l3 3 3-3" />
+                  <path d="M2.8 11.4v1.2c0 .7.5 1.2 1.2 1.2h8c.7 0 1.2-.5 1.2-1.2v-1.2" />
+                </svg>
+                <span class="btn-foot-label">Import</span>
+              </button>
+              <Show when={importMenu()}>
+                <div class="menu-backdrop" onClick={() => setImportMenu(false)} />
+                <div class="card-menu menu-left menu-up">
+                  <button type="button" class="menu-item" onClick={openImport}>
+                    Import from Git…
+                  </button>
+                  <button type="button" class="menu-item" onClick={openAddCollection}>
+                    Add a collection by URL…
+                  </button>
+                  <p class="menu-note">
+                    Collections of your own start from a project — right-click one.
+                  </p>
+                </div>
+              </Show>
+            </div>
+
+            <button class="btn btn-primary btn-foot btn-foot-open" disabled={busy()} onClick={openCreate}>
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 16 16"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                aria-hidden="true"
+              >
+                <path d="M8 3v10M3 8h10" />
+              </svg>
+              <span class="btn-foot-label">New Project</span>
+            </button>
+          </div>
+        </aside>
+
+        <section class="detail">
+          <Show when={error() && !anyModalOpen()}>
+            <p class="error">{error()}</p>
+          </Show>
+
+          {/* --- A project: everything about it, and every setting it has --- */}
+          <Show when={selectedProject()}>
+            {(p) => (
+              <>
+                <header class="detail-head">
+                  <span class="detail-swatch" style={{ "background-color": rgb(p().color) }}>
+                    {p().name.charAt(0).toUpperCase()}
+                  </span>
+                  <div class="detail-title-block">
+                    <h1 class="detail-title">{p().name}</h1>
+                    <p class="detail-path" title={p().path}>
+                      {p().path}
+                    </p>
+                  </div>
+                  <div class="detail-actions">
+                    {/* A module has no app to start — it runs inside projects that list it — so
+                        offering ▶ would only lead to the backend's refusal. Build stays. */}
+                    <Show when={p().kind !== "Module"}>
+                      <button
+                        class="btn btn-primary"
+                        disabled={isRunning(p().path)}
+                        onClick={() => runProject(p().path)}
+                      >
+                        {isRunning(p().path) ? "Running…" : "▶ Run"}
                       </button>
                     </Show>
                     <button
-                      class="btn btn-build"
+                      class="btn btn-ghost"
                       title="Build only (compile without running)"
-                      disabled={running()}
-                      onClick={() => buildProject(p.path)}
+                      disabled={isRunning(p().path)}
+                      onClick={() => buildProject(p().path)}
                     >
-                      <svg
-                        class="hammer-icon"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="2"
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                        aria-hidden="true"
-                      >
-                        <path d="m15 12-8.373 8.373a1 1 0 1 1-3-3L12 9" />
-                        <path d="m18 15 4-4" />
-                        <path d="m21.5 11.5-1.914-1.914A2 2 0 0 1 19 8.172V7l-2.26-2.26a6 6 0 0 0-4.202-1.756L9 2.96l.92.82A6.18 6.18 0 0 1 12 8.4V10l2 2h1.172a2 2 0 0 1 1.414.586L18.5 14.5" />
-                      </svg>
+                      Build
                     </button>
-                    <button
-                      class="btn btn-play"
-                      title="Build &amp; Run"
-                      disabled={running()}
-                      onClick={() => runProject(p.path)}
-                    >
-                      ▶
-                    </button>
-                    <div class="menu-wrap">
+                    <Show when={defaultIde()}>
                       <button
-                        class="btn btn-icon"
-                        classList={{ "menu-open": menuFor() === p.path }}
-                        title="More actions"
-                        onClick={() => setMenuFor(menuFor() === p.path ? null : p.path)}
+                        class="btn btn-ghost"
+                        title={`Open in ${defaultIde()!.name} (${defaultIde()!.command}) — change the default in Settings`}
+                        disabled={opening() !== null}
+                        onClick={() => openInIde(p().path)}
                       >
-                        ⋮
+                        {opening() === p().path ? "Opening…" : `Open in ${defaultIde()!.name}`}
                       </button>
-                      <Show when={menuFor() === p.path}>
-                        <div class="menu-backdrop" onClick={() => setMenuFor(null)} />
-                        <div class="card-menu">
-                          <Show when={p.git}>
-                            <div class="menu-info">
-                              <span class="menu-info-branch">
-                                {p.git!.branch ?? "detached"}
-                                <Show when={p.git!.dirty}>
-                                  <span class="git-dot"> ●</span>
-                                </Show>
-                              </span>
-                              <span class="menu-info-remote">
-                                {p.git!.remote ?? "local git repository"}
-                              </span>
-                            </div>
-                          </Show>
-                          <button
-                            type="button"
-                            class="menu-item"
-                            onClick={() => {
-                              setMenuFor(null);
-                              openSettings(p.path);
-                            }}
+                    </Show>
+                    <button
+                      class="btn btn-ghost btn-icon"
+                      title="More actions"
+                      onClick={(e) => openContextMenu(e, { project: p() })}
+                    >
+                      ⋮
+                    </button>
+                  </div>
+                </header>
+
+                <div class="badge-row">
+                  <span
+                    class="project-kind"
+                  >
+                    {p().kind}
+                  </span>
+                  <span class="project-fw">{frameworkLabel(p().frameworkVersion)}</span>
+                  <Show when={p().git}>
+                    <span
+                      class="project-git"
+                      title={
+                        (p().git!.remote ?? "local git repository") +
+                        (p().git!.dirty ? " · uncommitted changes" : "")
+                      }
+                    >
+                      <span class="git-branch-name">{p().git!.branch ?? "detached"}</span>
+                      <Show when={p().git!.dirty}>
+                        <span class="git-dot">●</span>
+                      </Show>
+                    </span>
+                  </Show>
+                  <Show when={p().git?.remote}>
+                    <span class="detail-remote" title={p().git!.remote!}>
+                      {repoLabel(p().git!.remote!)}
+                    </span>
+                  </Show>
+                </div>
+
+                <Show when={draft.cfg} fallback={<p class="muted">Loading settings…</p>}>
+                  <form class="settings" onSubmit={saveSettings}>
+                    <section class="panel">
+                      <h2 class="panel-title">Framework</h2>
+                      <label class="field">
+                        <span class="field-label">Builds against</span>
+                        <Select
+                          value={draft.cfg!.frameworkVersion}
+                          options={projectFwChoices().map((v) => ({
+                            value: v.value,
+                            label: v.label,
+                          }))}
+                          onChange={(v) => setDraft("cfg", "frameworkVersion", v)}
+                        />
+                      </label>
+                      <Show
+                        when={isSourcePin(draft.cfg!.frameworkVersion)}
+                        fallback={
+                          <p class="field-hint">
+                            Resolved to a prebuilt SDK for this platform and downloaded on the
+                            first build. Recorded in <code>koral.json</code>, so it travels with
+                            the project.
+                          </p>
+                        }
+                      >
+                        {/* A source build is the one framework a debugger can step into, so this
+                            is where to say whether it actually can. */}
+                        <Show
+                          when={pinnedSourceBuild(draft.cfg!.frameworkVersion)}
+                          fallback={
+                            <p class="field-hint field-bad">
+                              {sourcePinAmbiguous(draft.cfg!.frameworkVersion)
+                                ? "Several source builds are registered here, so a bare “source” is ambiguous — pick the one you mean above."
+                                : "No matching source build is registered on this machine — add one under Frameworks, or pick a release."}
+                            </p>
+                          }
+                        >
+                          {(fw) => (
+                            <>
+                              <p class="field-hint">
+                                Re-read from <code>{fw().path}</code> on every build, so your
+                                latest <code>cmake --install</code> is what this compiles against.
+                              </p>
+                              <Show
+                                when={fw().sourceDir}
+                                fallback={
+                                  <p class="field-hint field-bad">
+                                    Its source tree is unknown, so a crash inside the framework
+                                    won't open any code. Set it under{" "}
+                                    <strong>Frameworks → Locate source</strong>.
+                                  </p>
+                                }
+                              >
+                                <p class="field-hint">
+                                  Debugging steps into <code>{fw().sourceDir}</code>
+                                  {fw().buildType && !carriesDebugInfo(fw().buildType)
+                                    ? ` — but it was built ${fw().buildType}, which carries no debug info.`
+                                    : "."}
+                                </p>
+                              </Show>
+                            </>
+                          )}
+                        </Show>
+                      </Show>
+                    </section>
+
+                    <section class="panel">
+                      <h2 class="panel-title">Rendering</h2>
+                      <div class="field-grid">
+                        {/* A Job runs headless — it has no window, so width/height/flags do not
+                            apply and the Hub does not pass them. Only the API is meaningful. */}
+                        {/* Drag either field sideways to size the window, or click and type.
+                            See `scrubNumber`. */}
+                        <Show when={draft.cfg!.kind === "Scene"}>
+                          <For
+                            each={
+                              [
+                                ["width", "Width"],
+                                ["height", "Height"],
+                              ] as const
+                            }
                           >
-                            Settings
-                          </button>
-                          <button
-                            type="button"
-                            class="menu-item"
-                            onClick={() => {
-                              setMenuFor(null);
-                              openPublishProject(p);
-                            }}
+                            {([key, label]) => (
+                              <label class="field">
+                                <span class="field-label">{label}</span>
+                                <input
+                                  class="input"
+                                  type="number"
+                                  min={SIZE_MIN}
+                                  max={SIZE_MAX}
+                                  title="Drag to resize, or type. Hold Shift while dragging for fine steps."
+                                  value={draft.cfg!.rendering.window[key]}
+                                  onPointerDown={scrubNumber(
+                                    () => draft.cfg!.rendering.window[key],
+                                    (v) => setDraft("cfg", "rendering", "window", key, v),
+                                  )}
+                                  onInput={(e) =>
+                                    setDraft("cfg", "rendering", "window", key, +e.currentTarget.value)
+                                  }
+                                  // Clamped on commit rather than on every keystroke, so typing
+                                  // "1280" isn't fought character by character.
+                                  onChange={(e) =>
+                                    setDraft(
+                                      "cfg",
+                                      "rendering",
+                                      "window",
+                                      key,
+                                      clampSize(+e.currentTarget.value),
+                                    )
+                                  }
+                                />
+                              </label>
+                            )}
+                          </For>
+                        </Show>
+                        <label class="field">
+                          <span class="field-label">Graphics API</span>
+                          <Select
+                            value={draft.cfg!.rendering.api}
+                            options={[
+                              { value: "Vulkan", label: "Vulkan" },
+                              { value: "OpenGL", label: "OpenGL" },
+                            ]}
+                            onChange={(v) =>
+                              setDraft("cfg", "rendering", "api", v as "Vulkan" | "OpenGL")
+                            }
+                          />
+                        </label>
+                        {/* A Scene's windowing system on Linux. Ignored on Windows/macOS, so only
+                            shown there; a Job has no window. `auto` lets the runtime (GLFW)
+                            choose. Note OpenGL always runs on X11/XWayland — a Wayland choice
+                            with OpenGL is ignored by the runtime. */}
+                        <Show when={isLinux && draft.cfg!.kind === "Scene"}>
+                          <label class="field">
+                            <span class="field-label">Windowing (Linux)</span>
+                            <Select
+                              value={draft.cfg!.rendering.platform ?? "auto"}
+                              options={[
+                                { value: "auto", label: "Auto (GLFW default)" },
+                                { value: "wayland", label: "Wayland" },
+                                { value: "x11", label: "X11" },
+                              ]}
+                              onChange={(v) =>
+                                setDraft(
+                                  "cfg",
+                                  "rendering",
+                                  "platform",
+                                  v as "auto" | "x11" | "wayland",
+                                )
+                              }
+                            />
+                          </label>
+                        </Show>
+                      </div>
+
+                      <Show
+                        when={draft.cfg!.kind === "Scene"}
+                        fallback={
+                          <p class="field-hint">
+                            {draft.cfg!.kind === "Job" ? (
+                              <>
+                                This is a <strong>Job</strong> — it runs headless on a device-only
+                                context, so there are no window settings.
+                              </>
+                            ) : (
+                              <>
+                                This is a <strong>Module</strong> — it is loaded by projects that
+                                list it, and never opens a window of its own.
+                              </>
+                            )}
+                          </p>
+                        }
+                      >
+                        <span class="field-label">Window</span>
+                        <div class="toggle-row">
+                          <For
+                            each={
+                              [
+                                ["resizable", "Resizable"],
+                                ["vsync", "VSync"],
+                                ["fullscreen", "Fullscreen"],
+                                ["borderless", "Borderless"],
+                                ["transparent", "Transparent"],
+                              ] as const
+                            }
                           >
-                            {p.git?.remote && ownRemote(p.git.remote) ? "Update on Git" : "Save to Git"}
-                          </button>
-                          <button
-                            type="button"
-                            class="menu-item menu-danger"
-                            onClick={() => {
-                              setMenuFor(null);
-                              askRemove(p);
-                            }}
-                          >
-                            Remove project
-                          </button>
+                            {([key, label]) => (
+                              <label class="toggle">
+                                <input
+                                  type="checkbox"
+                                  checked={draft.cfg!.rendering.window[key]}
+                                  onChange={(e) =>
+                                    setDraft("cfg", "rendering", "window", key, e.currentTarget.checked)
+                                  }
+                                />
+                                <span>{label}</span>
+                              </label>
+                            )}
+                          </For>
                         </div>
                       </Show>
-                    </div>
-                  </li>
-                )}
-              </For>
-            </ul>
-          </Show>
-        </Show>
-        </Show>
+                    </section>
 
-        <Show when={tab() === "collections"}>
-        <div class="section-head">
-          <h1 class="section-title">Browse</h1>
-          <button class="btn btn-ghost btn-small" disabled={busy()} onClick={openAddCollection}>
-            + Add collection
-          </button>
-        </div>
-
-        <Show
-          when={!collections.loading}
-          fallback={<p class="muted">Loading collections…</p>}
-        >
-          <Show
-            when={(collections()?.length ?? 0) > 0}
-            fallback={
-              <div class="empty">
-                <p class="muted">No collections yet.</p>
-                <p class="muted-sm">Add one with a link your instructor shared.</p>
-              </div>
-            }
-          >
-            <div class="collection-list">
-              <For each={collections()}>
-                {(c) => (
-                  <section class="collection-card" classList={{ collapsed: isCollapsed(c.url) }}>
-                    <div class="collection-head">
-                      <button
-                        class="btn btn-icon collapse-toggle"
-                        title={isCollapsed(c.url) ? "Expand" : "Collapse"}
-                        onClick={() => toggleCollapsed(c.url)}
+                    <section class="panel">
+                      <h2 class="panel-title">Content</h2>
+                      <For
+                        each={
+                          [
+                            ["assetDirectories", "Asset folders", "assets"],
+                            ["shaderDirectories", "Shader folders", "shaders"],
+                          ] as const
+                        }
                       >
-                        {isCollapsed(c.url) ? "▸" : "▾"}
-                      </button>
-                      <span class="collection-meta" onClick={() => toggleCollapsed(c.url)}>
-                        <span class="collection-title">{c.manifest?.title ?? c.url}</span>
-                        <Show when={c.manifest?.description}>
-                          <span class="collection-sub">{c.manifest!.description}</span>
-                        </Show>
-                        <span class="collection-source" title={c.url}>{repoLabel(c.url)}</span>
-                      </span>
-                      <Show when={c.manifest}>
-                        <span class="collection-count">
-                          {c.manifest!.labs.length}{" "}
-                          {c.manifest!.labs.length === 1 ? "project" : "projects"}
-                        </span>
-                      </Show>
-                      <button
-                        class="btn btn-icon btn-danger"
-                        title="Remove this collection (downloaded projects are kept)"
-                        onClick={() => removeCollection(c.url)}
-                      >
-                        ✕
-                      </button>
-                    </div>
+                        {([key, label, placeholder]) => (
+                          <div class="field">
+                            <span class="field-label">{label}</span>
+                            <For each={draft.cfg!.paths[key]}>
+                              {(dir, i) => (
+                                <div class="dir-row">
+                                  <input
+                                    class="input"
+                                    value={dir}
+                                    placeholder={placeholder}
+                                    onInput={(e) =>
+                                      setDraft("cfg", "paths", key, i(), e.currentTarget.value)
+                                    }
+                                  />
+                                  {/* Order is the search order, so moving an entry up is a real
+                                      setting. */}
+                                  <button
+                                    type="button"
+                                    class="btn btn-ghost btn-icon btn-move"
+                                    title="Search this one earlier"
+                                    disabled={i() === 0}
+                                    onClick={() =>
+                                      setDraft("cfg", "paths", key, (dirs) => {
+                                        const next = [...dirs];
+                                        [next[i() - 1], next[i()]] = [next[i()], next[i() - 1]];
+                                        return next;
+                                      })
+                                    }
+                                  >
+                                    ↑
+                                  </button>
+                                  <button
+                                    type="button"
+                                    class="btn btn-ghost btn-icon"
+                                    title="Remove"
+                                    onClick={() =>
+                                      setDraft("cfg", "paths", key, (dirs) =>
+                                        dirs.filter((_, n) => n !== i()),
+                                      )
+                                    }
+                                  >
+                                    ✕
+                                  </button>
+                                </div>
+                              )}
+                            </For>
+                            <button
+                              type="button"
+                              class="btn btn-ghost btn-small self-start"
+                              onClick={() => setDraft("cfg", "paths", key, (dirs) => [...dirs, ""])}
+                            >
+                              + Add folder
+                            </button>
+                          </div>
+                        )}
+                      </For>
+                      <p class="field-hint">
+                        Relative to the project root, searched in order. The runtime resolves
+                        relative texture, model and shader paths against these — a scene can just
+                        ask for <code>textures/wood.png</code>. The engine's own content is
+                        searched last, so a project can shadow a built-in asset by name without
+                        losing the rest.
+                      </p>
+                    </section>
 
-                    <Show when={!isCollapsed(c.url)}>
-                      <Show when={c.error}>
-                        <p class="error">Couldn't load this collection: {c.error}</p>
-                      </Show>
-
-                      <Show when={c.manifest}>
+                    {/* The modules list is what the runtime loads when *running* this project. A
+                        module project is never run — its dependencies are declared in code — so
+                        offering the editor there would only invite a key the runtime never reads. */}
+                    <Show when={draft.cfg!.kind !== "Module"}>
+                      <section class="panel">
+                        <h2 class="panel-title">Modules</h2>
+                        {/* A checklist of what this machine actually has, not a text box: a typed
+                            name is only discovered to be wrong at launch, while everything here
+                            is known to resolve. Anything already in the file that is *not*
+                            installed still shows — see unregisteredModules below — so opening a
+                            project never silently drops it. */}
                         <Show
-                          when={c.manifest!.labs.length > 0}
-                          fallback={<p class="muted-sm">This collection has no projects yet.</p>}
+                          when={(availableModules() ?? []).length > 0}
+                          fallback={
+                            <p class="field-hint">
+                              No modules available yet. Create one with{" "}
+                              <strong>New Project → Module</strong>, or download one from a
+                              collection.
+                            </p>
+                          }
                         >
-                          <ul class="lab-list">
-                            <For each={c.manifest!.labs}>
-                              {(lab, i) => (
-                                <li class="lab-row">
-                                  <span class="lab-index">{i() + 1}</span>
-                                  <span class="lab-meta">
-                                    <span class="lab-name">
-                                      {lab.name}
-                                      <Show when={labDownloaded(lab.url)}>
-                                        <span class="lab-badge">Downloaded</span>
-                                      </Show>
+                          <div class="module-picker">
+                            <For each={availableModules()}>
+                              {(m) => (
+                                <label class="pick-row" classList={{ selected: hasModule(m.id) }}>
+                                  <input
+                                    type="checkbox"
+                                    checked={hasModule(m.id)}
+                                    onChange={() => toggleModule(m.id)}
+                                  />
+                                  <span class="pick-meta">
+                                    <span class="pick-name">{m.name}</span>
+                                    <span class="pick-sub">
+                                      {m.path ?? "ships with the framework"}
                                     </span>
-                                    <Show when={lab.description}>
-                                      <span class="lab-desc">{lab.description}</span>
-                                    </Show>
-                                    <span class="lab-repo" title={lab.url}>{repoLabel(lab.url)}</span>
                                   </span>
+                                  {/* Which ones a debugger can step into is exactly the
+                                      difference between the two sources here, so say it. */}
+                                  <Show when={m.hasSource}>
+                                    <span class="pick-tag" title="Its source is on this machine, so debugging steps into it">
+                                      source
+                                    </span>
+                                  </Show>
+                                  <span class="pick-tag">
+                                    {m.source === "project" ? "your project" : "framework"}
+                                  </span>
+                                </label>
+                              )}
+                            </For>
+                          </div>
+                        </Show>
+
+                        {/* Entries the file names that this machine cannot offer — a module built
+                            on another machine, or a path. Kept, listed and removable, because
+                            dropping a setting the user cannot see would be the worst behaviour. */}
+                        <Show when={unregisteredModules().length > 0}>
+                          <p class="field-hint">Listed in koral.json but not registered here:</p>
+                          <For each={unregisteredModules()}>
+                            {(entry) => (
+                              <div class="dir-row">
+                                <input class="input" value={entry} disabled />
+                                <button
+                                  type="button"
+                                  class="btn btn-ghost btn-icon"
+                                  title="Remove"
+                                  onClick={() => toggleModule(entry)}
+                                >
+                                  ✕
+                                </button>
+                              </div>
+                            )}
+                          </For>
+                        </Show>
+                        <p class="field-hint">
+                          Optional engine features the runtime loads for this project. Your own
+                          module projects are built and copied in automatically when this project
+                          builds, and a debugger steps straight into their code. A module that
+                          another module depends on must be ticked too.
+                        </p>
+                      </section>
+                    </Show>
+
+                    {/* Sticky, and only present while there is something to save — a permanent
+                        bar would make an unchanged project look unsaved. */}
+                    <Show when={settingsDirty()}>
+                      <div class="save-bar">
+                        <span class="save-note">Unsaved changes to koral.json</span>
+                        <button type="button" class="btn btn-ghost" onClick={revertSettings}>
+                          Revert
+                        </button>
+                        <button type="submit" class="btn btn-primary" disabled={busy()}>
+                          {busy() ? "Saving…" : "Save"}
+                        </button>
+                      </div>
+                    </Show>
+                  </form>
+                </Show>
+              </>
+            )}
+          </Show>
+
+          {/* --- A collection: what it holds, and what can be done to it --- */}
+          <Show when={selectedCollection()}>
+            {(c) => (
+              <>
+                <header class="detail-head">
+                  <span class="detail-swatch detail-swatch-collection">▤</span>
+                  <div class="detail-title-block">
+                    <h1 class="detail-title">{c().title}</h1>
+                    <p class="detail-path" title={c().subtitle}>
+                      {c().subtitle}
+                    </p>
+                  </div>
+                  <div class="detail-actions">
+                    <Show
+                      when={c().authored}
+                      fallback={
+                        <button
+                          class="btn btn-ghost"
+                          title="Stop following this collection (downloaded projects are kept)"
+                          onClick={() => removeCollection(c().key)}
+                        >
+                          Remove
+                        </button>
+                      }
+                    >
+                      {(a) => (
+                        <>
+                          <button class="btn btn-ghost" onClick={() => openAddUrl(a())}>
+                            + Add by URL
+                          </button>
+                          <button
+                            class="btn btn-primary"
+                            title={
+                              a().git?.remote ? `Push updates to ${a().git!.remote}` : "Publish to GitHub"
+                            }
+                            onClick={() => openPublishCollection(a())}
+                          >
+                            {a().git?.remote ? "Publish updates" : "Publish"}
+                          </button>
+                          <button
+                            class="btn btn-ghost btn-icon"
+                            title="More actions"
+                            onClick={(e) => openContextMenu(e, { collection: c() })}
+                          >
+                            ⋮
+                          </button>
+                        </>
+                      )}
+                    </Show>
+                  </div>
+                </header>
+
+                <div class="badge-row">
+                  <span class="project-kind">{c().contents}</span>
+                  <span class="project-fw">
+                    {c().labs.length} {entryWord(c().contents)}
+                    {c().labs.length === 1 ? "" : "s"}
+                  </span>
+                  <Show when={c().authored?.git}>
+                    <span
+                      class="project-git"
+                      title={
+                        (c().authored!.git!.remote ?? "local git repository") +
+                        (c().authored!.git!.dirty ? " · uncommitted changes" : "")
+                      }
+                    >
+                      <span class="git-branch-name">{c().authored!.git!.branch ?? "detached"}</span>
+                      <Show when={c().authored!.git!.dirty}>
+                        <span class="git-dot">●</span>
+                      </Show>
+                    </span>
+                  </Show>
+                  <Show when={!c().authored}>
+                    <span class="row-kind">shared with you</span>
+                  </Show>
+                </div>
+
+                <Show when={c().subscribed?.description || c().authored?.description}>
+                  <p class="detail-desc">
+                    {c().subscribed?.description || c().authored?.description}
+                  </p>
+                </Show>
+
+                <Show when={c().error}>
+                  <p class="error">Couldn't load this collection: {c().error}</p>
+                </Show>
+
+                <div class="detail-sections">
+                <section class="panel">
+                  <h2 class="panel-title">Contents</h2>
+                  <Show
+                    when={c().labs.length > 0}
+                    fallback={
+                      <p class="field-hint">
+                        {c().authored
+                          ? `No ${entryWord(c().contents)}s yet — right-click a project to add it, or use “+ Add by URL”.`
+                          : `This collection has no ${entryWord(c().contents)}s yet.`}
+                      </p>
+                    }
+                  >
+                    <ul class="member-list">
+                      <For each={c().labs}>
+                        {(lab, i) => (
+                          <li class="member-row">
+                            <span class="member-index">{i() + 1}</span>
+                            <span class="member-meta">
+                              <span class="member-name">
+                                {lab.name}
+                                <Show when={lab.kind === "Module" && c().contents === "mixed"}>
+                                  <span class="lab-badge lab-badge-module">module</span>
+                                </Show>
+                                <Show when={labPath(lab)}>
+                                  <span class="lab-badge">on disk</span>
+                                </Show>
+                              </span>
+                              <Show when={lab.description}>
+                                <span class="member-sub">{lab.description}</span>
+                              </Show>
+                              <span class="member-sub" title={lab.url}>
+                                {repoLabel(lab.url)}
+                              </span>
+                            </span>
+                            <span class="member-actions">
+                              <Show
+                                when={labPath(lab)}
+                                fallback={
                                   <button
                                     class="btn btn-ghost btn-small"
                                     disabled={downloadingLab() !== null}
                                     onClick={() => downloadLab(lab.url)}
                                   >
-                                    {downloadingLab() === lab.url
-                                      ? "Downloading…"
-                                      : labDownloaded(lab.url)
-                                        ? "Download again"
-                                        : "Download"}
+                                    {downloadingLab() === lab.url ? "Downloading…" : "Download"}
                                   </button>
-                                </li>
-                              )}
-                            </For>
-                          </ul>
-                        </Show>
-                      </Show>
-                    </Show>
-                  </section>
-                )}
-              </For>
-            </div>
-          </Show>
-        </Show>
+                                }
+                              >
+                                <button
+                                  class="btn btn-ghost btn-small"
+                                  onClick={() => select({ kind: "project", path: labPath(lab)! })}
+                                >
+                                  Open
+                                </button>
+                              </Show>
+                              <Show when={c().authored}>
+                                {(a) => (
+                                  <>
+                                    <button
+                                      class="btn btn-icon btn-move"
+                                      title="Move up"
+                                      disabled={i() === 0 || collectionBusy() === a().path}
+                                      onClick={() => reorderLab(a(), lab.url, true)}
+                                    >
+                                      ↑
+                                    </button>
+                                    <button
+                                      class="btn btn-icon btn-move"
+                                      title="Move down"
+                                      disabled={
+                                        i() === c().labs.length - 1 || collectionBusy() === a().path
+                                      }
+                                      onClick={() => reorderLab(a(), lab.url, false)}
+                                    >
+                                      ↓
+                                    </button>
+                                    <button
+                                      class="btn btn-icon btn-danger"
+                                      title="Remove from collection"
+                                      disabled={collectionBusy() === a().path}
+                                      onClick={() => removeLab(a(), lab.url)}
+                                    >
+                                      ✕
+                                    </button>
+                                  </>
+                                )}
+                              </Show>
+                            </span>
+                          </li>
+                        )}
+                      </For>
+                    </ul>
+                  </Show>
+                </section>
 
-        <div class="section-head">
-          <h1 class="section-title">My Collections</h1>
-          <button class="btn btn-ghost btn-small" disabled={busy()} onClick={openCreateCollection}>
-            + New collection
-          </button>
-        </div>
-        <p class="field-hint collections-blurb">
-          Gather your projects into one repository of git submodules, then push it and share the link
-          — students add it under <strong>Browse</strong> and download each as a course lab.
-        </p>
-
-        <Show when={!authored.loading} fallback={<p class="muted">Loading…</p>}>
-          <Show
-            when={(authored()?.length ?? 0) > 0}
-            fallback={
-              <div class="empty">
-                <p class="muted">You aren't building any collections yet.</p>
-                <p class="muted-sm">Create one to gather projects for a course.</p>
-              </div>
-            }
-          >
-            <ul class="collection-list">
-              <For each={authored()}>
-                {(c) => (
-                  <li class="collection-card" classList={{ collapsed: isCollapsed(c.path) }}>
-                    <div class="collection-head">
-                      <button
-                        class="btn btn-icon collapse-toggle"
-                        title={isCollapsed(c.path) ? "Expand" : "Collapse"}
-                        onClick={() => toggleCollapsed(c.path)}
-                      >
-                        {isCollapsed(c.path) ? "▸" : "▾"}
-                      </button>
-                      <span class="collection-meta" onClick={() => toggleCollapsed(c.path)}>
-                        <span class="collection-title">{c.title}</span>
-                        <Show when={c.description}>
-                          <span class="collection-sub">{c.description}</span>
-                        </Show>
-                        <span class="collection-source" title={c.path}>{c.path}</span>
-                      </span>
-                      <span class="collection-count">
-                        {c.labCount} {c.labCount === 1 ? "project" : "projects"}
-                      </span>
-                      <Show when={c.git}>
-                        <span
-                          class="project-git"
-                          title={
-                            (c.git!.remote ?? "local git repository") +
-                            (c.git!.dirty ? " · uncommitted changes" : "")
-                          }
+                <Show when={c().authored}>
+                  <p class="field-hint">
+                    A collection is a git repository of submodules. Publish it and share the URL —
+                    anyone can add it here and download each entry as their own project.
+                  </p>
+                  {/* Listed once, but the subscription is real and has to stay cancellable —
+                      otherwise merging the two rows would strand it with no way to remove it. */}
+                  <Show when={subscriptionFor(c().key)}>
+                    {(sub) => (
+                      <p class="field-hint">
+                        You're also following this collection at <code>{sub().url}</code>, so it
+                        is shown once, here.{" "}
+                        <button
+                          type="button"
+                          class="link-button"
+                          onClick={() => removeCollection(sub().url)}
                         >
-                          <span class="git-branch-name">{c.git!.branch ?? "detached"}</span>
-                          <Show when={c.git!.dirty}>
-                            <span class="git-dot">●</span>
-                          </Show>
-                        </span>
-                      </Show>
-                      <button
-                        class="btn btn-ghost btn-small"
-                        disabled={!!addProjectTo()}
-                        onClick={() => openAddProject(c)}
-                      >
-                        + Add project
-                      </button>
-                      <button
-                        class="btn btn-ghost btn-small"
-                        title={c.git?.remote ? `Push updates to ${c.git.remote}` : "Publish to GitHub"}
-                        onClick={() => openPublishCollection(c)}
-                      >
-                        {c.git?.remote ? "Publish updates" : "Publish"}
-                      </button>
-                      <button
-                        class="btn btn-icon btn-danger"
-                        title="Remove this collection"
-                        onClick={() => askRemoveCollection(c)}
-                      >
-                        ✕
-                      </button>
-                    </div>
-
-                    {/* The projects in the collection, in order — reorder or remove each. */}
-                    <Show when={!isCollapsed(c.path)}>
-                    <Show
-                      when={c.labs.length > 0}
-                      fallback={
-                        <p class="collection-empty muted-sm">
-                          No projects yet — add one with “+ Add project”.
-                        </p>
-                      }
-                    >
-                      <ul class="member-list">
-                        <For each={c.labs}>
-                          {(lab, i) => (
-                            <li class="member-row">
-                              <span class="member-index">{i() + 1}</span>
-                              <span class="member-meta">
-                                <span class="member-name">{lab.name}</span>
-                                <Show when={lab.description || lab.url}>
-                                  <span class="member-sub">{lab.description || lab.url}</span>
-                                </Show>
-                              </span>
-                              <span class="member-actions">
-                                <button
-                                  class="btn btn-icon btn-move"
-                                  title="Move up"
-                                  disabled={i() === 0 || collectionBusy() === c.path}
-                                  onClick={() => reorderLab(c, lab.url, true)}
-                                >
-                                  ↑
-                                </button>
-                                <button
-                                  class="btn btn-icon btn-move"
-                                  title="Move down"
-                                  disabled={i() === c.labs.length - 1 || collectionBusy() === c.path}
-                                  onClick={() => reorderLab(c, lab.url, false)}
-                                >
-                                  ↓
-                                </button>
-                                <button
-                                  class="btn btn-icon btn-danger"
-                                  title="Remove from collection"
-                                  disabled={collectionBusy() === c.path}
-                                  onClick={() => removeLab(c, lab.url)}
-                                >
-                                  ✕
-                                </button>
-                              </span>
-                            </li>
-                          )}
-                        </For>
-                      </ul>
-                    </Show>
-                    </Show>
-                  </li>
-                )}
-              </For>
-            </ul>
-          </Show>
-        </Show>
-        </Show>
-
-        <Show when={tab() === "framework"}>
-        <h1 class="section-title">Framework</h1>
-
-        <Show
-          when={!available.error}
-          fallback={
-            <div class="empty">
-              <p class="error">Could not reach GitHub: {String(available.error)}</p>
-              <button class="btn btn-ghost" onClick={() => refetchAvailable()}>
-                Retry
-              </button>
-            </div>
-          }
-        >
-          <Show when={!available.loading} fallback={<p class="muted">Checking for releases…</p>}>
-            <Show
-              when={(available()?.length ?? 0) > 0}
-              fallback={
-                <div class="empty">
-                  <p class="muted">No releases published for this platform yet.</p>
+                          Stop following
+                        </button>
+                        .
+                      </p>
+                    )}
+                  </Show>
+                </Show>
                 </div>
-              }
-            >
-              <ul class="fw-list">
-                <For each={available()}>
-                  {(fw) => {
-                    const pct = () => progress()[fw.version];
-                    const downloading = () => pct() !== undefined;
-                    const local = () =>
-                      installed()?.find((i) => i.version === fw.version);
-                    return (
-                      <li class="fw-card" classList={{ "fw-installed": fw.installed }}>
+              </>
+            )}
+          </Show>
+
+          {/* --- A collection entry that isn't here yet --- */}
+          <Show when={selectedLab()}>
+            {(picked) => (
+              <>
+                <header class="detail-head">
+                  <span class="detail-swatch detail-swatch-ghost">↓</span>
+                  <div class="detail-title-block">
+                    <h1 class="detail-title">{picked().lab.name}</h1>
+                    <p class="detail-path" title={picked().lab.url}>
+                      {repoLabel(picked().lab.url)}
+                    </p>
+                  </div>
+                  <div class="detail-actions">
+                    <button
+                      class="btn btn-primary"
+                      disabled={downloadingLab() !== null}
+                      onClick={() => downloadLab(picked().lab.url)}
+                    >
+                      {downloadingLab() === picked().lab.url ? "Downloading…" : "Download"}
+                    </button>
+                  </div>
+                </header>
+
+                <div class="badge-row">
+                  <Show when={picked().lab.kind}>
+                    <span
+                      class="project-kind"
+                    >
+                      {picked().lab.kind}
+                    </span>
+                  </Show>
+                  <span class="project-fw">from {picked().collection.title}</span>
+                </div>
+
+                <Show when={picked().lab.description}>
+                  <p class="detail-desc">{picked().lab.description}</p>
+                </Show>
+
+                <div class="detail-sections">
+                  <p class="field-hint">
+                    Downloading clones it into your projects folder as a copy of your own — the
+                    upstream history is dropped, so nothing you change here can be overwritten by
+                    the author later. It then appears here as an ordinary project.
+                  </p>
+                </div>
+              </>
+            )}
+          </Show>
+
+          <Show when={!selectedProject() && !selectedCollection() && !selectedLab()}>
+            <div class="empty">
+              <p class="muted">Nothing selected.</p>
+              <p class="muted-sm">
+                Pick a project on the left, or create one to get started.
+              </p>
+            </div>
+          </Show>
+        </section>
+      </div>
+
+      {/* --- Frameworks --- */}
+      <Show when={showFrameworks()}>
+        <div class="modal-scrim" onClick={() => setShowFrameworks(false)}>
+          <div class="modal modal-wide modal-tall" onClick={(e) => e.stopPropagation()}>
+            <h2 class="modal-title">Frameworks</h2>
+            <div class="modal-scroll">
+              <Show when={error()}>
+                <p class="error">{error()}</p>
+              </Show>
+
+              {/* Builds from source come first: someone who has registered one is working on the
+                  framework itself, and it is what their projects resolve to. Listed even when GitHub
+                  is unreachable, since nothing here needs the network. */}
+              <div class="fw-local-head">
+                <span class="fw-local-title">Built from source</span>
+                <button class="btn btn-ghost btn-small" onClick={openAddLocal}>
+                  + Add source build
+                </button>
+              </div>
+              <Show
+                when={sourceBuilds().length > 0}
+                fallback={
+                  <p class="field-hint">
+                    Point the Hub at a framework you built yourself — the directory you passed to{" "}
+                    <code>cmake --install --prefix</code> — to build projects against a version that
+                    was never released, and to debug straight into engine code.
+                  </p>
+                }
+              >
+                <ul class="fw-list">
+                  <For each={sourceBuilds()}>
+                    {(fw) => (
+                      <li class="fw-card">
                         <span class="fw-meta">
                           <span class="fw-version">
-                            koral {fw.version}
-                            <Show when={fw.draft}>
-                              <span class="fw-tag fw-tag-draft" title="Unpublished — visible only because you are signed in to GitHub">
-                                draft
+                            {fw.name}
+                            <span class="fw-tag">source</span>
+                            {/* Debug info is what makes a crash land on a line of framework code, and
+                                it is a property of how they built it — so it is stated, not implied. */}
+                            <Show when={fw.buildType}>
+                              <span
+                                class="fw-tag"
+                                classList={{ "fw-tag-draft": !carriesDebugInfo(fw.buildType) }}
+                                title={buildTypeHint(fw.buildType!)}
+                              >
+                                {fw.buildType}
                               </span>
                             </Show>
-                            <Show when={fw.prerelease && !fw.draft}>
-                              <span class="fw-tag">pre-release</span>
-                            </Show>
                           </span>
-                          <span class="fw-sub">
-                            {local()
-                              ? `installed · ${mb(local()!.sizeBytes)} on disk`
-                              : `${fw.assetName} · ${mb(fw.assetSize)}`}
+                          <span class="fw-sub" title={fw.path}>
+                            {fw.path}
+                          </span>
+                          <span class="fw-sub" title={fw.sourceDir}>
+                            {fw.sourceDir ? `source: ${fw.sourceDir}` : "source tree not found"}
                           </span>
                         </span>
-
-                        <Show when={downloading()}>
-                          <span class="fw-progress">
-                            <progress
-                              class="fw-bar"
-                              max="100"
-                              value={pct()! >= 0 ? pct()! : undefined}
-                            />
-                            <span class="muted-sm">
-                              {pct()! >= 0 ? `${pct()}%` : "downloading…"}
-                            </span>
-                          </span>
-                        </Show>
-
-                        <Show when={!downloading()}>
-                          <Show
-                            when={fw.installed}
-                            fallback={
-                              <button
-                                class="btn btn-primary"
-                                onClick={() => installFramework(fw.version)}
-                              >
-                                Install
-                              </button>
-                            }
-                          >
-                            <button
-                              class="btn btn-ghost"
-                              title={`Delete ${local()?.path ?? fw.version}`}
-                              onClick={() => uninstallFramework(fw.version)}
-                            >
-                              Uninstall
-                            </button>
-                          </Show>
-                        </Show>
+                        <span class="fw-pin" title="What a project's Framework setting has to say to use this build">
+                          {sourceBuilds().length === 1 ? "source" : `source:${fw.name}`}
+                        </span>
+                        <button
+                          class="btn btn-ghost btn-small"
+                          title="Choose the source tree a debugger should read framework code from"
+                          onClick={() => locateSource(fw)}
+                        >
+                          {fw.sourceDir ? "Change source" : "Locate source"}
+                        </button>
+                        <button
+                          class="btn btn-ghost btn-small"
+                          title="Forget this registration. The directory itself is left alone."
+                          onClick={() => removeSourceBuild(fw.name)}
+                        >
+                          Remove
+                        </button>
                       </li>
-                    );
-                  }}
-                </For>
-              </ul>
+                    )}
+                  </For>
+                </ul>
+              </Show>
+
+              <div class="fw-local-head">
+                <span class="fw-local-title">Releases</span>
+              </div>
+
+              <Show
+                when={!available.error}
+                fallback={
+                  <div class="empty">
+                    <p class="error">Could not reach GitHub: {String(available.error)}</p>
+                    <button class="btn btn-ghost" onClick={() => refetchAvailable()}>
+                      Retry
+                    </button>
+                  </div>
+                }
+              >
+                <Show when={!available.loading} fallback={<p class="muted">Checking for releases…</p>}>
+                  <Show
+                    when={(available()?.length ?? 0) > 0}
+                    fallback={
+                      <div class="empty">
+                        <p class="muted">No releases published for this platform yet.</p>
+                      </div>
+                    }
+                  >
+                    <ul class="fw-list">
+                      <For each={available()}>
+                        {(fw) => {
+                          const pct = () => progress()[fw.version];
+                          const downloading = () => pct() !== undefined;
+                          const local = () =>
+                            installed()?.find((i) => !i.local && i.version === fw.version);
+                          return (
+                            <li class="fw-card" classList={{ "fw-installed": fw.installed }}>
+                              <span class="fw-meta">
+                                <span class="fw-version">
+                                  koral {fw.version}
+                                  <Show when={fw.draft}>
+                                    <span class="fw-tag fw-tag-draft" title="Unpublished — visible only because you are signed in to GitHub">
+                                      draft
+                                    </span>
+                                  </Show>
+                                  <Show when={fw.prerelease && !fw.draft}>
+                                    <span class="fw-tag">pre-release</span>
+                                  </Show>
+                                </span>
+                                <span class="fw-sub">
+                                  {local()
+                                    ? `installed · ${mb(local()!.sizeBytes)} on disk`
+                                    : `${fw.assetName} · ${mb(fw.assetSize)}`}
+                                </span>
+                              </span>
+
+                              <Show when={downloading()}>
+                                <span class="fw-progress">
+                                  <progress
+                                    class="fw-bar"
+                                    max="100"
+                                    value={pct()! >= 0 ? pct()! : undefined}
+                                  />
+                                  <span class="muted-sm">
+                                    {pct()! >= 0 ? `${pct()}%` : "downloading…"}
+                                  </span>
+                                </span>
+                              </Show>
+
+                              <Show when={!downloading()}>
+                                <Show
+                                  when={fw.installed}
+                                  fallback={
+                                    <button
+                                      class="btn btn-primary"
+                                      onClick={() => installFramework(fw.version)}
+                                    >
+                                      Install
+                                    </button>
+                                  }
+                                >
+                                  <button
+                                    class="btn btn-ghost"
+                                    title={`Delete ${local()?.path ?? fw.version}`}
+                                    onClick={() => uninstallFramework(fw.version)}
+                                  >
+                                    Uninstall
+                                  </button>
+                                </Show>
+                              </Show>
+                            </li>
+                          );
+                        }}
+                      </For>
+                    </ul>
+                  </Show>
+                </Show>
+              </Show>
+            </div>
+
+            <div class="modal-actions">
+              <button type="button" class="btn btn-ghost" onClick={() => setShowFrameworks(false)}>
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      </Show>
+
+      {/* --- Right-click menu --- */}
+      <Show when={contextMenu()}>
+        {(menu) => (
+          <>
+            <div
+              class="menu-backdrop"
+              onClick={() => setContextMenu(null)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setContextMenu(null);
+              }}
+            />
+            <div
+              class="card-menu context-menu"
+              ref={(el) => onMount(() => fitContextMenu(el))}
+              style={{ left: `${menu().x}px`, top: `${menu().y}px` }}
+            >
+              <Show when={menu().project}>
+                {(p) => (
+                  <>
+                    <Show when={p().git}>
+                      <div class="menu-info">
+                        <span class="menu-info-branch">
+                          {p().git!.branch ?? "detached"}
+                          <Show when={p().git!.dirty}>
+                            <span class="git-dot"> ●</span>
+                          </Show>
+                        </span>
+                        <span class="menu-info-remote">
+                          {p().git!.remote ?? "local git repository"}
+                        </span>
+                      </div>
+                    </Show>
+                    <Show when={p().kind !== "Module"}>
+                      <button
+                        type="button"
+                        class="menu-item"
+                        disabled={isRunning(p().path)}
+                        onClick={() => runProject(p().path)}
+                      >
+                        Build &amp; Run
+                      </button>
+                    </Show>
+                    <button
+                      type="button"
+                      class="menu-item"
+                      disabled={isRunning(p().path)}
+                      onClick={() => buildProject(p().path)}
+                    >
+                      Build
+                    </button>
+                    <Show when={defaultIde()}>
+                      <button type="button" class="menu-item" onClick={() => openInIde(p().path)}>
+                        Open in {defaultIde()!.name}
+                      </button>
+                    </Show>
+                    <hr class="menu-divider" />
+                    {/* The only way to make a collection: from something to put in it. */}
+                    <button
+                      type="button"
+                      class="menu-item"
+                      onClick={() => openCreateCollection(p())}
+                    >
+                      New collection…
+                    </button>
+                    <button
+                      type="button"
+                      class="menu-item"
+                      disabled={eligibleCollections(p()).length === 0}
+                      title={
+                        eligibleCollections(p()).length === 0
+                          ? "No collection of yours accepts this kind of project yet"
+                          : undefined
+                      }
+                      onClick={() => openAddToCollection(p())}
+                    >
+                      Add to collection…
+                    </button>
+                    <hr class="menu-divider" />
+                    <button
+                      type="button"
+                      class="menu-item"
+                      onClick={() => openPublishProject(p())}
+                    >
+                      {p().git?.remote && ownRemote(p().git!.remote) ? "Update on Git" : "Save to Git"}
+                    </button>
+                    <button
+                      type="button"
+                      class="menu-item menu-danger"
+                      onClick={() => askRemove(p())}
+                    >
+                      Remove project
+                    </button>
+                  </>
+                )}
+              </Show>
+
+              <Show when={menu().collection}>
+                {(c) => (
+                  <Show
+                    when={c().authored}
+                    fallback={
+                      <button
+                        type="button"
+                        class="menu-item menu-danger"
+                        onClick={() => {
+                          setContextMenu(null);
+                          removeCollection(c().key);
+                        }}
+                      >
+                        Stop following
+                      </button>
+                    }
+                  >
+                    {(a) => (
+                      <>
+                        <button
+                          type="button"
+                          class="menu-item"
+                          onClick={() => {
+                            setContextMenu(null);
+                            openAddUrl(a());
+                          }}
+                        >
+                          Add entry by URL…
+                        </button>
+                        <button
+                          type="button"
+                          class="menu-item"
+                          onClick={() => openPublishCollection(a())}
+                        >
+                          {a().git?.remote ? "Publish updates" : "Publish…"}
+                        </button>
+                        <hr class="menu-divider" />
+                        <button
+                          type="button"
+                          class="menu-item menu-danger"
+                          onClick={() => askRemoveCollection(a())}
+                        >
+                          Remove collection
+                        </button>
+                      </>
+                    )}
+                  </Show>
+                )}
+              </Show>
+            </div>
+          </>
+        )}
+      </Show>
+
+      {/* --- Unsaved settings, when the selection is about to move --- */}
+      <Show when={pendingSelection()}>
+        <div class="modal-scrim">
+          <div class="modal" onClick={(e) => e.stopPropagation()}>
+            <h2 class="modal-title">Save changes to {draft.cfg?.name}?</h2>
+            <p class="field-hint">
+              Its <code>koral.json</code> has edits that haven't been written yet.
+            </p>
+            <div class="modal-actions">
+              <button type="button" class="btn btn-ghost" onClick={() => setPendingSelection(null)}>
+                Keep editing
+              </button>
+              <button
+                type="button"
+                class="btn btn-ghost"
+                onClick={() => {
+                  const next = pendingSelection()!;
+                  setPendingSelection(null);
+                  applySelection(next);
+                }}
+              >
+                Discard
+              </button>
+              <button
+                type="button"
+                class="btn btn-primary"
+                disabled={busy()}
+                onClick={async () => {
+                  if (!(await saveSettings())) return;
+                  const next = pendingSelection()!;
+                  setPendingSelection(null);
+                  applySelection(next);
+                }}
+              >
+                {busy() ? "Saving…" : "Save"}
+              </button>
+            </div>
+          </div>
+        </div>
+      </Show>
+
+      <Show when={showAddLocal()}>
+        <div class="modal-scrim" onClick={() => setAddingLocal(false)}>
+          <form class="modal" onClick={(e) => e.stopPropagation()} onSubmit={submitAddLocal}>
+            <h2 class="modal-title">Add a build from source</h2>
+            <p class="field-hint">
+              Registers a framework you built yourself, so projects can target a version that has
+              never been released. It gets no version number — a source tree changes under you —
+              so projects target it as <code>source</code> and resolve it fresh on every build.
+              Nothing is copied: re-running <code>cmake --install</code> is picked up next build.
+            </p>
+
+            <label class="field">
+              <span class="field-label">Install prefix</span>
+              <span class="field-row">
+                <input
+                  class="input"
+                  value={localPath()}
+                  placeholder="/path/to/koral-install"
+                  onInput={(e) => setLocalPath(e.currentTarget.value)}
+                  onChange={(e) => probeLocalPath(e.currentTarget.value)}
+                />
+                <button type="button" class="btn btn-ghost" onClick={browseLocalFramework}>
+                  Browse…
+                </button>
+              </span>
+            </label>
+            <p class="field-hint">
+              The directory you passed to <code>cmake --install --prefix</code> — it holds{" "}
+              <code>bin/</code>, <code>include/</code> and <code>lib/</code>.
+            </p>
+
+            {/* What the Hub found, so the user can see whether debugging will work before they
+                commit — rather than discovering it at the first crash. */}
+            <Show when={detected()}>
+              {(d) => (
+                <Show
+                  when={d().sourcePath}
+                  fallback={
+                    <p class="field-hint field-bad">
+                      Couldn't find the build this prefix came from, so the source tree is unknown.
+                      Point at it below, or a crash inside the framework won't open any code.
+                    </p>
+                  }
+                >
+                  <p class="field-hint">
+                    Built from <code>{d().sourcePath}</code>
+                    {d().buildType ? ` (${d().buildType})` : ""}
+                    {d().buildType && d().buildType !== "Debug"
+                      ? " — a Release build carries no debug info, so debugging cannot step into it."
+                      : "."}
+                  </p>
+                </Show>
+              )}
             </Show>
-          </Show>
-        </Show>
-        </Show>
-      </main>
+
+            <label class="field">
+              <span class="field-label">Source tree {detected()?.sourcePath ? "(override)" : "(optional)"}</span>
+              <span class="field-row">
+                <input
+                  class="input"
+                  value={localSource()}
+                  placeholder={detected()?.sourcePath || "/path/to/Koral"}
+                  onInput={(e) => setLocalSource(e.currentTarget.value)}
+                />
+                <button type="button" class="btn btn-ghost" onClick={browseLocalSource}>
+                  Browse…
+                </button>
+              </span>
+            </label>
+            <p class="field-hint">
+              What a debugger reads framework code from, so a crash inside the engine lands on the
+              line that failed.
+            </p>
+
+            <Show when={error()}>
+              <p class="error">{error()}</p>
+            </Show>
+
+            <div class="modal-actions">
+              <button type="button" class="btn btn-ghost" onClick={() => setAddingLocal(false)}>
+                Cancel
+              </button>
+              <button type="submit" class="btn btn-primary" disabled={!canAddLocal()}>
+                {busy() ? "Adding…" : "Add"}
+              </button>
+            </div>
+          </form>
+        </div>
+      </Show>
 
       <Show when={showCreate()}>
         <div class="modal-scrim" onClick={() => setCreating(false)}>
@@ -1846,6 +3684,7 @@ export default function App() {
                   [
                     ["Scene", "Realtime app with a window and an Update/Render loop."],
                     ["Job", "Headless single dispatch: Run() once to completion, then exit."],
+                    ["Module", "Reusable engine feature (cameras, physics…) that projects load at runtime."],
                   ] as const
                 }
               >
@@ -1977,8 +3816,8 @@ export default function App() {
             <h2 class="modal-title">Add Collection</h2>
             <p class="field-hint">
               Paste the link your instructor shared — a GitHub repository, or a direct link to its{" "}
-              <code>koral-collection.json</code>. The Hub remembers it and refreshes its projects each
-              time you open.
+              <code>koral-collection.json</code>. It joins the list on the left, and its projects
+              refresh each time you open the Hub.
             </p>
 
             <label class="field">
@@ -2008,183 +3847,116 @@ export default function App() {
         </div>
       </Show>
 
-      <Show when={showCreateCollection()}>
+      {/* New collection, always started from the project that will be its first entry. */}
+      <Show when={showCreateCollection() && collectionSeed()}>
         <div class="modal-scrim" onClick={() => setCreatingCollection(false)}>
-          <form class="modal" onClick={(e) => e.stopPropagation()} onSubmit={submitCreateCollection}>
-            <h2 class="modal-title">New Collection</h2>
-            <p class="field-hint">
-              Creates a git repository that gathers projects as submodules. Add projects to it
-              afterwards, then push it and share its URL for students to browse.
-            </p>
+          <form class="modal modal-tall" onClick={(e) => e.stopPropagation()} onSubmit={submitCreateCollection}>
+            <h2 class="modal-title">New collection from {collectionSeed()!.name}</h2>
 
-            <label class="field">
-              <span class="field-label">Name</span>
-              <input
-                class="input"
-                value={collectionName()}
-                placeholder="Intro to Graphics — Labs"
-                autofocus
-                onInput={(e) => setCollectionName(e.currentTarget.value)}
-              />
-            </label>
+            <div class="modal-scroll">
+              <p class="field-hint">
+                Creates a git repository that gathers projects as submodules, with{" "}
+                <strong>{collectionSeed()!.name}</strong> as its first entry. Publish it afterwards
+                and share the URL for others to browse.
+              </p>
 
-            <label class="field">
-              <span class="field-label">Description</span>
-              <input
-                class="input"
-                value={collectionDescription()}
-                placeholder="Lab collection for CS-4560."
-                onInput={(e) => setCollectionDescription(e.currentTarget.value)}
-              />
-            </label>
+              <span class="field-label">Contents</span>
+              <div class="template-picker">
+                <For
+                  each={
+                    [
+                      ["projects", "Projects", "Runnable scenes and jobs — a course's labs."],
+                      ["modules", "Modules", "Reusable engine features — a module registry."],
+                      ["mixed", "Both", "Labs and the modules they use, side by side."],
+                    ] as const
+                  }
+                >
+                  {([value, label, blurb]) => (
+                    <button
+                      type="button"
+                      class="template-card"
+                      classList={{ "template-active": collectionContents() === value }}
+                      disabled={!contentsAccepts(value, collectionSeed()!.kind)}
+                      title={
+                        contentsAccepts(value, collectionSeed()!.kind)
+                          ? undefined
+                          : `A ${collectionSeed()!.kind} cannot go in a ${label.toLowerCase()} collection`
+                      }
+                      onClick={() => setCollectionContents(value)}
+                    >
+                      <span class="template-name">{label}</span>
+                      <span class="template-blurb">{blurb}</span>
+                    </button>
+                  )}
+                </For>
+              </div>
 
-            <label class="field">
-              <span class="field-label">Location</span>
-              <span class="field-row">
+              <label class="field">
+                <span class="field-label">Name</span>
                 <input
                   class="input"
-                  value={location()}
-                  placeholder="~/Koral"
-                  onInput={(e) => setLocation(e.currentTarget.value)}
+                  value={collectionName()}
+                  placeholder="Intro to Graphics — Labs"
+                  autofocus
+                  onInput={(e) => setCollectionName(e.currentTarget.value)}
                 />
-                <button type="button" class="btn btn-ghost" onClick={browseLocation}>
-                  Browse…
-                </button>
-              </span>
-            </label>
+              </label>
 
-            <Show when={location() && collectionName().trim()}>
-              <p class="field-hint">
-                Creates <code>{joinPath(location(), collectionName().trim())}</code>
-              </p>
-            </Show>
+              <label class="field">
+                <span class="field-label">Description</span>
+                <input
+                  class="input"
+                  value={collectionDescription()}
+                  placeholder="Lab collection for CS-4560."
+                  onInput={(e) => setCollectionDescription(e.currentTarget.value)}
+                />
+              </label>
 
-            <Show when={error()}>
-              <p class="error">{error()}</p>
-            </Show>
+              <label class="field">
+                <span class="field-label">Location</span>
+                <span class="field-row">
+                  <input
+                    class="input"
+                    value={location()}
+                    placeholder="~/Koral"
+                    onInput={(e) => setLocation(e.currentTarget.value)}
+                  />
+                  <button type="button" class="btn btn-ghost" onClick={browseLocation}>
+                    Browse…
+                  </button>
+                </span>
+              </label>
 
-            <div class="modal-actions">
-              <button type="button" class="btn btn-ghost" onClick={() => setCreatingCollection(false)}>
-                Cancel
-              </button>
-              <button type="submit" class="btn btn-primary" disabled={!canCreateCollection()}>
-                {busy() ? "Creating…" : "Create"}
-              </button>
-            </div>
-          </form>
-        </div>
-      </Show>
-
-      <Show when={addProjectTo()}>
-        <div class="modal-scrim" onClick={() => setAddProjectTo(null)}>
-          <form class="modal" onClick={(e) => e.stopPropagation()} onSubmit={submitAddProject}>
-            <h2 class="modal-title">Add project to {addProjectTo()!.title}</h2>
-
-            {/* Pick one of your own projects, or add any repository by URL. */}
-            <div class="segmented">
-              <button
-                type="button"
-                classList={{ active: addMode() === "project" }}
-                onClick={() => setAddMode("project")}
-              >
-                Your projects
-              </button>
-              <button
-                type="button"
-                classList={{ active: addMode() === "url" }}
-                onClick={() => setAddMode("url")}
-              >
-                Git URL
-              </button>
-            </div>
-
-            <Show
-              when={addMode() === "project"}
-              fallback={
-                <>
-                  <p class="field-hint">
-                    Any git repository, added as a submodule. Its folder name comes from the repo.
-                  </p>
-                  <label class="field">
-                    <span class="field-label">Repository URL</span>
-                    <input
-                      class="input"
-                      value={labUrl()}
-                      placeholder="https://github.com/course/lab01-triangle.git"
-                      onInput={(e) => setLabUrl(e.currentTarget.value)}
-                    />
-                  </label>
-                  <label class="field">
-                    <span class="field-label">Display name (optional)</span>
-                    <input
-                      class="input"
-                      value={labName()}
-                      placeholder={labUrl().trim() ? gitRepoName(labUrl()) : "Lab 01 — Triangle"}
-                      onInput={(e) => setLabName(e.currentTarget.value)}
-                    />
-                  </label>
-                </>
-              }
-            >
-              <p class="field-hint">
-                Added as a submodule tracking the project's git repository.
-              </p>
-              <Show
-                when={(projects()?.length ?? 0) > 0}
-                fallback={<p class="field-hint field-bad">You don't have any projects yet.</p>}
-              >
-                <div class="project-picker">
-                  <For each={projects()}>
-                    {(p) => (
-                      <label class="pick-row" classList={{ selected: addProjectPath() === p.path }}>
-                        <input
-                          type="radio"
-                          name="add-project"
-                          checked={addProjectPath() === p.path}
-                          onChange={() => pickProject(p)}
-                        />
-                        <span class="pick-meta">
-                          <span class="pick-name">{p.name}</span>
-                          <span class="pick-sub">{p.git?.remote ?? p.path}</span>
-                        </span>
-                        <Show when={!p.git?.remote}>
-                          <span class="pick-tag">not published</span>
-                        </Show>
-                      </label>
-                    )}
-                  </For>
-                </div>
+              <Show when={location() && collectionName().trim()}>
+                <p class="field-hint">
+                  Creates <code>{joinPath(location(), collectionName().trim())}</code>
+                </p>
               </Show>
 
-              {/* A local-only project has no URL for a submodule, so publish it first. */}
-              <Show when={selectedNeedsPublish()}>
+              {/* A submodule tracks a URL, so a project that has never been pushed is published
+                  first — otherwise there is nothing for the collection to point at. */}
+              <Show when={seedNeedsPublish(collectionSeed())}>
+                <hr class="modal-divider" />
                 <Show
                   when={(accounts()?.length ?? 0) > 0}
                   fallback={
                     <p class="field-hint field-bad">
-                      This project isn't published yet. Sign in to GitHub first (Settings →
-                      Accounts).
+                      {collectionSeed()!.name} isn't published yet, and a collection tracks its
+                      entries by URL. Sign in to GitHub first (Settings → Accounts).
                     </p>
                   }
                 >
                   <p class="field-hint">
-                    This project isn't published yet — it'll be pushed to a new repository first.
+                    {collectionSeed()!.name} isn't published yet — it'll be pushed to a new
+                    repository first, and the collection will track that.
                   </p>
                   <label class="field">
                     <span class="field-label">Account</span>
-                    <select
-                      class="input"
+                    <Select
                       value={addProjectHost()}
-                      onChange={(e) => setAddProjectHost(e.currentTarget.value)}
-                    >
-                      <For each={accounts()}>
-                        {(a) => (
-                          <option value={a.host}>
-                            {a.username}@{a.host}
-                          </option>
-                        )}
-                      </For>
-                    </select>
+                      options={accountOptions()}
+                      onChange={setAddProjectHost}
+                    />
                   </label>
                   <label class="field">
                     <span class="field-label">Repository name</span>
@@ -2204,6 +3976,103 @@ export default function App() {
                   </label>
                 </Show>
               </Show>
+
+              <label class="field">
+                <span class="field-label">Entry description (optional)</span>
+                <input
+                  class="input"
+                  value={labDescription()}
+                  placeholder="Draw your first triangle."
+                  onInput={(e) => setLabDescription(e.currentTarget.value)}
+                />
+              </label>
+            </div>
+
+            <Show when={error()}>
+              <p class="error">{error()}</p>
+            </Show>
+
+            <div class="modal-actions">
+              <button type="button" class="btn btn-ghost" onClick={() => setCreatingCollection(false)}>
+                Cancel
+              </button>
+              <button type="submit" class="btn btn-primary" disabled={!canCreateWithSeed()}>
+                {busy() ? "Creating…" : "Create"}
+              </button>
+            </div>
+          </form>
+        </div>
+      </Show>
+
+      {/* Filing a project into a collection that already exists. */}
+      <Show when={addToCollection()}>
+        <div class="modal-scrim" onClick={() => setAddToCollection(null)}>
+          <form class="modal" onClick={(e) => e.stopPropagation()} onSubmit={submitAddToCollection}>
+            <h2 class="modal-title">Add {addToCollection()!.name} to a collection</h2>
+            <p class="field-hint">
+              Added as a submodule tracking the project's git repository.
+            </p>
+
+            <div class="project-picker">
+              <For each={eligibleCollections(addToCollection())}>
+                {(c) => (
+                  <label class="pick-row" classList={{ selected: targetCollection() === c.path }}>
+                    <input
+                      type="radio"
+                      name="target-collection"
+                      checked={targetCollection() === c.path}
+                      onChange={() => setTargetCollection(c.path)}
+                    />
+                    <span class="pick-meta">
+                      <span class="pick-name">{c.title}</span>
+                      <span class="pick-sub">
+                        {c.labCount} {entryWord(c.contents)}
+                        {c.labCount === 1 ? "" : "s"} · {c.path}
+                      </span>
+                    </span>
+                  </label>
+                )}
+              </For>
+            </div>
+
+            <Show when={seedNeedsPublish(addToCollection())}>
+              <Show
+                when={(accounts()?.length ?? 0) > 0}
+                fallback={
+                  <p class="field-hint field-bad">
+                    This project isn't published yet, and a collection tracks its entries by URL.
+                    Sign in to GitHub first (Settings → Accounts).
+                  </p>
+                }
+              >
+                <p class="field-hint">
+                  This project isn't published yet — it'll be pushed to a new repository first.
+                </p>
+                <label class="field">
+                  <span class="field-label">Account</span>
+                  <Select
+                    value={addProjectHost()}
+                    options={accountOptions()}
+                    onChange={setAddProjectHost}
+                  />
+                </label>
+                <label class="field">
+                  <span class="field-label">Repository name</span>
+                  <input
+                    class="input"
+                    value={addProjectRepoName()}
+                    onInput={(e) => setAddProjectRepoName(e.currentTarget.value)}
+                  />
+                </label>
+                <label class="toggle">
+                  <input
+                    type="checkbox"
+                    checked={addProjectPrivate()}
+                    onChange={(e) => setAddProjectPrivate(e.currentTarget.checked)}
+                  />
+                  <span>Private repository</span>
+                </label>
+              </Show>
             </Show>
 
             <label class="field">
@@ -2221,11 +4090,69 @@ export default function App() {
             </Show>
 
             <div class="modal-actions">
-              <button type="button" class="btn btn-ghost" onClick={() => setAddProjectTo(null)}>
+              <button type="button" class="btn btn-ghost" onClick={() => setAddToCollection(null)}>
                 Cancel
               </button>
-              <button type="submit" class="btn btn-primary" disabled={!canAddProject()}>
-                {busy() ? "Adding…" : "Add project"}
+              <button type="submit" class="btn btn-primary" disabled={!canAddToCollection()}>
+                {busy() ? "Adding…" : "Add"}
+              </button>
+            </div>
+          </form>
+        </div>
+      </Show>
+
+      {/* Adding a repository that isn't one of your projects. */}
+      <Show when={addUrlTo()}>
+        <div class="modal-scrim" onClick={() => setAddUrlTo(null)}>
+          <form class="modal" onClick={(e) => e.stopPropagation()} onSubmit={submitAddUrl}>
+            <h2 class="modal-title">
+              Add {entryWord(addUrlTo()!.contents)} to {addUrlTo()!.title}
+            </h2>
+            <p class="field-hint">
+              Any git repository, added as a submodule. Its folder name comes from the repo.
+            </p>
+
+            <label class="field">
+              <span class="field-label">Repository URL</span>
+              <input
+                class="input"
+                value={labUrl()}
+                placeholder="https://github.com/course/lab01-triangle.git"
+                autofocus
+                onInput={(e) => setLabUrl(e.currentTarget.value)}
+              />
+            </label>
+
+            <label class="field">
+              <span class="field-label">Display name (optional)</span>
+              <input
+                class="input"
+                value={labName()}
+                placeholder={labUrl().trim() ? gitRepoName(labUrl()) : "Lab 01 — Triangle"}
+                onInput={(e) => setLabName(e.currentTarget.value)}
+              />
+            </label>
+
+            <label class="field">
+              <span class="field-label">Description (optional)</span>
+              <input
+                class="input"
+                value={labDescription()}
+                placeholder="Draw your first triangle."
+                onInput={(e) => setLabDescription(e.currentTarget.value)}
+              />
+            </label>
+
+            <Show when={error()}>
+              <p class="error">{error()}</p>
+            </Show>
+
+            <div class="modal-actions">
+              <button type="button" class="btn btn-ghost" onClick={() => setAddUrlTo(null)}>
+                Cancel
+              </button>
+              <button type="submit" class="btn btn-primary" disabled={!labUrl().trim() || busy()}>
+                {busy() ? "Adding…" : "Add"}
               </button>
             </div>
           </form>
@@ -2315,55 +4242,54 @@ export default function App() {
                   </p>
                 }
               >
-                <select
-                  class="input"
+                {/* Empty = follow whatever is installed, rather than pinning a choice. */}
+                <Select
                   value={prefs.s!.defaultIde}
-                  onChange={(e) => setPrefs("s", "defaultIde", e.currentTarget.value)}
-                >
-                  {/* Empty = follow whatever is installed, rather than pinning a choice. */}
-                  <option value="">Auto ({defaultIde()?.name ?? "none"})</option>
-                  <For each={ides()}>
-                    {(ide) => <option value={ide.id}>{ide.name}</option>}
-                  </For>
-                </select>
+                  options={[
+                    { value: "", label: `Auto (${defaultIde()?.name ?? "none"})` },
+                    ...(ides() ?? []).map((ide) => ({ value: ide.id, label: ide.name })),
+                  ]}
+                  onChange={(v) => setPrefs("s", "defaultIde", v)}
+                />
               </Show>
             </label>
 
             <label class="field">
-              <span class="field-label">Framework version for new projects</span>
-              <select
-                class="input"
+              <span class="field-label">Framework for new projects</span>
+              <Select
                 value={prefs.s!.defaultFrameworkVersion}
-                onChange={(e) => setPrefs("s", "defaultFrameworkVersion", e.currentTarget.value)}
-              >
-                <option value="">Auto (newest installed — {defaults()?.frameworkVersion})</option>
-                <For each={frameworkChoices()}>
-                  {(v) => (
-                    <option value={v.version}>
-                      koral {v.version}
-                      {v.installed ? "" : " (not installed — will download)"}
-                    </option>
-                  )}
-                </For>
-              </select>
+                options={[
+                  {
+                    value: "",
+                    // Auto is this machine's source build, else the newest release it can find —
+                    // which on a fresh machine means one published but not yet installed. Say what
+                    // it actually resolved to, or that it found nothing at all.
+                    label: defaults()?.frameworkVersion
+                      ? `Auto (${frameworkLabel(defaults()!.frameworkVersion)})`
+                      : "Auto (nothing installed, and no releases found)",
+                  },
+                  ...frameworkChoices().map((v) => ({ value: v.value, label: v.label })),
+                ]}
+                onChange={(v) => setPrefs("s", "defaultFrameworkVersion", v)}
+              />
             </label>
             <p class="field-hint">
-              Existing projects are unaffected — each one records its own version in{" "}
+              Existing projects are unaffected — each one records its own framework in{" "}
               <code>koral.json</code>.
             </p>
 
             <Show when={isLinux}>
               <label class="field">
                 <span class="field-label">Display server (Linux)</span>
-                <select
-                  class="input"
+                <Select
                   value={prefs.s!.displayBackend}
-                  onChange={(e) => setPrefs("s", "displayBackend", e.currentTarget.value)}
-                >
-                  <option value="">Auto (session default)</option>
-                  <option value="wayland">Wayland</option>
-                  <option value="x11">X11</option>
-                </select>
+                  options={[
+                    { value: "", label: "Auto (session default)" },
+                    { value: "wayland", label: "Wayland" },
+                    { value: "x11", label: "X11" },
+                  ]}
+                  onChange={(v) => setPrefs("s", "displayBackend", v)}
+                />
               </label>
               <p class="field-hint">
                 Which windowing backend a launched app uses — applied to the app you run, not the Hub.
@@ -2478,7 +4404,7 @@ export default function App() {
                     {publishTarget()!.kind === "collection" ? (
                       <>
                         {publishResult()!.created ? "Published." : "Pushed your latest changes."}{" "}
-                        Students add this collection under <strong>Browse</strong> with:
+                        Others add this collection with:
                       </>
                     ) : publishResult()!.created ? (
                       "Saved to your git at:"
@@ -2539,19 +4465,11 @@ export default function App() {
                 >
                   <label class="field">
                     <span class="field-label">Account</span>
-                    <select
-                      class="input"
+                    <Select
                       value={publishHost()}
-                      onChange={(e) => setPublishHost(e.currentTarget.value)}
-                    >
-                      <For each={accounts()}>
-                        {(a) => (
-                          <option value={a.host}>
-                            {a.username}@{a.host}
-                          </option>
-                        )}
-                      </For>
-                    </select>
+                      options={accountOptions()}
+                      onChange={setPublishHost}
+                    />
                   </label>
 
                   <label class="field">
@@ -2639,273 +4557,57 @@ export default function App() {
         </div>
       </Show>
 
-      <Show when={settingsPath() && draft.cfg}>
-        <div class="modal-scrim" onClick={closeSettings}>
-          <form class="modal" onClick={(e) => e.stopPropagation()} onSubmit={saveSettings}>
-            <h2 class="modal-title">{draft.cfg!.name} — Settings</h2>
-            <p class="field-hint">
-              Saved to <code>koral.json</code> and applied on the next build — in the Hub, VS Code
-              and CLion alike.
-            </p>
-
-            <label class="field">
-              <span class="field-label">Framework version</span>
-              <select
-                class="input"
-                value={draft.cfg!.frameworkVersion}
-                onChange={(e) => setDraft("cfg", "frameworkVersion", e.currentTarget.value)}
-              >
-                <For each={projectFwChoices()}>
-                  {(v) => (
-                    <option value={v.version}>
-                      koral {v.version}
-                      {v.installed ? "" : " (not installed — will download)"}
-                    </option>
-                  )}
-                </For>
-              </select>
-            </label>
-
-            <div class="field-grid">
-              {/* A Job runs headless — it has no window, so width/height/flags do not apply and
-                  the Hub does not pass them. Only the graphics API is still meaningful. */}
-              <Show when={draft.cfg!.kind === "Scene"}>
-                <label class="field">
-                  <span class="field-label">Width</span>
-                  <input
-                    class="input"
-                    type="number"
-                    min="1"
-                    value={draft.cfg!.rendering.window.width}
-                    onInput={(e) =>
-                      setDraft("cfg", "rendering", "window", "width", +e.currentTarget.value)
-                    }
-                  />
-                </label>
-                <label class="field">
-                  <span class="field-label">Height</span>
-                  <input
-                    class="input"
-                    type="number"
-                    min="1"
-                    value={draft.cfg!.rendering.window.height}
-                    onInput={(e) =>
-                      setDraft("cfg", "rendering", "window", "height", +e.currentTarget.value)
-                    }
-                  />
-                </label>
-              </Show>
-              <label class="field">
-                <span class="field-label">Graphics API</span>
-                <select
-                  class="input"
-                  value={draft.cfg!.rendering.api}
-                  onChange={(e) =>
-                    setDraft("cfg", "rendering", "api", e.currentTarget.value as "Vulkan" | "OpenGL")
-                  }
-                >
-                  <option value="Vulkan">Vulkan</option>
-                  <option value="OpenGL">OpenGL</option>
-                </select>
-              </label>
-              {/* A Scene's windowing system on Linux. Ignored on Windows/macOS, so only shown there;
-                  a Job has no window. `auto` lets the runtime (GLFW) choose. Note OpenGL always runs
-                  on X11/XWayland — a Wayland choice with OpenGL is ignored by the runtime. */}
-              <Show when={isLinux && draft.cfg!.kind === "Scene"}>
-                <label class="field">
-                  <span class="field-label">Windowing (Linux)</span>
-                  <select
-                    class="input"
-                    value={draft.cfg!.rendering.platform ?? "auto"}
-                    onChange={(e) =>
-                      setDraft(
-                        "cfg",
-                        "rendering",
-                        "platform",
-                        e.currentTarget.value as "auto" | "x11" | "wayland",
-                      )
-                    }
-                  >
-                    <option value="auto">Auto (GLFW default)</option>
-                    <option value="wayland">Wayland</option>
-                    <option value="x11">X11</option>
-                  </select>
-                </label>
-              </Show>
-            </div>
-
-            <Show
-              when={draft.cfg!.kind === "Scene"}
-              fallback={
-                <p class="field-hint">
-                  This is a <strong>Job</strong> — it runs headless on a device-only context, so
-                  there are no window settings.
-                </p>
-              }
-            >
-              <span class="field-label">Window</span>
-              <div class="toggle-row">
-                <For
-                  each={
-                    [
-                      ["resizable", "Resizable"],
-                      ["vsync", "VSync"],
-                      ["fullscreen", "Fullscreen"],
-                      ["borderless", "Borderless"],
-                      ["transparent", "Transparent"],
-                    ] as const
-                  }
-                >
-                  {([key, label]) => (
-                    <label class="toggle">
-                      <input
-                        type="checkbox"
-                        checked={draft.cfg!.rendering.window[key]}
-                        onChange={(e) =>
-                          setDraft("cfg", "rendering", "window", key, e.currentTarget.checked)
-                        }
-                      />
-                      <span>{label}</span>
-                    </label>
-                  )}
-                </For>
-              </div>
-            </Show>
-
-            <For
-              each={
-                [
-                  ["assetDirectories", "Asset folders", "assets"],
-                  ["shaderDirectories", "Shader folders", "shaders"],
-                ] as const
-              }
-            >
-              {([key, label, placeholder]) => (
-                <div class="field">
-                  <span class="field-label">{label}</span>
-                  <For each={draft.cfg!.paths[key]}>
-                    {(dir, i) => (
-                      <div class="dir-row">
-                        <input
-                          class="input"
-                          value={dir}
-                          placeholder={placeholder}
-                          onInput={(e) =>
-                            setDraft("cfg", "paths", key, i(), e.currentTarget.value)
-                          }
-                        />
-                        {/* Order is the search order, so moving an entry up is a real setting. */}
-                        <button
-                          type="button"
-                          class="btn btn-ghost btn-icon btn-move"
-                          title="Search this one earlier"
-                          disabled={i() === 0}
-                          onClick={() =>
-                            setDraft("cfg", "paths", key, (dirs) => {
-                              const next = [...dirs];
-                              [next[i() - 1], next[i()]] = [next[i()], next[i() - 1]];
-                              return next;
-                            })
-                          }
-                        >
-                          ↑
-                        </button>
-                        <button
-                          type="button"
-                          class="btn btn-ghost btn-icon"
-                          title="Remove"
-                          onClick={() =>
-                            setDraft("cfg", "paths", key, (dirs) =>
-                              dirs.filter((_, n) => n !== i()),
-                            )
-                          }
-                        >
-                          ✕
-                        </button>
-                      </div>
-                    )}
-                  </For>
+      <Show when={shownConsole()}>
+        {(c) => (
+          <section class="console">
+            <div class="console-head">
+              <div class="console-tabs">
+                <Show when={c().build}>
                   <button
                     type="button"
-                    class="btn btn-ghost btn-small"
-                    onClick={() => setDraft("cfg", "paths", key, (dirs) => [...dirs, ""])}
+                    class="console-tab"
+                    classList={{ active: c().tab === "build" }}
+                    onClick={() => setConsoles(c().path, "tab", "build")}
                   >
-                    + Add folder
+                    {c().running ? "Building…" : "Build"}
                   </button>
-                </div>
-              )}
-            </For>
-            <p class="field-hint">
-              Relative to the project root, searched in order. The runtime resolves relative texture,
-              model and shader paths against these — a scene can just ask for{" "}
-              <code>textures/wood.png</code>. The engine's own content is searched last, so a project
-              can shadow a built-in asset by name without losing the rest.
-            </p>
-
-            <Show when={error()}>
-              <p class="error">{error()}</p>
-            </Show>
-
-            <div class="modal-actions">
-              <button type="button" class="btn btn-ghost" onClick={closeSettings}>
-                Cancel
-              </button>
-              <button type="submit" class="btn btn-primary" disabled={busy()}>
-                {busy() ? "Saving…" : "Save"}
+                </Show>
+                <Show when={c().run}>
+                  <button
+                    type="button"
+                    class="console-tab"
+                    classList={{ active: c().tab === "output" }}
+                    onClick={() => setConsoles(c().path, "tab", "output")}
+                  >
+                    Output
+                  </button>
+                </Show>
+              </div>
+              <button
+                class="btn btn-icon"
+                title="Close this tab"
+                onClick={() => {
+                  // Clear the active tab and hand focus to the other. If that one is empty too,
+                  // this project's console has nothing left to show and the panel disappears — so
+                  // closing the last tab closes it rather than leaving an empty shell.
+                  const path = c().path;
+                  if (c().tab === "build") {
+                    setConsoles(path, "build", "");
+                    setConsoles(path, "tab", "output");
+                  } else {
+                    setConsoles(path, "run", "");
+                    setConsoles(path, "tab", "build");
+                  }
+                }}
+              >
+                ✕
               </button>
             </div>
-          </form>
-        </div>
-      </Show>
-
-      <Show when={buildLog() || runLog()}>
-        <section class="console">
-          <div class="console-head">
-            <div class="console-tabs">
-              <Show when={buildLog()}>
-                <button
-                  type="button"
-                  class="console-tab"
-                  classList={{ active: consoleTab() === "build" }}
-                  onClick={() => setConsoleTab("build")}
-                >
-                  {running() ? "Building…" : "Build"}
-                </button>
-              </Show>
-              <Show when={runLog()}>
-                <button
-                  type="button"
-                  class="console-tab"
-                  classList={{ active: consoleTab() === "output" }}
-                  onClick={() => setConsoleTab("output")}
-                >
-                  Output
-                </button>
-              </Show>
-            </div>
-            <button
-              class="btn btn-icon"
-              title="Close this tab"
-              onClick={() => {
-                // Clear the active tab and hand focus to the other. If that one is empty too, the
-                // whole console's `Show` (buildLog || runLog) goes false and the panel disappears —
-                // so closing the last tab closes the console instead of leaving an empty shell.
-                if (consoleTab() === "build") {
-                  setBuildLog("");
-                  setConsoleTab("output");
-                } else {
-                  setRunLog("");
-                  setConsoleTab("build");
-                }
-              }}
-            >
-              ✕
-            </button>
-          </div>
-          <pre class="console-body">
-            <AnsiLog text={consoleTab() === "build" ? buildLog() : runLog()} />
-          </pre>
-        </section>
+            <pre class="console-body">
+              <AnsiLog text={c().tab === "build" ? c().build : c().run} />
+            </pre>
+          </section>
+        )}
       </Show>
     </div>
   );

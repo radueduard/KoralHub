@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::git;
-use crate::model::ProjectConfig;
+use crate::model::{Kind, ProjectConfig};
 use crate::paths;
 use crate::project;
 
@@ -42,8 +42,49 @@ pub struct CollectionManifest {
     pub title: String,
     #[serde(default)]
     pub description: String,
+    /// What the collection holds. Chosen at creation and enforced by [`add_lab`], so a course's
+    /// lab list stays a lab list and a module registry stays a module registry. Manifests written
+    /// before this existed default to projects — which is what they all were.
+    #[serde(default)]
+    pub contents: Contents,
     #[serde(default)]
     pub labs: Vec<Lab>,
+}
+
+/// What kind of entries a collection accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Contents {
+    /// Runnable projects only — scenes and jobs. The default, and what every older manifest is.
+    #[default]
+    Projects,
+    /// Modules only: a registry of reusable engine features.
+    Modules,
+    /// Anything goes — a course that ships its labs and the modules they use side by side.
+    Mixed,
+}
+
+impl Contents {
+    /// Whether an entry of this kind belongs in the collection. `None` — a repo whose kind cannot
+    /// be read (no koral.json, or one from before `kind` existed) — is allowed everywhere, since
+    /// refusing it would lock the very projects the feature predates out of their own collections.
+    pub fn accepts(self, kind: Option<Kind>) -> bool {
+        match (self, kind) {
+            (_, None) => true,
+            (Contents::Mixed, _) => true,
+            (Contents::Projects, Some(k)) => k != Kind::Module,
+            (Contents::Modules, Some(k)) => k == Kind::Module,
+        }
+    }
+
+    /// Named in errors and the UI: what this collection says it holds.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Contents::Projects => "projects",
+            Contents::Modules => "modules",
+            Contents::Mixed => "projects and modules",
+        }
+    }
 }
 
 /// One entry in a collection: a downloadable lab, hosted in its own git repository.
@@ -55,6 +96,11 @@ pub struct Lab {
     pub description: String,
     /// HTTPS git URL of the lab's own repository, cloned when the lab is downloaded.
     pub url: String,
+    /// What the entry is (Scene/Job/Module), read from its own koral.json when it was added.
+    /// Absent for entries added before this existed, or whose config could not be read — the UI
+    /// shows those unbadged rather than guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<Kind>,
 }
 
 // --- Subscribed-collections index (per machine, URLs only) ------------------------------
@@ -219,7 +265,7 @@ fn labs_from_gitmodules(text: &str) -> Vec<Lab> {
                 .or_else(|| section.clone())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| git::repo_name_from_url(&u));
-            labs.push(Lab { name, description: String::new(), url: u });
+            labs.push(Lab { name, description: String::new(), url: u, kind: None });
         } else {
             *path = None;
         }
@@ -277,6 +323,7 @@ pub fn fetch(url: &str) -> Result<CollectionManifest, String> {
                         schema_version: SCHEMA_VERSION,
                         title: git::repo_name_from_url(url),
                         description: String::new(),
+                        contents: Contents::default(),
                         labs,
                     });
                 }
@@ -367,16 +414,28 @@ fn write_readme(root: &Path, manifest: &CollectionManifest) -> Result<(), String
         md.push_str(manifest.description.trim());
         md.push_str("\n\n");
     }
-    md.push_str(
-        "A [Koral](https://github.com/radueduard/Koral) lab collection. In Koral Hub, open \
-         **Collections \u{2192} Browse**, add this repository's URL, and download any lab.\n\n",
-    );
-    md.push_str("## Labs\n\n");
+    md.push_str(&format!(
+        "A [Koral](https://github.com/radueduard/Koral) collection of {}. In Koral Hub, open \
+         **Collections \u{2192} Browse**, add this repository's URL, and download any entry.\n\n",
+        manifest.contents.describe(),
+    ));
+    // The heading follows the contents so a module registry doesn't call its modules "labs".
+    md.push_str(match manifest.contents {
+        Contents::Projects => "## Labs\n\n",
+        Contents::Modules => "## Modules\n\n",
+        Contents::Mixed => "## Contents\n\n",
+    });
     if manifest.labs.is_empty() {
-        md.push_str("_No labs yet._\n");
+        md.push_str("_Nothing here yet._\n");
     } else {
         for lab in &manifest.labs {
-            md.push_str(&format!("- **{}** — <{}>", lab.name, lab.url));
+            // In a mixed collection the marker is what tells the two kinds apart at a glance;
+            // in a modules-only one every row would say it, so it says nothing.
+            let marker = match (manifest.contents, lab.kind) {
+                (Contents::Mixed, Some(Kind::Module)) => " *(module)*",
+                _ => "",
+            };
+            md.push_str(&format!("- **{}**{marker} — <{}>", lab.name, lab.url));
             if !lab.description.trim().is_empty() {
                 md.push_str(&format!("  \n  {}", lab.description.trim()));
             }
@@ -392,7 +451,12 @@ fn write_readme(root: &Path, manifest: &CollectionManifest) -> Result<(), String
 /// afterwards as submodules (see [`add_lab`]). Fails if the folder already exists, so it never
 /// clobbers local work. Unlike a project, git is *required*: a collection aggregates other repos as
 /// submodules, so it must be a repo itself.
-pub fn create(location: &Path, name: &str, description: &str) -> Result<PathBuf, String> {
+pub fn create(
+    location: &Path,
+    name: &str,
+    description: &str,
+    contents: Contents,
+) -> Result<PathBuf, String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("collection name cannot be empty".into());
@@ -410,6 +474,7 @@ pub fn create(location: &Path, name: &str, description: &str) -> Result<PathBuf,
         schema_version: SCHEMA_VERSION,
         title: name.to_string(),
         description: description.trim().to_string(),
+        contents,
         labs: Vec::new(),
     };
     write_manifest(&root, &manifest)?;
@@ -447,6 +512,25 @@ pub fn add_lab(
 
     git::submodule_add(root, url, &sub_path)?;
 
+    // Now that the submodule's working tree exists, its own koral.json says what it is — which is
+    // both the badge the manifest records and the thing the collection's contents rule checks.
+    // Unreadable (not a Koral repo, or a config from before `kind` existed) stays None, which every
+    // contents rule accepts; see Contents::accepts.
+    let kind = project::load(&root.join(&sub_path)).ok().map(|cfg| cfg.kind);
+    if !manifest.contents.accepts(kind) {
+        // The clone happened, so undo it — a rejected add must leave the collection untouched,
+        // exactly as a failed clone does.
+        let _ = git::submodule_remove(root, &sub_path);
+        let what = match kind {
+            Some(Kind::Module) => "a module",
+            _ => "a project",
+        };
+        return Err(format!(
+            "'{sub_path}' is {what}, but this collection holds {} only",
+            manifest.contents.describe()
+        ));
+    }
+
     let display = name
         .map(str::trim)
         .filter(|n| !n.is_empty())
@@ -456,6 +540,7 @@ pub fn add_lab(
         name: display,
         description: description.trim().to_string(),
         url: url.to_string(),
+        kind,
     });
     write_manifest(root, &manifest)?;
     write_readme(root, &manifest)?;
@@ -666,7 +751,7 @@ mod tests {
         std::fs::write(lab.join("koral.json"), "{}").unwrap();
         git::init(&lab).unwrap();
 
-        let collection = create(&base, "Graphics Labs", "").unwrap();
+        let collection = create(&base, "Graphics Labs", "", Contents::default()).unwrap();
         let lab_url = lab.to_string_lossy().into_owned();
         add_lab(&collection, &lab_url, Some("Lab 01 — Triangle"), "First triangle").unwrap();
 
@@ -708,7 +793,7 @@ mod tests {
             urls.push(lab.to_string_lossy().into_owned());
         }
 
-        let collection = create(&base, "Labs", "").unwrap();
+        let collection = create(&base, "Labs", "", Contents::default()).unwrap();
         add_lab(&collection, &urls[0], None, "").unwrap();
         add_lab(&collection, &urls[1], None, "").unwrap();
 
@@ -732,6 +817,75 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// The contents rule, in every direction that matters: what each collection type accepts, and
+    /// that an unknown kind (a pre-`kind` repo) is accepted everywhere rather than locked out.
+    #[test]
+    fn contents_accepts_the_right_kinds() {
+        use Contents::*;
+        assert!(Projects.accepts(Some(Kind::Scene)));
+        assert!(Projects.accepts(Some(Kind::Job)));
+        assert!(!Projects.accepts(Some(Kind::Module)));
+        assert!(!Modules.accepts(Some(Kind::Scene)));
+        assert!(Modules.accepts(Some(Kind::Module)));
+        assert!(Mixed.accepts(Some(Kind::Scene)));
+        assert!(Mixed.accepts(Some(Kind::Module)));
+        for contents in [Projects, Modules, Mixed] {
+            assert!(contents.accepts(None), "unknown kinds must be allowed in {contents:?}");
+        }
+    }
+
+    /// A manifest without `contents` — every manifest written before it existed — reads as a
+    /// projects collection, which is what they all were.
+    #[test]
+    fn manifests_without_contents_default_to_projects() {
+        let m: CollectionManifest =
+            serde_json::from_str(r#"{ "title": "Old", "labs": [] }"#).unwrap();
+        assert_eq!(m.contents, Contents::Projects);
+    }
+
+    /// End-to-end of the enforcement: a modules-only collection takes a module (stamping its kind
+    /// in the manifest) and refuses a scene — leaving no half-added submodule behind.
+    #[test]
+    fn a_modules_collection_takes_modules_and_refuses_projects() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("koral-contents-test-{n}"));
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Two local repos with real configs: one module, one scene.
+        let write_repo = |name: &str, kind: &str| {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("koral.json"),
+                format!(
+                    r#"{{ "schemaVersion":1, "name":"{name}", "color":[1,0,0],
+                         "frameworkVersion":"0.0.9", "kind":"{kind}" }}"#
+                ),
+            )
+            .unwrap();
+            git::init(&dir).unwrap();
+            dir.to_string_lossy().into_owned()
+        };
+        let module_url = write_repo("cameras", "Module");
+        let scene_url = write_repo("game", "Scene");
+
+        let registry = create(&base, "Modules", "", Contents::Modules).unwrap();
+
+        add_lab(&registry, &module_url, None, "").unwrap();
+        let manifest = load_manifest(&registry).unwrap();
+        assert_eq!(manifest.labs.len(), 1);
+        assert_eq!(manifest.labs[0].kind, Some(Kind::Module), "the kind is stamped on add");
+
+        let err = add_lab(&registry, &scene_url, None, "").unwrap_err();
+        assert!(err.contains("modules"), "{err}");
+        // The rejected add rolled its submodule back: nothing on disk, nothing in the manifest.
+        assert!(!registry.join("game").exists(), "rejected submodule must be rolled back");
+        assert_eq!(load_manifest(&registry).unwrap().labs.len(), 1);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     #[test]
     fn create_scaffolds_a_committed_collection_repo_with_a_manifest() {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -739,7 +893,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("koral-collection-test-{n}"));
         std::fs::create_dir_all(&base).unwrap();
 
-        let root = create(&base, "Graphics Labs", "Labs for CS-4560.").unwrap();
+        let root = create(&base, "Graphics Labs", "Labs for CS-4560.", Contents::default()).unwrap();
         assert!(root.join(".git").is_dir(), "a collection must be a git repo");
         assert!(root.join("README.md").is_file());
 

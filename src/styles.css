@@ -1,61 +1,120 @@
-/* Palette drawn from the Koral logo: coral (#FD8856 / #C05629) on deep maroon (#630101).
-   Backgrounds stay near-neutral gray — very dark or very light — nudged a hair warm so the
-   coral accent sits in the same family rather than clashing with a cold blue-gray. */
+/* Design tokens.
+ *
+ * The shape language follows Samsung's One UI: large corner radii, filled surfaces that separate
+ * by *fill* rather than by outline, pill-shaped controls, and generous padding. Backgrounds are
+ * near-neutral (a hair cool) so they stay quiet and let the one saturated thing on screen — the
+ * accent — carry the emphasis.
+ *
+ * The accent stays Koral's coral (#FD8856 / #C05629, drawn from the logo): One UI itself themes
+ * its accent per wallpaper rather than mandating a hue, so keeping the brand colour is faithful to
+ * the language and keeps the app looking like itself.
+ */
 
 :root,
 :root[data-theme="dark"] {
   color-scheme: dark;
 
-  --bg: #161513;
-  --bg-elevated: #1e1c19;
-  --bg-card: #1e1c19;
-  --bg-card-hover: #272420;
-  --border: #322e29;
-  --border-strong: #454039;
-  --text: #f0ede9;
-  --text-dim: #a49f98;
-  --text-faint: #726c64;
+  /* Near-black page with progressively lighter surfaces stacked on top. No outlines: in dark, a
+     surface is legible because it is lighter than what is under it. */
+  --bg: #0b0b0d;
+  --bg-elevated: #141417;
+  --bg-card: #1a1a1e;
+  --bg-card-hover: #24242a;
+  /* Inputs and grouped lists sit *into* the card rather than on top of it. */
+  --bg-input: #24242a;
+  --bg-sunken: #100f12;
 
-  /* Neutral overlay for hover washes that must not assume a background lightness. */
-  --overlay: rgba(255, 255, 255, 0.06);
-  --scrim: rgba(0, 0, 0, 0.55);
+  --border: #2b2b33;
+  --border-strong: #3c3c46;
+  /* Cards carry no visible edge in dark — see the note above. */
+  --card-border: #1a1a1e;
+
+  --text: #f4f4f6;
+  --text-dim: #a9a9b3;
+  --text-faint: #76767f;
+
+  --overlay: rgba(255, 255, 255, 0.07);
+  --scrim: rgba(0, 0, 0, 0.62);
+
+  /* The track of an unchecked switch. */
+  --switch-off: #3c3c46;
+
+  /* Selected text. Left alone this is the desktop's own highlight colour, which is the one thing
+     on screen still wearing the system theme instead of ours. */
+  --selection: rgba(228, 106, 53, 0.38);
 
   /* The build console keeps a terminal feel: darkest surface in either theme. */
-  --console-bg: #100f0d;
-  --console-text: #d3cfc9;
+  --console-bg: #050506;
+  --console-text: #d6d6dc;
 
-  --shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+  --shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+  --shadow-sm: 0 2px 10px rgba(0, 0, 0, 0.3);
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
 
-  --bg: #f4f2ef;
+  /* One UI's light mode is the inverse arrangement: a soft grey page with white cards floating on
+     it, so the card is the *lighter* surface here. */
+  --bg: #f2f3f7;
   --bg-elevated: #ffffff;
   --bg-card: #ffffff;
-  --bg-card-hover: #ece9e4;
-  --border: #e2ddd6;
-  --border-strong: #ccc6bd;
-  --text: #201e1b;
-  --text-dim: #5e5a53;
-  --text-faint: #918b82;
+  --bg-card-hover: #eceef4;
+  /* Deep enough to read both *on* a white card (inputs, grouped lists) and *on* the grey page
+     (the badge chips), which are only 5% apart in this theme. */
+  --bg-input: #e8ebf2;
+  --bg-sunken: #e0e4ee;
 
-  --overlay: rgba(60, 40, 25, 0.06);
-  --scrim: rgba(40, 30, 22, 0.35);
+  --border: #e4e6ec;
+  --border-strong: #ccd0da;
+  /* A hairline keeps a white card off a near-white page; dark needs none. */
+  --card-border: #e8eaf0;
 
-  --console-bg: #201e1b;
-  --console-text: #d3cfc9;
+  --text: #14151a;
+  --text-dim: #5a5c67;
+  --text-faint: #8b8e9a;
 
-  --shadow: 0 18px 40px rgba(60, 40, 25, 0.18);
+  --overlay: rgba(20, 25, 40, 0.05);
+  --scrim: rgba(18, 20, 28, 0.4);
+
+  --switch-off: #c8ccd6;
+
+  /* Lighter than the dark theme's: this sits behind near-black text, which needs the contrast. */
+  --selection: rgba(228, 106, 53, 0.26);
+
+  --console-bg: #17181d;
+  --console-text: #d6d6dc;
+
+  --chevron: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%235a5c67' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+
+  --shadow: 0 22px 56px rgba(28, 34, 58, 0.16);
+  --shadow-sm: 0 2px 8px rgba(28, 34, 58, 0.07);
 }
 
-/* Coral accent — shared across both themes so the brand reads the same either way. */
 :root {
+  /* Coral accent — shared across both themes so the brand reads the same either way. */
   --accent: #e46a35;
   --accent-hover: #f27d46;
+  /* A wash of the accent, for the selected row and other tinted fills. */
+  --accent-soft: rgba(228, 106, 53, 0.14);
+  --accent-soft-hover: rgba(228, 106, 53, 0.2);
   --play: #24a324;
   /* Semantic red for errors/destructive text — legible on both themes' translucent red wash. */
   --danger: #dd5346;
+  --danger-soft: rgba(221, 83, 70, 0.12);
+
+  /* The radius scale is the loudest part of the language: containers are very round, controls are
+     fully round. Sizes are deliberately far apart so nesting reads as a hierarchy. */
+  --r-card: 26px;
+  --r-panel: 22px;
+  --r-control: 16px;
+  --r-small: 12px;
+  --r-pill: 999px;
+
+  /* The dropdown chevron, drawn by us because a native <select> arrow cannot be styled and does
+     not match anything else here. Two variants rather than `currentColor`, which a background
+     image cannot see. */
+  --chevron: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%23a9a9b3' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/></svg>");
 
   font-family: "Inter", system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
   font-synthesis: none;
@@ -79,4 +138,29 @@ body {
   color: var(--text);
   overflow: hidden;
   user-select: none;
+}
+
+/* `color: inherit` on purpose: the console's output is ANSI-coloured, and forcing a foreground
+   here would flatten it the moment you dragged across it. Only the wash changes. */
+::selection {
+  background: var(--selection);
+  color: inherit;
+}
+
+/* The text caret is the other system-coloured detail — it defaults to the desktop accent. */
+input,
+textarea {
+  caret-color: var(--accent);
+}
+
+/* One UI leans on motion. Honour a reduced-motion preference across the whole app rather than
+   per-component, so nothing animates for someone who asked it not to. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

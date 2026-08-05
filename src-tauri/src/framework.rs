@@ -59,11 +59,30 @@ pub struct FrameworkManifest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstalledFramework {
+    /// What a project writes in its `frameworkVersion` to target this SDK: a release version
+    /// (`0.0.10`) for a download, or a source pin (`source`, `source:<name>`) for a local build.
     pub version: String,
+    /// What to show a human. The version for a release; the install prefix's folder name for a
+    /// source build, which has no version to show — see [`local`].
+    pub name: String,
     pub platform: String,
     pub path: String,
-    /// Bytes on disk. Shown in the UI so it is obvious what uninstalling reclaims.
+    /// Bytes on disk. Shown in the UI so it is obvious what uninstalling reclaims. Zero for a
+    /// local build — the Hub did not put it there and removing the registration reclaims nothing.
     pub size_bytes: u64,
+    /// Registered from a path rather than downloaded. Such an entry may be *forgotten* but never
+    /// deleted, so the UI must offer "Remove" rather than "Uninstall".
+    #[serde(default)]
+    pub local: bool,
+    /// The source tree this was built from, when it is known — what makes stepping into framework
+    /// code work while debugging a project. Only ever set for a local build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_dir: Option<String>,
+    /// `CMAKE_BUILD_TYPE` of the build this was installed from, read fresh from its CMake cache.
+    /// `None` when the build tree could not be found. Surfaced because a Release build carries no
+    /// debug info, so a crash in it can never land on a line of framework source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_type: Option<String>,
 }
 
 /// A release that *could* be installed on this machine — i.e. one that publishes an SDK
@@ -171,6 +190,10 @@ fn http() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
         .default_headers(headers)
+        // Connect only: an SDK is a hundred megabytes and may legitimately take minutes, but a
+        // host that never answers must not hold up a command the UI is waiting on — the release
+        // list is now consulted for a new project's default version.
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("failed to create HTTP client: {e}"))
 }
@@ -262,6 +285,31 @@ pub fn available() -> Result<Vec<AvailableFramework>, String> {
 
 // --- Local installs ---------------------------------------------------------------------
 
+/// What a project writes in `frameworkVersion` to target this machine's framework source build.
+///
+/// A build from source has no version, on purpose: it is a working tree that changes under you,
+/// so a number stamped on it would be a lie the moment you rebuilt. It is pinned by *kind*
+/// instead — "whatever source build this machine has registered" — and resolved fresh on every
+/// build. `source:<name>` names one specifically, for a machine that has registered several.
+pub const SOURCE_PIN: &str = "source";
+
+/// The name a source pin selects: `Some("")` for a bare `source` (this machine's only source
+/// build), `Some(name)` for `source:<name>`, `None` for anything that is not a source pin.
+pub fn source_pin(version: &str) -> Option<&str> {
+    let rest = version.strip_prefix(SOURCE_PIN)?;
+    match rest.strip_prefix(':') {
+        Some(name) => Some(name.trim()),
+        None if rest.is_empty() => Some(""),
+        // "sourceforge-1.0" is a version, not a pin.
+        None => None,
+    }
+}
+
+/// Is this what a project targeting a source build writes?
+pub fn is_source_pin(version: &str) -> bool {
+    source_pin(version).is_some()
+}
+
 /// Reject anything that could escape the frameworks directory once joined onto a path.
 /// Versions come from release tags, which are attacker-influencable in principle and are
 /// certainly typo-influencable in practice — and this string is about to be handed to
@@ -304,6 +352,23 @@ fn dir_size(dir: &Path) -> u64 {
         .sum()
 }
 
+/// Order a version so the newest sorts last: numerically, segment by segment, because a string
+/// sort puts 0.10.0 *before* 0.9.0 and "newest installed" is the default a new project gets.
+///
+/// Each segment is a number plus whatever trails it, and a segment with nothing trailing wins:
+/// 1.0.0 is newer than 1.0.0-rc2, which is newer than 1.0.0-rc1.
+fn version_key(version: &str) -> Vec<(u64, u8, String)> {
+    version
+        .split('.')
+        .map(|part| {
+            let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+            let rest = part[digits.len()..].to_string();
+            let released = u8::from(rest.is_empty());
+            (digits.parse().unwrap_or(0), released, rest)
+        })
+        .collect()
+}
+
 /// Every SDK installed on this machine.
 pub fn installed() -> Vec<InstalledFramework> {
     let mut out = Vec::new();
@@ -326,15 +391,46 @@ pub fn installed() -> Vec<InstalledFramework> {
                 continue;
             }
             out.push(InstalledFramework {
+                name: version_name.clone(),
                 version: version_name.clone(),
                 platform: platform.file_name().to_string_lossy().into_owned(),
                 size_bytes: dir_size(&dir),
                 path: dir.to_string_lossy().into_owned(),
+                local: false,
+                source_dir: None,
+                build_type: None,
             });
         }
     }
-    out.sort_by(|a, b| b.version.cmp(&a.version));
-    out
+
+    out.sort_by(|a, b| version_key(&b.version).cmp(&version_key(&a.version)));
+
+    // Locally-registered SDKs are installed too, as far as everything downstream is concerned —
+    // the module scan, the picker, "is this version available". They cannot collide with a release
+    // any more (their pin is namespaced), and they go first because a machine that has one is being
+    // used to work on the framework itself.
+    let host = host_platform();
+    // Pin down any build directory a registration is missing first, so the build type below is
+    // reported for an SDK registered before that was possible rather than left blank forever.
+    local::fill_missing_build_dirs();
+    let locals = local::list();
+    let single = locals.len() == 1;
+    let mut head: Vec<InstalledFramework> = locals
+        .into_iter()
+        .map(|entry| InstalledFramework {
+            version: entry.pin(single),
+            name: entry.name,
+            platform: host.clone(),
+            size_bytes: 0,
+            path: entry.path,
+            local: true,
+            source_dir: (!entry.source_dir.is_empty()).then_some(entry.source_dir),
+            build_type: local::build_type(&entry.build_dir),
+        })
+        .collect();
+
+    head.append(&mut out);
+    head
 }
 
 /// Remove an installed SDK. Idempotent: uninstalling something that is not there succeeds.
@@ -440,14 +536,530 @@ pub fn install(version: &str, mut progress: impl FnMut(u64, u64)) -> Result<Path
     Ok(dest)
 }
 
-/// Ensure `version` is installed, downloading it if necessary, and return its SDK root.
-/// The build path calls this; it is silent, with no progress reporting.
+/// Ensure `version` is available on this machine, downloading it if necessary, and return its SDK
+/// root. Silent, with no progress reporting.
+///
+/// A source pin is already "installed" by definition — it is a directory the user built — so this
+/// resolves it rather than trying to download a release by that name.
 pub fn ensure_installed(version: &str) -> Result<PathBuf, String> {
+    if let Some(local) = local::resolve_pin(version)? {
+        return Ok(PathBuf::from(local.path));
+    }
     let dir = install_dir(version, &host_platform());
     if dir.join("framework.json").exists() {
         return Ok(dir);
     }
     install(version, |_, _| {})
+}
+
+/// Locate the SDK a project's `frameworkVersion` names, and describe it: its root and manifest.
+///
+/// A **source pin** (`source`, `source:<name>`) resolves to a registered local build and never
+/// touches the network. A bare version resolves to a downloaded release — but a local build
+/// registered under that exact name still wins, which is what keeps projects pinned to the old
+/// version-label scheme working.
+///
+/// The release path downloads on demand. A local SDK needs no `framework.json` written into the
+/// user's install prefix: the manifest is synthesised from the tree each time instead, so a
+/// rebuild is picked up with nothing to refresh.
+pub fn resolve(version: &str) -> Result<(PathBuf, FrameworkManifest), String> {
+    if let Some(local) = local::resolve_pin(version)? {
+        let root = PathBuf::from(&local.path);
+        if !root.is_dir() {
+            return Err(format!(
+                "the source build '{}' is registered at {}, which no longer exists — \
+                 re-register it, or remove it in Frameworks",
+                local.name, local.path
+            ));
+        }
+        let manifest = describe_tree(&root, "koral", version, &host_platform())?;
+        return Ok((root, manifest));
+    }
+
+    let root = ensure_installed(version)?;
+    let manifest = read_manifest(&root)?;
+    Ok((root, manifest))
+}
+
+/// The SDK root for `version` **without ever downloading one** — `None` when this machine does not
+/// have it yet. What anything that merely inspects an SDK (the module scan, the settings panel)
+/// must use: opening a panel is not consent to pull 40 MB over the network.
+pub fn installed_root(version: &str) -> Option<PathBuf> {
+    if let Ok(Some(local)) = local::resolve_pin(version) {
+        let root = PathBuf::from(local.path);
+        return root.is_dir().then_some(root);
+    }
+    let dir = install_dir(version, &host_platform());
+    dir.join("framework.json").exists().then_some(dir)
+}
+
+/// Directories a debugger should search for the framework's own source, for a project targeting
+/// `version`. Empty unless this is a source build whose tree the Hub knows about — a downloaded
+/// SDK ships no source, so there is nothing a debugger could show for a frame inside it.
+///
+/// The source root itself is enough for gdb (it searches recursively from what `directory` is
+/// given), but the engine's own layout dirs are listed too so a partial checkout still resolves.
+pub fn debug_source_dirs(version: &str) -> Vec<PathBuf> {
+    let Ok(Some(local)) = local::resolve_pin(version) else {
+        return Vec::new();
+    };
+    if local.source_dir.is_empty() {
+        return Vec::new();
+    }
+    let root = PathBuf::from(&local.source_dir);
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let mut dirs = vec![root.clone()];
+    for sub in ["src", "include", "modules", "engine"] {
+        let dir = root.join(sub);
+        if dir.is_dir() {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+/// Framework builds from source that the user has registered by path.
+///
+/// Deliberately an index of paths rather than a copy: a developer building the framework from
+/// source re-runs `cmake --install` constantly, and the Hub must see the new build immediately
+/// rather than a snapshot taken when they registered it. For the same reason these carry **no
+/// version** — a working tree changes under you, so any number stamped on it is stale as soon as
+/// it is written. Projects target them by kind instead; see [`SOURCE_PIN`].
+pub mod local {
+    use super::*;
+
+    /// One registered source build.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct LocalFramework {
+        /// Display name, and what `source:<name>` selects. Derived from the install prefix's
+        /// folder name rather than typed, since there is nothing meaningful for a user to name it.
+        ///
+        /// Reads a pre-source-build registration's `version` label as the name, so a machine that
+        /// registered one under the old scheme keeps it (and keeps resolving projects pinned to
+        /// that label — see [`resolve_pin`]).
+        #[serde(alias = "version")]
+        pub name: String,
+        /// The install prefix: the directory `cmake --install --prefix` produced.
+        pub path: String,
+        /// The source tree it was built from, discovered from the build's CMake cache. Empty when
+        /// it could not be found; the user can point at it themselves.
+        #[serde(default)]
+        pub source_dir: String,
+        /// The CMake build directory the install came from, kept so the *current* build type can
+        /// be re-read on every listing rather than frozen at registration.
+        #[serde(default)]
+        pub build_dir: String,
+    }
+
+    impl LocalFramework {
+        /// What a project writes to target this build. Bare `source` when it is the only one
+        /// registered — the common case, and the one worth keeping readable — and `source:<name>`
+        /// once there is a choice to disambiguate.
+        pub fn pin(&self, only_one: bool) -> String {
+            if only_one {
+                SOURCE_PIN.to_string()
+            } else {
+                format!("{SOURCE_PIN}:{}", self.name)
+            }
+        }
+    }
+
+    #[derive(Default, Serialize, Deserialize)]
+    struct Cache {
+        frameworks: Vec<LocalFramework>,
+    }
+
+    fn load_cache() -> Cache {
+        std::fs::read_to_string(paths::local_frameworks_file())
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_cache(cache: &Cache) -> Result<(), String> {
+        let file = paths::local_frameworks_file();
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let text = serde_json::to_string_pretty(cache).map_err(|e| e.to_string())?;
+        std::fs::write(file, text).map_err(|e| e.to_string())
+    }
+
+    /// Every registered source build whose install prefix still exists.
+    pub fn list() -> Vec<LocalFramework> {
+        load_cache()
+            .frameworks
+            .into_iter()
+            .filter(|f| Path::new(&f.path).is_dir())
+            .collect()
+    }
+
+    /// The source build registered under this exact name, if any.
+    pub fn find(name: &str) -> Option<LocalFramework> {
+        list().into_iter().find(|f| f.name == name)
+    }
+
+    /// Which registered source build a project's `frameworkVersion` selects, if any.
+    ///
+    /// - `source` — this machine's source build. An error when several are registered, since
+    ///   picking one arbitrarily would silently build against the wrong framework.
+    /// - `source:<name>` — that one specifically.
+    /// - anything else — a release version, *unless* a source build happens to carry that exact
+    ///   name, which is how a project pinned under the old version-label scheme still resolves.
+    ///
+    /// `Ok(None)` means "not a source build, go and resolve a release".
+    pub fn resolve_pin(version: &str) -> Result<Option<LocalFramework>, String> {
+        let Some(name) = source_pin(version) else {
+            return Ok(find(version));
+        };
+        if !name.is_empty() {
+            return match find(name) {
+                Some(framework) => Ok(Some(framework)),
+                None => Err(format!(
+                    "this project targets the source build '{name}', which is not registered on \
+                     this machine — add it under Frameworks, or pick another framework"
+                )),
+            };
+        }
+
+        let mut all = list();
+        match all.len() {
+            0 => Err("this project targets a framework build from source, but none is \
+                      registered on this machine — add one under Frameworks → Add source build"
+                .into()),
+            1 => Ok(Some(all.remove(0))),
+            _ => Err(format!(
+                "several source builds are registered ({}) — pin one in this project's settings \
+                 so it is unambiguous which to build against",
+                all.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", ")
+            )),
+        }
+    }
+
+    /// `CMAKE_BUILD_TYPE` of a build directory, read fresh so a rebuild in another configuration
+    /// is reflected without re-registering. `None` when the directory is not a CMake build tree.
+    ///
+    /// Worth surfacing: a Release build of the framework carries no debug info, so no amount of
+    /// source-path configuration will make a crash inside it land on a line of source.
+    pub fn build_type(build_dir: &str) -> Option<String> {
+        if build_dir.is_empty() {
+            return None;
+        }
+        let text = std::fs::read_to_string(Path::new(build_dir).join("CMakeCache.txt")).ok()?;
+        cache_value(&text, "CMAKE_BUILD_TYPE").map(str::to_string)
+    }
+
+    /// The value of a CMake cache entry (`NAME:TYPE=value`), ignoring the type.
+    fn cache_value<'a>(cache: &'a str, key: &str) -> Option<&'a str> {
+        cache.lines().find_map(|line| {
+            let rest = line.strip_prefix(key)?.strip_prefix(':')?;
+            let (_, value) = rest.split_once('=')?;
+            let value = value.trim();
+            (!value.is_empty()).then_some(value)
+        })
+    }
+
+    /// Directory names a CMake build tree conventionally has. Checked by name under each candidate
+    /// so a build nested one level deeper than the prefix (`~/koral-sdk` installed from
+    /// `~/dev/Koral/build`) is still found, without fanning out over every directory twice.
+    const BUILD_DIR_NAMES: &[&str] = &[
+        "build",
+        "out",
+        "cmake-build-debug",
+        "cmake-build-release",
+        "cmake-build-relwithdebinfo",
+    ];
+
+    /// Directories worth looking in for the build tree behind an install prefix: the prefix's
+    /// ancestors, their immediate subdirectories, and the conventionally named build directories
+    /// under those.
+    fn build_candidates(prefix: &Path) -> Vec<PathBuf> {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        for ancestor in prefix.ancestors().skip(1).take(3) {
+            candidates.push(ancestor.to_path_buf());
+            let Ok(entries) = std::fs::read_dir(ancestor) else {
+                continue;
+            };
+            // Bounded: a home directory can hold a lot, and this runs while the user waits.
+            for entry in entries.flatten().take(200) {
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    || entry.file_name().to_string_lossy().starts_with('.')
+                {
+                    continue;
+                }
+                let dir = entry.path();
+                candidates.extend(BUILD_DIR_NAMES.iter().map(|name| dir.join(name)));
+                candidates.push(dir);
+            }
+        }
+        candidates
+    }
+
+    /// Does this directory hold the framework's own CMake project?
+    ///
+    /// Matched by the `project()` name rather than by folder name, because the folder is whatever
+    /// the user cloned into — and tolerant of the pending GFX -> Koral rename, exactly like
+    /// [`is_sdk_asset`], so a checkout of either era is recognised.
+    fn is_framework_source(dir: &Path) -> bool {
+        let Ok(text) = std::fs::read_to_string(dir.join("CMakeLists.txt")) else {
+            return false;
+        };
+        text.lines()
+            .filter_map(|line| line.trim_start().strip_prefix("project("))
+            .any(|rest| {
+                let name = rest.trim_start().to_ascii_lowercase();
+                name.starts_with("koral") || name.starts_with("gfx")
+            })
+    }
+
+    /// Find the source tree an install prefix was built from, and the build tree it came from when
+    /// that can be pinned down.
+    ///
+    /// The answer decides which files a debugger opens for a frame inside the framework, and
+    /// whether its build type can be reported at all, so it is established in descending order of
+    /// confidence:
+    ///
+    /// 1. A build whose **install manifest** names files under this prefix. CMake writes
+    ///    `install_manifest.txt` on every install, listing the files it actually wrote — so unlike
+    ///    the cache it records the prefix `--install --prefix` was given. That makes the build that
+    ///    produced this tree identifiable for the ordinary `cmake --install <build> --prefix
+    ///    <src>/stage/sdk` layout, which is the whole reason step 2 is not enough on its own.
+    ///    Newest install first: a prefix installed to twice holds what the later one wrote.
+    /// 2. A `CMakeCache.txt` whose `CMAKE_INSTALL_PREFIX` is exactly this prefix — the build was
+    ///    configured to install here, even if it has not yet done so and has no manifest.
+    /// 3. A build tree whose source directory *contains* this prefix. An inference, not an
+    ///    identification: it says which source tree, but not which of its build directories, so
+    ///    the build type is left unreported rather than guessed at from whichever was found first.
+    /// 4. Failing any cache at all — a build directory that has since been cleaned — an ancestor
+    ///    of the prefix that is the framework's own CMake project.
+    ///
+    /// Returns `(source_dir, build_dir)`; both empty when nothing matched, and `build_dir` empty
+    /// whenever the source was inferred rather than identified.
+    pub fn discover_source(prefix: &Path) -> (String, String) {
+        // Read each cache once. Capped: a tree of build directories is a lot of megabytes, and
+        // nothing beyond the first handful is plausibly the one.
+        let caches: Vec<(PathBuf, String)> = build_candidates(prefix)
+            .into_iter()
+            .filter_map(|dir| {
+                let text = std::fs::read_to_string(dir.join("CMakeCache.txt")).ok()?;
+                Some((dir, text))
+            })
+            .take(40)
+            .collect();
+
+        let source_of = |text: &str| {
+            cache_value(text, "CMAKE_HOME_DIRECTORY")
+                .filter(|s| Path::new(s).is_dir())
+                .map(str::to_string)
+        };
+
+        // 1. The build whose install manifest says it wrote this tree, most recent install first.
+        let mut installed_here: Vec<(&PathBuf, &String, std::time::SystemTime)> = caches
+            .iter()
+            .filter_map(|(dir, text)| {
+                let manifest = dir.join("install_manifest.txt");
+                let at = std::fs::metadata(&manifest).and_then(|m| m.modified()).ok()?;
+                let listing = std::fs::read_to_string(&manifest).ok()?;
+                // Compared as paths, not strings, so a neighbouring `…/stage/sdk-old` cannot
+                // pass for `…/stage/sdk`.
+                let wrote_here = listing
+                    .lines()
+                    .any(|line| Path::new(line.trim()).starts_with(prefix));
+                wrote_here.then_some((dir, text, at))
+            })
+            .collect();
+        installed_here.sort_by_key(|(_, _, at)| std::cmp::Reverse(*at));
+        for (dir, text, _) in installed_here {
+            if let Some(source) = source_of(text) {
+                return (source, dir.to_string_lossy().into_owned());
+            }
+        }
+
+        // 2. The build configured to install exactly here.
+        for (dir, text) in &caches {
+            let installs_here = cache_value(text, "CMAKE_INSTALL_PREFIX")
+                .map(|p| Path::new(p) == prefix)
+                .unwrap_or(false);
+            if installs_here {
+                if let Some(source) = source_of(text) {
+                    return (source, dir.to_string_lossy().into_owned());
+                }
+            }
+        }
+
+        // 3. A build whose source tree contains this prefix.
+        for (_, text) in &caches {
+            if let Some(source) = source_of(text) {
+                if prefix.starts_with(&source) {
+                    return (source, String::new());
+                }
+            }
+        }
+
+        // 4. No usable cache: an ancestor that is the framework's source.
+        for ancestor in prefix.ancestors().skip(1).take(4) {
+            if is_framework_source(ancestor) {
+                return (ancestor.to_string_lossy().into_owned(), String::new());
+            }
+        }
+        (String::new(), String::new())
+    }
+
+    /// Register the install prefix at `path` as a source build.
+    ///
+    /// Validated before it is remembered — a directory that is not an SDK is rejected here, where
+    /// the user can fix the path, rather than at the first build of a project that targets it.
+    /// Re-registering the same prefix replaces the entry, so re-pointing at a moved source tree is
+    /// one action. `source_dir` overrides what the build's CMake cache says; empty means "work it
+    /// out", which is what the UI sends unless the user picked a folder by hand.
+    pub fn add(path: &Path, source_dir: &str) -> Result<LocalFramework, String> {
+        if !path.is_dir() {
+            return Err(format!("{} is not a directory", path.display()));
+        }
+        // Canonicalised so the same tree reached by two different paths is one registration, and
+        // so a relative path typed into the dialog is stored as something that still resolves
+        // from wherever the Hub runs next.
+        let path = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+
+        // The real check: does this tree look like an installed SDK? describe_tree fails with a
+        // specific reason ("SDK has no bin/ directory", "no *Config.cmake found under …"), which
+        // is far more useful than a generic rejection.
+        describe_tree(&path, "koral", SOURCE_PIN, &host_platform()).map_err(|e| {
+            format!(
+                "{} does not look like an installed Koral SDK — {e}. Point at the directory you \
+                 passed to `cmake --install --prefix`.",
+                path.display()
+            )
+        })?;
+
+        let (discovered, build_dir) = discover_source(&path);
+        let source_dir = match source_dir.trim() {
+            "" => discovered,
+            given => {
+                if !Path::new(given).is_dir() {
+                    return Err(format!("{given} is not a directory"));
+                }
+                given.to_string()
+            }
+        };
+
+        // Named after the *source* tree when we know it, because that is the name a human has for
+        // this framework ("GFX", "Koral"). An install prefix is almost always called something
+        // generic — `sdk`, `install`, `stage/sdk` — which would make every registration on a
+        // machine look alike, and `source:sdk` a meaningless thing to pin a project to.
+        let folder_name = |dir: &Path| {
+            dir.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .filter(|n| !n.is_empty())
+        };
+        let name = folder_name(Path::new(&source_dir))
+            .or_else(|| folder_name(&path))
+            .unwrap_or_else(|| "source".to_string());
+
+        let entry = LocalFramework {
+            name,
+            path: path.to_string_lossy().into_owned(),
+            source_dir,
+            build_dir,
+        };
+
+        let mut cache = load_cache();
+        // Keyed by path: the prefix is the identity, and the name is only what we call it. Names
+        // are deduplicated after, so two prefixes with the same folder name stay distinguishable.
+        cache.frameworks.retain(|f| f.path != entry.path);
+        cache.frameworks.push(entry.clone());
+        dedupe_names(&mut cache.frameworks);
+        save_cache(&cache)?;
+        // The stored entry may have been renamed to keep names unique; hand back what was saved.
+        Ok(cache
+            .frameworks
+            .iter()
+            .find(|f| f.path == entry.path)
+            .cloned()
+            .unwrap_or(entry))
+    }
+
+    /// Make every name unique, since `source:<name>` has to select exactly one build. A clash
+    /// takes a numeric suffix (`koral-install-2`), which is stable as long as the list is.
+    fn dedupe_names(frameworks: &mut [LocalFramework]) {
+        let mut seen: Vec<String> = Vec::new();
+        for framework in frameworks.iter_mut() {
+            let base = framework.name.clone();
+            let mut candidate = base.clone();
+            let mut n = 1;
+            while seen.contains(&candidate) {
+                n += 1;
+                candidate = format!("{base}-{n}");
+            }
+            seen.push(candidate.clone());
+            framework.name = candidate;
+        }
+    }
+
+    /// Forget a source build, by name. Never touches the directory itself — it is the user's build
+    /// output, not something the Hub installed and may delete.
+    pub fn remove(name: &str) -> Result<(), String> {
+        let mut cache = load_cache();
+        cache.frameworks.retain(|f| f.name != name);
+        save_cache(&cache)
+    }
+
+    /// Point an existing registration at a source tree the user picked by hand — the escape hatch
+    /// for a build whose CMake cache is gone (a fresh clone of the prefix, a pruned build dir).
+    pub fn set_source_dir(name: &str, source_dir: &str) -> Result<(), String> {
+        let source_dir = source_dir.trim();
+        if !source_dir.is_empty() && !Path::new(source_dir).is_dir() {
+            return Err(format!("{source_dir} is not a directory"));
+        }
+        let mut cache = load_cache();
+        let entry = cache
+            .frameworks
+            .iter_mut()
+            .find(|f| f.name == name)
+            .ok_or_else(|| format!("no source build named '{name}' is registered"))?;
+        entry.source_dir = source_dir.to_string();
+        save_cache(&cache)
+    }
+
+    /// Work out the build directory for any registration that has none, and remember it.
+    ///
+    /// An empty `build_dir` means no build type to report, and so a Frameworks tab that cannot say
+    /// whether a source build carries debug info at all. Registrations made before the install
+    /// manifest was consulted all carry one — [`discover_source`] had nothing that could identify
+    /// the build behind a `--install --prefix` tree — so discovery is re-run for them here rather
+    /// than making the user re-register a framework that has not changed.
+    ///
+    /// Only ever fills a gap: a `source_dir` the user set by hand is left exactly as it is.
+    ///
+    /// Once found the answer is saved, so this costs nothing on later listings. An entry that
+    /// stays unidentifiable — its build tree deleted — is searched again each time, which is the
+    /// same bounded scan the Add dialog already runs, and only while the Frameworks tab is open.
+    pub fn fill_missing_build_dirs() {
+        let mut cache = load_cache();
+        let mut found_any = false;
+
+        for entry in &mut cache.frameworks {
+            if !entry.build_dir.is_empty() || !Path::new(&entry.path).is_dir() {
+                continue;
+            }
+            let (source, build) = discover_source(Path::new(&entry.path));
+            if build.is_empty() {
+                continue;
+            }
+            entry.build_dir = build;
+            if entry.source_dir.is_empty() {
+                entry.source_dir = source;
+            }
+            found_any = true;
+        }
+
+        if found_any {
+            let _ = save_cache(&cache);
+        }
+    }
 }
 
 // --- Unpacking --------------------------------------------------------------------------
@@ -601,6 +1213,18 @@ mod tests {
         w.finish().unwrap().into_inner()
     }
 
+    /// A string sort reads 0.10.0 as older than 0.9.0, which would hand every new project a
+    /// two-releases-stale default the day the framework reaches its tenth minor.
+    #[test]
+    fn versions_order_by_number_not_by_text() {
+        let mut versions = ["0.9.0", "0.10.0", "0.0.3", "1.0.0-rc1", "1.0.0", "0.10.1"];
+        versions.sort_by_key(|v| version_key(v));
+        assert_eq!(
+            versions,
+            ["0.0.3", "0.9.0", "0.10.0", "0.10.1", "1.0.0-rc1", "1.0.0"]
+        );
+    }
+
     /// The tarballs wrap everything in a directory named after the archive; the Windows zip
     /// does not. Both must land with `bin/` directly under the install root — stripping a
     /// component unconditionally left Windows installs with their files loose at the root and
@@ -624,6 +1248,261 @@ mod tests {
             );
             assert_eq!(find_runtime(&dest).unwrap(), "bin/Koral_Runtime.exe", "{case}");
         }
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Build a directory shaped like a `cmake --install` prefix of the SDK.
+    fn fake_sdk(root: &Path) {
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("lib/cmake/Koral")).unwrap();
+        let runtime = if cfg!(windows) { "Koral_Runtime.exe" } else { "Koral_Runtime" };
+        std::fs::write(root.join("bin").join(runtime), "x").unwrap();
+        std::fs::write(root.join("lib/cmake/Koral/KoralConfig.cmake"), "x").unwrap();
+    }
+
+    /// A local SDK is described by inspecting the tree — no framework.json required, and none
+    /// written. The engine's own `cmake --install` produces no manifest, so requiring one would
+    /// make every source build unusable; and writing one into the user's prefix would leave a
+    /// file that goes stale the moment they re-point the registration.
+    #[test]
+    fn a_source_install_is_described_without_a_manifest() {
+        let root = scratch();
+        fake_sdk(&root);
+
+        let manifest = describe_tree(&root, "koral", "0.0.10", "linux-x64").unwrap();
+        assert_eq!(manifest.version, "0.0.10");
+        assert_eq!(manifest.cmake_dir, "lib/cmake/Koral");
+        assert!(manifest.runtime.starts_with("bin/Koral_Runtime"));
+        assert!(
+            !root.join("framework.json").exists(),
+            "describing a tree must not write into it"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory that is not an SDK is rejected with a reason naming what is missing, rather
+    /// than being accepted and failing at the first build of a project that targets it.
+    #[test]
+    fn a_directory_that_is_not_an_sdk_is_rejected_with_a_reason() {
+        let root = scratch();
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Nothing at all: no bin/.
+        let err = describe_tree(&root, "koral", "0.0.10", "linux-x64").unwrap_err();
+        assert!(err.contains("bin"), "{err}");
+
+        // A runtime but no CMake package config — buildable-looking, but a consumer could not
+        // find_package(Koral) against it.
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let runtime = if cfg!(windows) { "Koral_Runtime.exe" } else { "Koral_Runtime" };
+        std::fs::write(root.join("bin").join(runtime), "x").unwrap();
+        let err = describe_tree(&root, "koral", "0.0.10", "linux-x64").unwrap_err();
+        assert!(err.contains("cmake"), "{err}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A source pin is what a project writes instead of a version. It has to be told apart from a
+    /// version by *shape*, since both land in the same `frameworkVersion` field — and a release
+    /// that merely starts with the letters "source" must stay a release.
+    #[test]
+    fn source_pins_are_told_apart_from_versions() {
+        assert_eq!(source_pin("source"), Some(""));
+        assert_eq!(source_pin("source:koral-install"), Some("koral-install"));
+        assert_eq!(source_pin("source: koral "), Some("koral"));
+
+        for version in ["0.0.10", "1.2.3-rc1", "sourceforge-1.0", "", "resource"] {
+            assert_eq!(source_pin(version), None, "{version} is a version, not a pin");
+            assert!(!is_source_pin(version));
+        }
+    }
+
+    /// The source tree is identified from the build's own CMake cache rather than guessed, because
+    /// the answer decides which files a debugger opens for a frame inside the framework. The match
+    /// is on `CMAKE_INSTALL_PREFIX`: a *different* build tree sitting next door must not be
+    /// mistaken for the one this prefix came from.
+    #[test]
+    fn the_source_tree_is_found_through_the_build_that_installed_it() {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("koral-discover-{}", std::process::id()));
+        let source = base.join("Koral");
+        let build = base.join("Koral/build");
+        let prefix = base.join("koral-sdk");
+        let other = base.join("SomethingElse/build");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::create_dir_all(&prefix).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+
+        let cache = |install: &Path, home: &Path, build_type: &str| {
+            format!(
+                "CMAKE_INSTALL_PREFIX:PATH={}\nCMAKE_HOME_DIRECTORY:INTERNAL={}\n\
+                 CMAKE_BUILD_TYPE:STRING={build_type}\n",
+                install.display(),
+                home.display()
+            )
+        };
+        std::fs::write(build.join("CMakeCache.txt"), cache(&prefix, &source, "Debug")).unwrap();
+        // A build tree that installs somewhere else entirely — it must not be picked up.
+        std::fs::write(
+            other.join("CMakeCache.txt"),
+            cache(&base.join("elsewhere"), &base.join("SomethingElse"), "Release"),
+        )
+        .unwrap();
+
+        let (found_source, found_build) = local::discover_source(&prefix);
+        assert_eq!(Path::new(&found_source), source);
+        assert_eq!(Path::new(&found_build), build);
+        assert_eq!(local::build_type(&found_build).as_deref(), Some("Debug"));
+
+        // A prefix with no build tree to be found reports nothing rather than guessing.
+        std::fs::remove_file(build.join("CMakeCache.txt")).unwrap();
+        assert_eq!(local::discover_source(&prefix), (String::new(), String::new()));
+        assert_eq!(local::build_type(""), None);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The layout `cmake --install <build> --prefix <src>/stage/sdk` produces — which is how the
+    /// SDK is normally staged, and what the README told people to do.
+    ///
+    /// `--install --prefix` overrides the prefix for that one command and never writes it to the
+    /// cache, so no build tree records installing here. Matching only on `CMAKE_INSTALL_PREFIX`
+    /// therefore finds nothing at all, and the source build silently becomes undebuggable — the
+    /// exact thing the feature exists to prevent. The prefix sitting *inside* the source tree is
+    /// what identifies it instead.
+    ///
+    /// This is the case with no install manifest to go on — a build tree cleaned since it staged
+    /// this prefix. The source tree is still found; which build produced it is not, so the build
+    /// type stays unreported. With a manifest, both are known (see the test below).
+    #[test]
+    fn a_prefix_staged_inside_the_source_tree_is_recognised() {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("koral-staged-{}", std::process::id()));
+        let source = base.join("GFX");
+        let build = source.join("cmake-build-debug");
+        let prefix = source.join("stage/sdk");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::create_dir_all(&prefix).unwrap();
+
+        // Configured to install to /usr/local, then staged elsewhere with `--install --prefix`.
+        std::fs::write(
+            build.join("CMakeCache.txt"),
+            format!(
+                "CMAKE_INSTALL_PREFIX:PATH=/usr/local\n\
+                 CMAKE_HOME_DIRECTORY:INTERNAL={}\nCMAKE_BUILD_TYPE:STRING=Debug\n",
+                source.display()
+            ),
+        )
+        .unwrap();
+
+        let (found_source, found_build) = local::discover_source(&prefix);
+        assert_eq!(Path::new(&found_source), source);
+        assert_eq!(
+            found_build, "",
+            "which build installed here is not recorded anywhere, so it must not be claimed"
+        );
+
+        // Even with the build tree gone, the source tree is still identifiable by its project().
+        std::fs::remove_dir_all(&build).unwrap();
+        std::fs::write(
+            source.join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.28)\nproject(Koral VERSION 0.0.9 LANGUAGES C CXX)\n",
+        )
+        .unwrap();
+        assert_eq!(Path::new(&local::discover_source(&prefix).0), source);
+
+        // A directory that is some other CMake project is not the framework.
+        std::fs::write(source.join("CMakeLists.txt"), "project(SomethingElse)\n").unwrap();
+        assert_eq!(local::discover_source(&prefix), (String::new(), String::new()));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The same staged layout, but with the `install_manifest.txt` CMake writes on every install.
+    ///
+    /// It lists the files the install actually wrote, so it records the `--prefix` the cache never
+    /// sees — which is what makes the build behind a staged prefix identifiable, and with it the
+    /// build type. Without this the Frameworks tab can say nothing at all about a source build
+    /// staged the ordinary way: not that it is debuggable, and not that a Release one is not.
+    #[test]
+    fn the_install_manifest_identifies_the_build_that_staged_the_prefix() {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("koral-manifest-{}", std::process::id()));
+        let source = base.join("GFX");
+        let debug = source.join("cmake-build-debug");
+        let release = source.join("cmake-build-release");
+        let prefix = source.join("stage/sdk");
+        std::fs::create_dir_all(&debug).unwrap();
+        std::fs::create_dir_all(&release).unwrap();
+        std::fs::create_dir_all(&prefix).unwrap();
+
+        // Both configured to install to /usr/local and then staged with `--install --prefix`, so
+        // neither records this prefix in its cache. Only one of them staged it *here*.
+        let cache = |build_type: &str| {
+            format!(
+                "CMAKE_INSTALL_PREFIX:PATH=/usr/local\n\
+                 CMAKE_HOME_DIRECTORY:INTERNAL={}\nCMAKE_BUILD_TYPE:STRING={build_type}\n",
+                source.display()
+            )
+        };
+        std::fs::write(debug.join("CMakeCache.txt"), cache("Debug")).unwrap();
+        std::fs::write(release.join("CMakeCache.txt"), cache("Release")).unwrap();
+
+        let manifest = |dir: &Path, to: &Path| {
+            std::fs::write(
+                dir.join("install_manifest.txt"),
+                format!(
+                    "{}\n{}\n",
+                    to.join("lib/libKoral.so").display(),
+                    to.join("bin/Koral_Runtime").display()
+                ),
+            )
+            .unwrap();
+        };
+        manifest(&debug, &prefix);
+        // The release build staged somewhere else entirely, and must not be mistaken for this one.
+        manifest(&release, &base.join("elsewhere"));
+
+        let (found_source, found_build) = local::discover_source(&prefix);
+        assert_eq!(Path::new(&found_source), source);
+        assert_eq!(Path::new(&found_build), debug);
+        assert_eq!(
+            local::build_type(&found_build).as_deref(),
+            Some("Debug"),
+            "identifying the build is what makes its build type reportable"
+        );
+
+        // Installed to twice: the tree on disk is whatever the *later* install wrote, so that is
+        // the build — and the build type — to report.
+        manifest(&release, &prefix);
+        let touch = |dir: &Path, secs: u64| {
+            let file = std::fs::File::options()
+                .write(true)
+                .open(dir.join("install_manifest.txt"))
+                .unwrap();
+            let at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            file.set_times(std::fs::FileTimes::new().set_modified(at)).unwrap();
+        };
+        touch(&debug, 1_000_000);
+        touch(&release, 2_000_000);
+        assert_eq!(Path::new(&local::discover_source(&prefix).1), release);
+        touch(&debug, 3_000_000);
+        assert_eq!(Path::new(&local::discover_source(&prefix).1), debug);
+
+        // A neighbouring prefix with a similar name is a different tree, not this one.
+        let sibling = source.join("stage/sdk-old");
+        std::fs::create_dir_all(&sibling).unwrap();
+        assert_eq!(
+            local::discover_source(&sibling).1,
+            "",
+            "no manifest names this prefix, so no build may be claimed for it"
+        );
 
         std::fs::remove_dir_all(&base).ok();
     }
@@ -715,6 +1594,31 @@ fn prefer_system_vulkan(sdk_root: &Path) {
 /// The published SDK does not carry one (the framework's CMake install does not emit it), so
 /// the Hub derives it from the tree instead of hardcoding paths that a rename would break.
 /// A release that *does* ship its own manifest is left untouched — it is the better authority.
+/// Describe an unpacked SDK tree by inspecting it, without writing anything.
+///
+/// Shared by the release path (which then persists the result) and by locally-registered SDKs,
+/// where nothing is written at all — a `cmake --install` prefix belongs to the user, and a
+/// framework.json the Hub dropped into it would linger and go stale the moment they re-point the
+/// registration at a different version.
+///
+/// Doubles as the validity check for a directory the user picked: a tree with no runtime, or no
+/// `*Config.cmake`, is not an SDK, and this is what says so in those words.
+pub fn describe_tree(
+    root: &Path,
+    name: &str,
+    version: &str,
+    platform: &str,
+) -> Result<FrameworkManifest, String> {
+    Ok(FrameworkManifest {
+        name: name.to_string(),
+        version: version.to_string(),
+        platform: platform.to_string(),
+        runtime: find_runtime(root)?,
+        cmake_dir: find_cmake_dir(root)?,
+        vcpkg_baseline: String::new(),
+    })
+}
+
 fn write_manifest(
     root: &Path,
     version: &str,
@@ -730,17 +1634,9 @@ fn write_manifest(
         .split("-sdk-")
         .next()
         .filter(|s| !s.is_empty())
-        .unwrap_or("koral")
-        .to_string();
+        .unwrap_or("koral");
 
-    let manifest = FrameworkManifest {
-        name,
-        version: version.to_string(),
-        platform: platform.to_string(),
-        runtime: find_runtime(root)?,
-        cmake_dir: find_cmake_dir(root)?,
-        vcpkg_baseline: String::new(),
-        };
+    let manifest = describe_tree(root, name, version, platform)?;
 
     let text = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
     std::fs::write(root.join("framework.json"), text)

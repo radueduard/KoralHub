@@ -8,6 +8,7 @@ mod framework;
 mod git;
 mod ide;
 mod model;
+mod modules;
 mod paths;
 mod project;
 mod scaffold;
@@ -101,6 +102,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::list_recent_projects,
+            commands::project_details,
             commands::create_project,
             commands::import_project,
             commands::remove_project,
@@ -128,11 +130,16 @@ pub fn run() {
             commands::installed_ides,
             commands::open_in_ide,
             commands::project_config,
+            commands::available_modules,
             commands::save_project_config,
             commands::installed_frameworks,
             commands::available_frameworks,
             commands::install_framework,
             commands::uninstall_framework,
+            commands::add_local_framework,
+            commands::remove_local_framework,
+            commands::set_framework_source,
+            commands::detect_framework_source,
             commands::ensure_framework,
             commands::build_project,
             commands::run_project,

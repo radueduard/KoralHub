@@ -14,13 +14,6 @@ use crate::framework;
 use crate::ide;
 use crate::paths;
 
-/// The framework version a project targets when nothing else says otherwise.
-///
-/// Only a last resort: [`Settings::framework_version`] prefers what the user picked, then the
-/// newest SDK actually installed on this machine, and falls back to this only on a fresh install
-/// with nothing to go on.
-const FALLBACK_FRAMEWORK_VERSION: &str = "0.0.3";
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -28,7 +21,7 @@ pub struct Settings {
     pub project_location: String,
     /// `Ide::id` of the editor to open projects with. Empty → the first one detected.
     pub default_ide: String,
-    /// Framework version new projects target. Empty → newest installed, else the fallback.
+    /// Framework version new projects target. Empty → the newest the Hub can find.
     pub default_framework_version: String,
     /// Linux only: windowing backend a launched app should use — `"wayland"`, `"x11"`, or empty for
     /// the session default. Ignored on other platforms.
@@ -76,18 +69,41 @@ impl Settings {
             .cloned()
     }
 
-    /// The framework version a new project should target.
+    /// The framework version a new project should target: the newest framework this machine can
+    /// reach, or its source build.
     ///
-    /// Prefers an explicit choice; otherwise the newest SDK already on this machine, so a new
-    /// project builds without a download. `framework::installed` sorts newest-first.
-    pub fn framework_version(&self) -> String {
+    /// In order: an explicit choice; a build from source, because registering one is a deliberate
+    /// act and a machine that has one is being used to work on the framework itself — new projects
+    /// there should track that working tree rather than pin a release it is ahead of; the newest
+    /// release already installed here, so the first build needs no download (`framework::installed`
+    /// sorts those newest-first); and finally the newest release published for this platform, which
+    /// the first build fetches on demand.
+    ///
+    /// `None` when this machine has no framework at all and the release list cannot be reached
+    /// (offline, or rate-limited). There is no honest default to invent there, and a made-up
+    /// version would only fail later, at build time, with a worse message than the caller can give
+    /// now.
+    pub fn framework_version(&self) -> Option<String> {
         if !self.default_framework_version.trim().is_empty() {
-            return self.default_framework_version.clone();
+            return Some(self.default_framework_version.clone());
         }
-        framework::installed()
-            .first()
-            .map(|f| f.version.clone())
-            .unwrap_or_else(|| FALLBACK_FRAMEWORK_VERSION.to_string())
+
+        // `installed` puts source builds first, then releases newest-first, so this is "source if
+        // there is one, else the newest release on disk" in a single step.
+        let installed = framework::installed();
+        if let Some(framework) = installed.first() {
+            return Some(framework.version.clone());
+        }
+
+        // Drafts are skipped: one is unpublished by definition, and its asset 404s for anyone
+        // without a token. A pre-release is offered only when it is the newest thing there is —
+        // for a framework still in 0.x that may be every release it has.
+        let releases = framework::available().ok()?;
+        releases
+            .iter()
+            .find(|r| !r.draft && !r.prerelease)
+            .or_else(|| releases.iter().find(|r| !r.draft))
+            .map(|r| r.version.clone())
     }
 }
 

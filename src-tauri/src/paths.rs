@@ -24,6 +24,13 @@ pub fn recent_projects_file() -> PathBuf {
     data_dir().join("recent_projects.json")
 }
 
+/// Per-machine index of locally-built SDKs the user has registered by path — framework installs
+/// that did not come from a release. Paths and version labels only; the trees themselves stay
+/// wherever the user installed them and are never copied or modified.
+pub fn local_frameworks_file() -> PathBuf {
+    data_dir().join("local_frameworks.json")
+}
+
 /// Per-machine list of subscribed lab-collection URLs. URLs only — the manifests they point at
 /// are fetched live on each open, so a course can revise its labs after students subscribe.
 pub fn collections_file() -> PathBuf {
