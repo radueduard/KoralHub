@@ -280,6 +280,13 @@ impl Default for Window {
     }
 }
 
+/// An external package the project's own source needs, and how CMake gets at it.
+///
+/// The port name alone is not enough to *use* a library: `nlohmann-json` is found as
+/// `nlohmann_json` and linked as `nlohmann_json::nlohmann_json`, and there is no rule that derives
+/// one from the other. So the CMake names travel with the project rather than being looked up on
+/// whichever machine happens to be building — the Hub fills them in from the port's `usage` file
+/// when it is added, and they stay editable for the ports that ship no usage file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Library {
@@ -288,6 +295,38 @@ pub struct Library {
     pub min_version: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
+    /// What `find_package()` is called with.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<String>,
+    /// What `target_link_libraries()` is given, verbatim — a name, or a generator expression the
+    /// port recommends. Legitimately empty for a header-only port that exposes only an include
+    /// directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
+}
+
+impl Library {
+    /// The packages to find. Falls back to the port name for a project written before these
+    /// fields existed, or edited by hand — a guess, but a better one than emitting nothing and
+    /// leaving the build to fail on a missing header instead of a named package.
+    pub fn cmake_packages(&self) -> Vec<String> {
+        if self.packages.is_empty() {
+            vec![self.vcpkg_port.clone()]
+        } else {
+            self.packages.clone()
+        }
+    }
+
+    /// The targets to link. Empty stays empty *only* when the project says so explicitly — a
+    /// header-only port is a real case, but so is an old entry that predates the field, and the
+    /// two are told apart by whether `packages` was recorded alongside.
+    pub fn cmake_targets(&self) -> Vec<String> {
+        if self.packages.is_empty() && self.targets.is_empty() {
+            vec![format!("{}::{}", self.vcpkg_port, self.vcpkg_port)]
+        } else {
+            self.targets.clone()
+        }
+    }
 }
 
 #[cfg(test)]

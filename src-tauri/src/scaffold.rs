@@ -29,6 +29,11 @@ pub fn build_dir_name(profile: &str) -> String {
 
 /// (Re)generate CMakeLists.txt, CMakePresets.json and — only when the project actually needs
 /// vcpkg — vcpkg.json.
+///
+/// `profile` is the *active* one: the configuration ▶ builds, and the one an IDE opens on. Presets
+/// and run configurations are written for **every** profile in [`project::PROFILES`] regardless, so
+/// switching to Release in the Hub — or picking it from CLion's own profile list — needs no
+/// regeneration and cannot land on a preset that does not exist.
 pub fn generate(
     project_root: &Path,
     cfg: &ProjectConfig,
@@ -39,7 +44,7 @@ pub fn generate(
     let modules = crate::modules::build_inputs(&cfg.modules, sdk_root);
     write(
         project_root.join("CMakeLists.txt"),
-        &cmakelists(&cfg.name, &modules.sdk_targets),
+        &cmakelists(project_root, &cfg.name, &modules.sdk_targets, &cfg.libraries),
     )?;
 
     let vcpkg = vcpkg_toolchain(cfg)?;
@@ -60,14 +65,17 @@ pub fn generate(
         &presets_json(
             sdk_root,
             manifest,
-            profile,
             vcpkg.as_deref(),
             &runtime,
             &generator,
             &modules.include_dirs,
         ),
     )?;
-    clear_foreign_build_dir(project_root, profile, &generator);
+    // Every profile has a build tree of its own, and any of them can have been configured by
+    // another generator before one was pinned.
+    for p in crate::project::PROFILES {
+        clear_foreign_build_dir(project_root, p, &generator);
+    }
 
     ide_configs(project_root, cfg, profile, &runtime, sdk_root)?;
     Ok(())
@@ -159,14 +167,18 @@ fn ide_configs(
         write(properties, &vscode_cpp_properties(profile, &sources, sdk_root))?;
     }
 
+    // One CLion run configuration per profile, so its Run/Debug dropdown offers the same set the
+    // Hub does rather than the single Debug entry it used to get.
     let clion = project_root.join(".idea").join("runConfigurations");
     std::fs::create_dir_all(&clion).map_err(|e| e.to_string())?;
-    write(
-        clion.join(format!("Koral_{profile}.xml")),
-        &clion_run_config(cfg, profile, runtime),
-    )?;
-    // The run configuration alone is not enough: it names a CMake profile, and CLion has to be
-    // building with that profile rather than one it invented for itself.
+    for p in crate::project::PROFILES {
+        write(
+            clion.join(format!("Koral_{p}.xml")),
+            &clion_run_config(cfg, p, runtime),
+        )?;
+    }
+    // The run configurations alone are not enough: each names a CMake profile, and CLion has to
+    // have those profiles rather than ones it invented for itself.
     write_clion_profile(project_root, profile)?;
 
     // `/.koral/` is in the template a fresh project gets, but a project scaffolded before the
@@ -261,27 +273,26 @@ fn ensure_ignored(project_root: &Path, rules: &[&str]) -> Result<(), String> {
 /// **vcpkg is opt-in, and opting in is the project's call, not the SDK's.** A project that
 /// declares no `libraries` needs no package manager: the SDK vendors everything its public
 /// headers expose and hands it over through `Koral::Koral`. Then no `vcpkg.json` and no
-/// `CMAKE_TOOLCHAIN_FILE` are written, and vcpkg need not be installed at all.
+/// `CMAKE_TOOLCHAIN_FILE` are written, and vcpkg is not consulted at all.
 ///
-/// Only a project naming extra ports pulls vcpkg in — and only then is `VCPKG_ROOT` genuinely
-/// required, reported here with the ports that caused it, rather than surfacing later as CMake
-/// failing to find `/scripts/buildsystems/vcpkg.cmake` (what an unset `$env{VCPKG_ROOT}` expands
-/// to) with no hint as to why vcpkg was involved.
+/// Only a project naming extra ports pulls vcpkg in, and it comes from the Hub's own checkout —
+/// nothing to install by hand, and no `VCPKG_ROOT` to set. The one case that fails is a checkout
+/// that is not there yet (first run, still cloning, or a clone that failed offline), reported here
+/// with the ports that caused it rather than surfacing later as CMake failing to find a toolchain
+/// file with no hint as to why vcpkg was involved at all.
 fn vcpkg_toolchain(cfg: &ProjectConfig) -> Result<Option<String>, String> {
     if cfg.libraries.is_empty() {
         return Ok(None);
     }
     let ports: Vec<&str> = cfg.libraries.iter().map(|l| l.vcpkg_port.as_str()).collect();
-    let root = std::env::var("VCPKG_ROOT").map_err(|_| {
+    let toolchain = crate::vcpkg::toolchain_file().ok_or_else(|| {
         format!(
-            "this project needs vcpkg for {}, but VCPKG_ROOT is not set — install vcpkg and point \
-             VCPKG_ROOT at it, or remove those libraries from koral.json",
+            "this project needs vcpkg for {}, but the Hub's vcpkg checkout is not ready yet — \
+             open Libraries in the project's settings to fetch it (or remove those libraries)",
             ports.join(", ")
         )
     })?;
-    Ok(Some(cmake_path(
-        &Path::new(&root).join("scripts/buildsystems/vcpkg.cmake"),
-    )))
+    Ok(Some(cmake_path(&toolchain)))
 }
 
 fn write(path: std::path::PathBuf, contents: &str) -> Result<(), String> {
@@ -299,7 +310,12 @@ fn cmake_path(p: &Path) -> String {
 /// go in *this* file rather than the preset because a target name is portable: it means the same
 /// thing on every machine, and a machine whose SDK lacks one should fail loudly rather than build
 /// a library that cannot load.
-fn cmakelists(name: &str, sdk_module_targets: &[String]) -> String {
+fn cmakelists(
+    project_root: &Path,
+    name: &str,
+    sdk_module_targets: &[String],
+    libraries: &[crate::model::Library],
+) -> String {
     let links = if sdk_module_targets.is_empty() {
         String::new()
     } else {
@@ -311,36 +327,135 @@ fn cmakelists(name: &str, sdk_module_targets: &[String]) -> String {
             sdk_module_targets.join("\n    ")
         )
     };
+
+    let (packages, library_links) = library_cmake(project_root, name, libraries);
+
     CMAKELISTS_TEMPLATE
         .replace("{MODULE_LINKS}", &links)
+        .replace("{LIBRARY_PACKAGES}", &packages)
+        .replace("{LIBRARY_LINKS}", &library_links)
         .replace("{NAME}", name)
 }
 
-/// VS Code build/run tasks. Portable — they drive the CMake preset and name no absolute path,
-/// so this file is safe to commit and works on a teammate's machine.
-fn vscode_tasks(profile: &str) -> String {
-    let doc = json!({
-        "version": "2.0.0",
-        "tasks": [
-            {
-                "label": "Koral: Build",
-                "type": "shell",
-                "command": "cmake",
-                "args": ["--build", "--preset", profile],
-                "group": { "kind": "build", "isDefault": true },
-                "problemMatcher": ["$gcc"]
-            },
-            {
-                // Builds the scene library, then launches it in the SDK runtime. The `run`
-                // target is defined by the generated CMakeLists.
-                "label": "Koral: Run",
-                "type": "shell",
-                "command": "cmake",
-                "args": ["--build", "--preset", profile, "--target", "run"],
-                "problemMatcher": ["$gcc"]
+/// The `find_package` and `target_link_libraries` lines for the project's declared libraries.
+///
+/// Installing a port is only half of using it — without these, vcpkg fetches and builds the
+/// package and the project still cannot include a header from it. The names come from the project
+/// (see [`crate::model::Library`]), because there is no rule that derives `nlohmann_json` from the
+/// port called `nlohmann-json`.
+///
+/// Returns `(find_package block, link block)`; both empty when the project declares no libraries,
+/// which is the common case and leaves the file exactly as it was before.
+/// The CMake package and link names for one library, in descending order of authority:
+///
+/// 1. what the project records — the user's answer, including any correction they have made;
+/// 2. the port's own `usage` file, for a project that records nothing (written before the fields
+///    existed, or by hand). Upstream's curated recommendation, and what keeps `entt` from being
+///    asked for as `entt` when the config it installs is `EnTTConfig.cmake`;
+/// 3. what vcpkg actually installed into one of this project's build trees, which is not a guess
+///    at all but is only there after a configure has run — this is what eventually gets `glfw3`
+///    right, whose target is plainly `glfw`;
+/// 4. the port name, which is all that is left and is right often enough to be worth emitting.
+fn resolve_library(project_root: &Path, library: &crate::model::Library) -> (Vec<String>, Vec<String>) {
+    if !library.packages.is_empty() {
+        return (library.packages.clone(), library.targets.clone());
+    }
+    if let Some(found) = crate::vcpkg::cmake_names(&library.vcpkg_port) {
+        return found;
+    }
+    if let Some(found) = crate::vcpkg::installed_cmake_names(project_root, &library.vcpkg_port) {
+        return found;
+    }
+    (library.cmake_packages(), library.cmake_targets())
+}
+
+fn library_cmake(
+    project_root: &Path,
+    name: &str,
+    libraries: &[crate::model::Library],
+) -> (String, String) {
+    if libraries.is_empty() {
+        return (String::new(), String::new());
+    }
+
+    // Two ports can be found through one package, and `find_package` twice is noise at best.
+    let mut packages: Vec<String> = Vec::new();
+    let mut targets: Vec<String> = Vec::new();
+    for library in libraries {
+        let (found, linked) = resolve_library(project_root, library);
+        for package in found {
+            if !packages.contains(&package) {
+                packages.push(package);
             }
-        ]
-    });
+        }
+        for target in linked {
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+    }
+
+    let mut find = String::from(
+        "\n# External packages this project declares under \"libraries\" in koral.json, resolved by\n\
+         # vcpkg through the toolchain file the generated preset sets. Edit the list there — this\n\
+         # file is regenerated from it on every build.\n",
+    );
+    for package in &packages {
+        find.push_str(&format!("find_package({package} CONFIG REQUIRED)\n"));
+    }
+
+    // A port can legitimately have nothing to link — a header-only package that exposes only an
+    // include directory — in which case finding it is the whole job.
+    let link = if targets.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\ntarget_link_libraries({name} PRIVATE\n    {})\n",
+            targets.join("\n    ")
+        )
+    };
+    (find, link)
+}
+
+/// The task and launch-configuration label for one profile. Suffixed even for Debug, so the list
+/// reads as a set of equals rather than "the one" plus some alternatives.
+fn labelled(what: &str, profile: &str) -> String {
+    format!("Koral: {what} ({profile})")
+}
+
+/// VS Code build/run tasks — a pair per profile. Portable: they drive the CMake presets and name
+/// no absolute path, so this file is safe to commit and works on a teammate's machine.
+///
+/// `active` is the profile the Hub is currently set to, and its build task is the one Ctrl+Shift+B
+/// runs. Only that differs between machines, and it costs nothing if it disagrees — the other
+/// tasks are all still there to pick from.
+fn vscode_tasks(active: &str) -> String {
+    let mut tasks: Vec<Value> = Vec::new();
+    for profile in crate::project::PROFILES {
+        let mut build = serde_json::Map::new();
+        build.insert("label".into(), json!(labelled("Build", profile)));
+        build.insert("type".into(), json!("shell"));
+        build.insert("command".into(), json!("cmake"));
+        build.insert("args".into(), json!(["--build", "--preset", profile]));
+        build.insert("problemMatcher".into(), json!(["$gcc"]));
+        build.insert(
+            "group".into(),
+            json!({ "kind": "build", "isDefault": *profile == active }),
+        );
+        tasks.push(Value::Object(build));
+
+        // Builds the scene library, then launches it in the SDK runtime. The `run` target is
+        // defined by the generated CMakeLists.
+        tasks.push(json!({
+            "label": labelled("Run", profile),
+            "type": "shell",
+            "command": "cmake",
+            "args": ["--build", "--preset", profile, "--target", "run"],
+            "problemMatcher": ["$gcc"]
+        }));
+    }
+
+    let doc = json!({ "version": "2.0.0", "tasks": tasks });
     serde_json::to_string_pretty(&doc).unwrap_or_default()
 }
 
@@ -359,14 +474,20 @@ fn vscode_tasks(profile: &str) -> String {
 /// Portable: paths are relative to `${workspaceFolder}`, so this file is committed.
 fn vscode_settings(profile: &str) -> String {
     let build_dir = build_dir_name(profile);
+    // Every profile has a build tree, and all of them are large and machine-local; indexing or
+    // searching any of them is pure noise. Only the active one's compile database is read.
+    let mut excluded = serde_json::Map::new();
+    for p in crate::project::PROFILES {
+        excluded.insert(build_dir_name(p), json!(true));
+    }
+
     let doc = json!({
         "cmake.useCMakePresets": "always",
         "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
         "C_Cpp.default.compileCommands":
             format!("${{workspaceFolder}}/{build_dir}/compile_commands.json"),
         "C_Cpp.default.cppStandard": "c++23",
-        // The build tree is large and machine-local; indexing or searching it is pure noise.
-        "files.exclude": { format!("{build_dir}"): true }
+        "files.exclude": Value::Object(excluded)
     });
     serde_json::to_string_pretty(&doc).unwrap_or_default()
 }
@@ -378,10 +499,33 @@ fn vscode_settings(profile: &str) -> String {
 /// crash inside the framework or a module land on the line that failed rather than on an address.
 fn vscode_launch(
     cfg: &ProjectConfig,
-    profile: &str,
+    active: &str,
     runtime: &Path,
     gdb_script: Option<&str>,
 ) -> String {
+    // One configuration per profile, the active one first so it is what the Run panel preselects.
+    let mut order: Vec<&str> = vec![active];
+    order.extend(
+        crate::project::PROFILES
+            .iter()
+            .copied()
+            .filter(|p| *p != active),
+    );
+    let configs: Vec<Value> = order
+        .iter()
+        .map(|profile| launch_config(cfg, profile, runtime, gdb_script))
+        .collect();
+
+    let doc = json!({ "version": "0.2.0", "configurations": configs });
+    serde_json::to_string_pretty(&doc).unwrap_or_default()
+}
+
+fn launch_config(
+    cfg: &ProjectConfig,
+    profile: &str,
+    runtime: &Path,
+    gdb_script: Option<&str>,
+) -> Value {
     let build_dir = build_dir_name(profile);
     let lib = format!(
         "${{workspaceFolder}}/{build_dir}/{}",
@@ -393,13 +537,13 @@ fn vscode_launch(
 
     // cppvsdbg is MSVC-only and takes no MIMode; cppdbg drives gdb/lldb everywhere else.
     let mut config = serde_json::Map::new();
-    config.insert("name".into(), json!(format!("Koral: Debug {}", cfg.name)));
+    config.insert("name".into(), json!(labelled(&cfg.name, profile)));
     config.insert("request".into(), json!("launch"));
     config.insert("program".into(), json!(cmake_path(runtime)));
     config.insert("args".into(), json!(args));
     config.insert("cwd".into(), json!("${workspaceFolder}"));
     config.insert("stopAtEntry".into(), json!(false));
-    config.insert("preLaunchTask".into(), json!("Koral: Build"));
+    config.insert("preLaunchTask".into(), json!(labelled("Build", profile)));
     if cfg!(windows) {
         config.insert("type".into(), json!("cppvsdbg"));
     } else {
@@ -432,8 +576,7 @@ fn vscode_launch(
         }
     }
 
-    let doc = json!({ "version": "0.2.0", "configurations": [config] });
-    serde_json::to_string_pretty(&doc).unwrap_or_default()
+    Value::Object(config)
 }
 
 /// IntelliSense configuration naming the *external* sources this project debugs into — the
@@ -576,21 +719,28 @@ fn write_clion_profile(project_root: &Path, profile: &str) -> Result<(), String>
 const EMPTY_WORKSPACE: &str =
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<project version=\"4\">\n</project>";
 
-/// The CMake profile list: ours enabled, CLion's own default switched off.
+/// The CMake profile list: every preset-derived profile enabled, CLion's own defaults switched off.
 ///
-/// The plain profile is named rather than dropped on purpose — leaving it out is not how CLion
-/// records "off", and it would simply be recreated, enabled, on the next reload.
-fn clion_cmake_settings(profile: &str) -> String {
+/// The plain profiles are named rather than dropped on purpose — leaving one out is not how CLion
+/// records "off", and it would simply be recreated, enabled, on the next reload, generating into
+/// the very build directory the matching preset owns.
+fn clion_cmake_settings(_active: &str) -> String {
+    let mut rows = String::new();
+    for profile in crate::project::PROFILES {
+        rows.push_str(&format!(
+            "      <configuration PROFILE_NAME=\"{profile}\" ENABLED=\"false\" CONFIG_NAME=\"{profile}\" />\n",
+            profile = xml_attr(profile),
+        ));
+    }
+    for profile in crate::project::PROFILES {
+        rows.push_str(&format!(
+            "      <configuration PROFILE_NAME=\"{preset}\" ENABLED=\"true\" FROM_PRESET=\"true\" GENERATION_DIR=\"$PROJECT_DIR$/{build_dir}\" />\n",
+            preset = xml_attr(&clion_profile_name(profile)),
+            build_dir = build_dir_name(profile),
+        ));
+    }
     format!(
-        r#"  <component name="CMakeSettings">
-    <configurations>
-      <configuration PROFILE_NAME="{profile}" ENABLED="false" CONFIG_NAME="{profile}" />
-      <configuration PROFILE_NAME="{preset}" ENABLED="true" FROM_PRESET="true" GENERATION_DIR="$PROJECT_DIR$/{build_dir}" />
-    </configurations>
-  </component>"#,
-        profile = xml_attr(profile),
-        preset = xml_attr(&clion_profile_name(profile)),
-        build_dir = build_dir_name(profile),
+        "  <component name=\"CMakeSettings\">\n    <configurations>\n{rows}    </configurations>\n  </component>"
     )
 }
 
@@ -703,7 +853,54 @@ fn vcpkg_json(cfg: &ProjectConfig, manifest: &FrameworkManifest) -> String {
     serde_json::to_string_pretty(&Value::Object(doc)).unwrap_or_default()
 }
 
+/// One configure + build preset pair per profile, so every configuration the Hub or an IDE can
+/// select is already defined and generates into a build tree of its own.
 fn presets_json(
+    sdk_root: &Path,
+    manifest: &FrameworkManifest,
+    vcpkg_toolchain: Option<&str>,
+    runtime: &Path,
+    generator: &Option<String>,
+    module_includes: &[std::path::PathBuf],
+) -> String {
+    let configure: Vec<Value> = crate::project::PROFILES
+        .iter()
+        .map(|profile| {
+            configure_preset(
+                sdk_root,
+                manifest,
+                profile,
+                vcpkg_toolchain,
+                runtime,
+                generator,
+                module_includes,
+            )
+        })
+        .collect();
+
+    let build: Vec<Value> = crate::project::PROFILES
+        .iter()
+        .map(|profile| {
+            json!({
+                "name": profile,
+                "configurePreset": profile,
+                // Multi-config generators ignore CMAKE_BUILD_TYPE and pick their own default
+                // (Debug), so without this a Release build silently produces Debug binaries.
+                // Single-config generators ignore it in turn, having already baked the type in.
+                "configuration": profile
+            })
+        })
+        .collect();
+
+    let doc = json!({
+        "version": 4,
+        "configurePresets": configure,
+        "buildPresets": build,
+    });
+    serde_json::to_string_pretty(&doc).unwrap_or_default()
+}
+
+fn configure_preset(
     sdk_root: &Path,
     manifest: &FrameworkManifest,
     profile: &str,
@@ -711,7 +908,7 @@ fn presets_json(
     runtime: &Path,
     generator: &Option<String>,
     module_includes: &[std::path::PathBuf],
-) -> String {
+) -> Value {
     let sdk_cmake = cmake_path(&sdk_root.join(&manifest.cmake_dir));
     let build_dir = build_dir_name(profile);
 
@@ -766,20 +963,7 @@ fn presets_json(
         configure.insert("generator".into(), json!(generator));
     }
     configure.insert("cacheVariables".into(), Value::Object(cache));
-
-    let doc = json!({
-        "version": 4,
-        "configurePresets": [configure],
-        "buildPresets": [{
-            "name": profile,
-            "configurePreset": profile,
-            // Multi-config generators ignore CMAKE_BUILD_TYPE and pick their own default
-            // (Debug), so without this a Release build silently produces Debug binaries.
-            // Single-config generators ignore it in turn, having already baked the type in.
-            "configuration": profile
-        }]
-    });
-    serde_json::to_string_pretty(&doc).unwrap_or_default()
+    Value::Object(configure)
 }
 
 #[cfg(test)]
@@ -797,12 +981,11 @@ mod tests {
         }
     }
 
-    fn presets(profile: &str) -> Value {
+    fn presets() -> Value {
         let sdk = Path::new("/sdk");
         let text = presets_json(
             sdk,
             &manifest(),
-            profile,
             None,
             &sdk.join("bin/Koral_Runtime.exe"),
             &None,
@@ -811,16 +994,50 @@ mod tests {
         serde_json::from_str(&text).expect("presets must be valid JSON")
     }
 
-    /// Multi-config generators (Visual Studio, and what Windows falls back to without Ninja)
-    /// ignore CMAKE_BUILD_TYPE, so the build preset has to name the configuration itself or a
-    /// Release build quietly produces Debug binaries.
+    /// The cache variables of one profile's configure preset.
+    fn cache_of(profile: &str) -> Value {
+        let doc = presets();
+        let found = doc["configurePresets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == json!(profile))
+            .unwrap_or_else(|| panic!("no configure preset named {profile}"))
+            .clone();
+        found["cacheVariables"].clone()
+    }
+
+    /// Every profile the Hub lets a project be built in has to have a preset pair, or selecting it
+    /// lands on `cmake --preset Release` with nothing defining Release — the failure the single-
+    /// profile scaffolding produced the moment anything but Debug was asked for.
     #[test]
-    fn the_build_preset_names_its_configuration() {
-        for profile in ["Debug", "Release"] {
+    fn every_profile_gets_a_configure_and_build_preset() {
+        let doc = presets();
+        for profile in crate::project::PROFILES {
+            let configure = doc["configurePresets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == json!(profile))
+                .unwrap_or_else(|| panic!("no configure preset for {profile}"));
+            assert_eq!(configure["cacheVariables"]["CMAKE_BUILD_TYPE"], json!(profile));
             assert_eq!(
-                presets(profile)["buildPresets"][0]["configuration"], profile,
-                "{profile}"
+                configure["binaryDir"],
+                json!(format!("${{sourceDir}}/{}", build_dir_name(profile))),
+                "{profile} must build in a tree of its own, or two profiles fight over one cache"
             );
+
+            let build = doc["buildPresets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == json!(profile))
+                .unwrap_or_else(|| panic!("no build preset for {profile}"));
+            // Multi-config generators (Visual Studio, and what Windows falls back to without
+            // Ninja) ignore CMAKE_BUILD_TYPE, so the build preset has to name the configuration
+            // itself or a Release build quietly produces Debug binaries.
+            assert_eq!(build["configuration"], json!(profile));
+            assert_eq!(build["configurePreset"], json!(profile));
         }
     }
 
@@ -828,11 +1045,64 @@ mod tests {
     /// refuses to mix CRTs — a Debug build defaulting to /MDd fails with LNK2038.
     #[test]
     fn windows_pins_the_release_msvc_runtime() {
-        let cache = presets("Debug")["configurePresets"][0]["cacheVariables"].clone();
+        let cache = cache_of("Debug");
         if cfg!(windows) {
             assert_eq!(cache["CMAKE_MSVC_RUNTIME_LIBRARY"], "MultiThreadedDLL");
         } else {
             assert!(cache.get("CMAKE_MSVC_RUNTIME_LIBRARY").is_none());
+        }
+    }
+
+    /// Picking a profile has to reach the IDEs too, or the Hub says Release and CLion's dropdown
+    /// still offers only Debug. Every profile gets a run configuration and a launch entry, and the
+    /// active one is what each IDE preselects.
+    #[test]
+    fn the_ides_are_offered_every_profile() {
+        let cfg = ProjectConfig::new("Game", "source", [0.5, 0.5, 0.5], crate::model::Kind::Scene);
+        let runtime = Path::new("/sdk/bin/Koral_Runtime");
+
+        let launch: Value =
+            serde_json::from_str(&vscode_launch(&cfg, "Release", runtime, None)).unwrap();
+        let names: Vec<String> = launch["configurations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        for profile in crate::project::PROFILES {
+            assert!(names.contains(&format!("Koral: Game ({profile})")), "{names:?}");
+        }
+        assert_eq!(names[0], "Koral: Game (Release)", "the active profile comes first");
+        assert_eq!(
+            launch["configurations"][0]["preLaunchTask"],
+            json!("Koral: Build (Release)"),
+            "each configuration must build the profile it launches"
+        );
+
+        let tasks: Value = serde_json::from_str(&vscode_tasks("Release")).unwrap();
+        let default_build: Vec<&Value> = tasks["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["group"]["isDefault"] == json!(true))
+            .collect();
+        assert_eq!(default_build.len(), 1);
+        assert_eq!(default_build[0]["label"], json!("Koral: Build (Release)"));
+
+        // CLion: every preset profile on, every profile it would invent for itself off.
+        let settings = clion_cmake_settings("Release");
+        for profile in crate::project::PROFILES {
+            assert!(
+                settings.contains(&format!(
+                    r#"PROFILE_NAME="{}" ENABLED="true""#,
+                    clion_profile_name(profile)
+                )),
+                "{settings}"
+            );
+            assert!(
+                settings.contains(&format!(r#"PROFILE_NAME="{profile}" ENABLED="false""#)),
+                "{settings}"
+            );
         }
     }
 
@@ -1017,7 +1287,7 @@ mod tests {
     /// build rather than loading and dying on an undefined symbol.
     #[test]
     fn only_checked_modules_reach_the_build() {
-        let none = cmakelists("Game", &[]);
+        let none = cmakelists(Path::new("/nonexistent"), "Game", &[], &[]);
         assert!(
             !none.contains("Koral::koral-camera"),
             "a project that checked no modules must link none: {none}"
@@ -1026,7 +1296,7 @@ mod tests {
         // sets nothing and the guard leaves its include path alone.
         assert!(none.contains("if(KORAL_MODULE_INCLUDES)"));
 
-        let checked = cmakelists("Game", &["Koral::koral-camera".into(), "Koral::koral-mesh".into()]);
+        let checked = cmakelists(Path::new("/nonexistent"), "Game", &["Koral::koral-camera".into(), "Koral::koral-mesh".into()], &[]);
         assert!(checked.contains("Koral::koral-camera"), "{checked}");
         assert!(checked.contains("Koral::koral-mesh"), "{checked}");
         // The project's own library must still be the thing being linked into.
@@ -1038,7 +1308,6 @@ mod tests {
         let text = presets_json(
             sdk,
             &manifest(),
-            "Debug",
             None,
             &sdk.join("bin/Koral_Runtime.exe"),
             &None,
@@ -1055,10 +1324,87 @@ mod tests {
         );
 
         // Nothing checked, nothing set — not an empty variable that would defeat the guard.
-        let bare = presets("Debug");
-        assert!(bare["configurePresets"][0]["cacheVariables"]
-            .get("KORAL_MODULE_INCLUDES")
-            .is_none());
+        assert!(cache_of("Debug").get("KORAL_MODULE_INCLUDES").is_none());
+    }
+
+    /// Declaring a library has to reach the *build*, not just vcpkg. Installing a port and then
+    /// never calling `find_package` for it leaves the package built and unusable — the project
+    /// fails on a missing header, with nothing pointing at the library that was supposedly added.
+    #[test]
+    fn declared_libraries_are_found_and_linked() {
+        let library = |port: &str, packages: &[&str], targets: &[&str]| crate::model::Library {
+            vcpkg_port: port.into(),
+            min_version: String::new(),
+            features: Vec::new(),
+            packages: packages.iter().map(|s| s.to_string()).collect(),
+            targets: targets.iter().map(|s| s.to_string()).collect(),
+        };
+
+        let text = cmakelists(
+            Path::new("/nonexistent"),
+            "Game",
+            &[],
+            &[
+                library("nlohmann-json", &["nlohmann_json"], &["nlohmann_json::nlohmann_json"]),
+                library("entt", &["EnTT"], &["EnTT::EnTT"]),
+            ],
+        );
+
+        // The CMake package name, not the port name — deriving one from the other is exactly what
+        // cannot be done, which is why the project records it.
+        assert!(text.contains("find_package(nlohmann_json CONFIG REQUIRED)"), "{text}");
+        assert!(text.contains("find_package(EnTT CONFIG REQUIRED)"), "{text}");
+        assert!(!text.contains("find_package(nlohmann-json"), "{text}");
+
+        // Linked into the project's own library, alongside Koral rather than instead of it.
+        assert!(
+            text.contains(
+                "target_link_libraries(Game PRIVATE\n    nlohmann_json::nlohmann_json\n    EnTT::EnTT)"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("target_link_libraries(${PROJECT_NAME} PRIVATE Koral::Koral)"), "{text}");
+
+        // A header-only port that exposes only an include directory has a package and nothing to
+        // link; emitting an empty link line would be a CMake error.
+        let headers = cmakelists(Path::new("/nonexistent"), "Game", &[], &[library("stb", &["Stb"], &[])]);
+        assert!(headers.contains("find_package(Stb CONFIG REQUIRED)"), "{headers}");
+        assert!(
+            !headers.contains("target_link_libraries(Game PRIVATE\n    )"),
+            "an empty link list must not be emitted: {headers}"
+        );
+
+        // A project written before these fields existed still has to build something sensible
+        // rather than silently contributing nothing. (With a port tree present it does better than
+        // this — see `resolve_library` — but the name is the floor.)
+        let old = cmakelists(Path::new("/nonexistent"), "Game", &[], &[library("fmt", &[], &[])]);
+        assert!(old.contains("find_package(fmt CONFIG REQUIRED)"), "{old}");
+        assert!(old.contains("fmt::fmt"), "{old}");
+
+        // And the overwhelmingly common case — no libraries — leaves the file exactly as it was.
+        let none = cmakelists(Path::new("/nonexistent"), "Game", &[], &[]);
+        assert!(!none.contains("find_package(Koral CONFIG REQUIRED)\n\n#"), "{none}");
+        assert!(!none.contains("koral.json, resolved by"), "{none}");
+    }
+
+    /// Materialise the build files for a real project folder, so the generated CMake can be run
+    /// against a real SDK and a real vcpkg rather than only asserted on as strings.
+    ///
+    /// Ignored: it needs a framework registered on this machine, and configuring it makes vcpkg
+    /// fetch and build whatever the project declares. Run it with
+    /// `cargo test -- --ignored generate_into -- <project-dir>`-style intent by setting
+    /// `KORAL_SCAFFOLD_TARGET` to the project folder.
+    #[test]
+    #[ignore]
+    fn generate_into_a_real_project() {
+        let root = std::path::PathBuf::from(
+            std::env::var("KORAL_SCAFFOLD_TARGET").expect("set KORAL_SCAFFOLD_TARGET"),
+        );
+        let cfg = crate::project::load(&root).expect("a koral.json to scaffold from");
+        let (sdk_root, manifest) =
+            crate::framework::resolve(&cfg.framework_version).expect("a resolvable framework");
+        generate(&root, &cfg, &sdk_root, &manifest, "Debug").expect("scaffolding should generate");
+        println!("generated against {}", sdk_root.display());
     }
 
     /// A multi-config generator appends its configuration to the plain output-directory
@@ -1068,7 +1414,7 @@ mod tests {
     #[test]
     fn every_configuration_pins_a_flat_output_directory() {
         let cfg = ProjectConfig::new("KoralProject", "0.0.5", [0.5, 0.5, 0.5], crate::model::Kind::Scene);
-        let text = cmakelists(&cfg.name, &[]);
+        let text = cmakelists(Path::new("/nonexistent"), &cfg.name, &[], &[]);
 
         // The loop the per-config variables are set from must cover every configuration a
         // preset can ask for — a missing one silently reverts to the nested layout.
@@ -1116,14 +1462,14 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 # preset. The imported target is expected to propagate the public glm/imgui/spdlog usage
 # requirements, so consumers don't find or link them explicitly.
 find_package(Koral CONFIG REQUIRED)
-
+{LIBRARY_PACKAGES}
 file(GLOB_RECURSE SOURCE_FILES CONFIGURE_DEPENDS "src/*.cpp" "src/*.c")
 file(GLOB_RECURSE HEADER_FILES CONFIGURE_DEPENDS "src/*.h" "src/*.hpp")
 
 add_library(${PROJECT_NAME} SHARED ${SOURCE_FILES} ${HEADER_FILES})
 
 target_link_libraries(${PROJECT_NAME} PRIVATE Koral::Koral)
-{MODULE_LINKS}
+{LIBRARY_LINKS}{MODULE_LINKS}
 # Headers of the module projects this project checked, set by the generated (machine-local)
 # CMakePresets.json. Unset when none are checked, which is why this is guarded.
 if(KORAL_MODULE_INCLUDES)

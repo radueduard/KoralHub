@@ -47,9 +47,85 @@ src-tauri/
     lib.rs           Tauri builder + command registration
     commands.rs      #[tauri::command] handlers exposed to the UI
     model.rs         portable project schema (koral.json)
+    project.rs       project storage, recent index, build profiles
+    vcpkg.rs         the Hub's own port tree + the library catalogue
   tauri.conf.json    window + bundle config
   capabilities/      webview permissions
 ```
+
+## Getting projects in
+
+Three ways, all under **Import** at the bottom of the sidebar:
+
+- **Import from Git** — clones a repository into your projects folder.
+- **Import a folder** — lists a project that is already on this machine. Nothing is copied, moved or
+  git-initialised; the folder is recorded where it lies, so this is safe to point at work in
+  progress. It only has to contain a `koral.json`.
+- **Add a collection by URL** — subscribes to a published collection.
+
+## Updating from git
+
+Right-click a project or an authored collection → **Update from Git**. This is deliberately an
+**overwrite**: the remote wins outright, so local commits on the branch and edits to tracked files
+are discarded, and there is no merge that can stop half way through a conflict. Files the remote
+does not carry are left alone. For a collection, every entry it checks out moves to the commit the
+refreshed manifest records.
+
+A project downloaded from *someone else's* collection has its history deliberately cut (see
+`collection::download_lab`) and so has no remote to update from — save it to your own git first.
+A subscribed collection has no checkout at all; its manifest is fetched live, and **Refresh from the
+author** re-reads it.
+
+## Build profiles
+
+Every project can be built in `Debug`, `Release`, `RelWithDebInfo` or `MinSizeRel`, chosen from the
+picker beside ▶ in the project header. Each has a preset and a build tree of its own
+(`cmake-build-<profile>/`), so switching costs a rebuild but never disturbs the one you came from.
+
+The choice is machine-local — which configuration you happen to be working in has no business
+travelling inside a project's committed `koral.json`, the same split that keeps `CMakePresets.json`
+out of git.
+
+`CMakePresets.json` carries all four pairs regardless of which is active, and both IDEs are given
+the whole set: CLion gets a run configuration per profile with the matching CMake profile enabled,
+and VS Code gets a build task and a launch configuration per profile. The active one is what each
+preselects.
+
+## Libraries (vcpkg)
+
+Most projects need nothing here: the SDK vendors everything its public headers expose (glm, imgui,
+spdlog, fmt) and hands it over through `Koral::Koral`. A project that declares no libraries gets no
+`vcpkg.json`, no `CMAKE_TOOLCHAIN_FILE`, and never involves vcpkg in its build.
+
+For anything else, **project settings → Libraries → Add library** searches a port catalogue and
+writes the choice (with its features) into `koral.json`. There is nothing to install and no
+`VCPKG_ROOT` to set: the Hub keeps **one vcpkg checkout per machine** under its data directory,
+shallow-cloned in the background on the first run that has no copy, and updated only when you ask it
+to — a port tree that moved under a project between two builds is the kind of surprise this is meant
+to avoid.
+
+If you already maintain your own vcpkg, set `VCPKG_ROOT` and the Hub defers to it entirely rather
+than imposing a second copy.
+
+### The CMake names
+
+Installing a port is only half of using it, so the generated `CMakeLists.txt` also carries the
+`find_package` and `target_link_libraries` lines for it. **The port name is not the CMake name**, and
+nothing derives one from the other — `nlohmann-json` is found as `nlohmann_json`, `entt` as `EnTT`,
+`glfw3` exports a target called plainly `glfw`. So the names are recorded per library in
+`koral.json` and shown, editable, under each entry in the Libraries panel.
+
+The Hub fills them in, in descending order of authority:
+
+1. what the project already records — including any correction you have made;
+2. the port's own `usage` file, which is upstream's recommendation. Only about a fifth of ports
+   ship one, but it covers most of the popular ones;
+3. what vcpkg actually installed into one of the project's build trees — not a guess at all, but
+   only available once a configure has installed the port;
+4. failing all of that, the port name, which the picker marks as **guessed** so it can be checked.
+
+A wrong name fails at `find_package` (or at the link, for a wrong target). Fixing it is one field in
+the Libraries panel; a rebuild also picks up (3) on its own once the port is installed.
 
 ## Working against a framework you built yourself
 

@@ -192,6 +192,85 @@ pub fn remove_recent(path: &Path) -> Result<(), String> {
     save_cache(&cache)
 }
 
+// --- Build profiles (per machine, per project) ----------------------------------------
+
+/// The CMake configurations a project can be built in.
+///
+/// Fixed rather than user-defined, because each one is a CMake build type with meaning to the
+/// compiler — inventing a fifth would produce a build tree with no optimisation or debug flags at
+/// all. The names are spelled exactly as `CMAKE_BUILD_TYPE` takes them, since they are used
+/// verbatim as the preset name, the build directory suffix and the configuration a multi-config
+/// generator selects.
+pub const PROFILES: &[&str] = &["Debug", "Release", "RelWithDebInfo", "MinSizeRel"];
+
+/// The profile a project is built in unless it says otherwise.
+pub const DEFAULT_PROFILE: &str = "Debug";
+
+/// Is this one of the profiles the Hub generates presets for?
+///
+/// Worth checking at every entry point: the string becomes a directory name and a CMake preset
+/// name, so an unknown one produces a confusing CMake failure rather than an answer.
+pub fn is_profile(profile: &str) -> bool {
+    PROFILES.contains(&profile)
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct StateCache {
+    /// Project root -> that project's machine-local state.
+    #[serde(default)]
+    projects: std::collections::BTreeMap<String, ProjectState>,
+}
+
+#[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct ProjectState {
+    /// Empty means "never chosen", which resolves to [`DEFAULT_PROFILE`].
+    profile: String,
+}
+
+fn load_state() -> StateCache {
+    std::fs::read_to_string(paths::project_state_file())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_state(cache: &StateCache) -> Result<(), String> {
+    let file = paths::project_state_file();
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let text = serde_json::to_string_pretty(cache).map_err(|e| e.to_string())?;
+    std::fs::write(file, text).map_err(|e| e.to_string())
+}
+
+/// Which profile this project builds in on this machine. Always a valid profile: a state file
+/// carrying something the Hub no longer generates falls back to the default rather than producing
+/// a preset name nothing defines.
+pub fn profile(project_root: &Path) -> String {
+    let key = project_root.to_string_lossy().into_owned();
+    load_state()
+        .projects
+        .get(&key)
+        .map(|s| s.profile.clone())
+        .filter(|p| is_profile(p))
+        .unwrap_or_else(|| DEFAULT_PROFILE.to_string())
+}
+
+/// Remember the profile to build this project in.
+pub fn set_profile(project_root: &Path, profile: &str) -> Result<(), String> {
+    if !is_profile(profile) {
+        return Err(format!(
+            "'{profile}' is not a build profile — expected one of {}",
+            PROFILES.join(", ")
+        ));
+    }
+    let key = project_root.to_string_lossy().into_owned();
+    let mut cache = load_state();
+    cache.projects.entry(key).or_default().profile = profile.to_string();
+    save_state(&cache)
+}
+
 /// Remove a project from the recent list, optionally deleting its folder from disk.
 ///
 /// Refuses any directory that holds no `koral.json`. That guard is the whole safety story: this is
@@ -211,6 +290,15 @@ pub fn delete(project_root: &Path, delete_files: bool) -> Result<(), String> {
         std::fs::remove_dir_all(project_root)
             .map_err(|e| format!("failed to delete {}: {e}", project_root.display()))?;
     }
+
+    // Drop the machine-local state too, so a later project created at the same path does not
+    // inherit a build profile chosen for something else.
+    let key = project_root.to_string_lossy().into_owned();
+    let mut state = load_state();
+    if state.projects.remove(&key).is_some() {
+        let _ = save_state(&state);
+    }
+
     remove_recent(project_root)
 }
 

@@ -1226,6 +1226,102 @@
   overflow: hidden;
 }
 
+/* --- Libraries (vcpkg) --- */
+
+.lib-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 0 10px;
+  padding: 0;
+}
+
+.lib-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-small);
+  background: var(--bg-card);
+}
+
+.lib-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.lib-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+/* The generated find_package/link lines. Two columns on a wide panel, stacked when there is no
+   room — these are short values, and a full-width input for `EnTT` looks broken. */
+.lib-cmake {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px 12px;
+}
+
+.lib-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.lib-field-label {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-faint);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+
+.lib-field .input {
+  padding: 7px 12px;
+  font-size: 12.5px;
+}
+
+.lib-name {
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* The features a port was added with — secondary, but the reason two projects on the same port can
+   compile to different things, so never hidden. */
+.lib-features {
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Feature checkboxes, shown only for the port being added. Wraps rather than scrolls: a port with
+   twenty features is rare, and a nested scroll area inside a scrolling list is miserable. */
+.lib-feature-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 8px;
+}
+
+/* --- Build profile picker --- */
+
+/* Sits in the detail header beside Run/Build. Narrow on purpose: the profile names are short and
+   it must not push the buttons it belongs to off the row. */
+.profile-picker {
+  display: block;
+  width: 132px;
+  flex: none;
+}
+
 /* --- Menus --- */
 .menu-wrap {
   position: relative;

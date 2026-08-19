@@ -181,8 +181,53 @@ type ProjectConfig = {
   // irrelevant: the runtime sorts them by their declared dependencies. Absent and empty mean
   // the same thing; saveSettings drops the key when the list is empty.
   modules?: string[];
+  // Extra vcpkg ports this project's own source needs, beyond what the SDK already vendors.
+  // Empty for most projects; edited by the Libraries panel.
+  libraries?: Library[];
   [key: string]: unknown;
 };
+
+// Mirrors `model::Library` — one vcpkg port a project depends on, and how CMake reaches it. The
+// port name alone is not enough: `nlohmann-json` is found as `nlohmann_json` and linked as
+// `nlohmann_json::nlohmann_json`, with no rule deriving one from the other.
+type Library = {
+  vcpkgPort: string;
+  minVersion?: string;
+  features?: string[];
+  packages?: string[];
+  targets?: string[];
+};
+
+// Mirrors `git::UpdateReport` — what one overwrite-from-origin actually moved.
+type UpdateReport = { branch: string; from: string; to: string; changed: boolean };
+
+// Mirrors `commands::Profiles` — the build configurations a project can be set to, and its current
+// one. Machine-local: which configuration you work in does not travel inside koral.json.
+type Profiles = { available: string[]; selected: string };
+
+// Mirrors `vcpkg::Status` / `vcpkg::Port` — the Hub's own port tree, and one library in it.
+type VcpkgStatus = {
+  ready: boolean;
+  busy: boolean;
+  path: string;
+  portCount: number;
+  revision: string;
+  // Set when vcpkg comes from the user's own $VCPKG_ROOT, which the Hub does not manage.
+  externalRoot?: string;
+};
+type VcpkgPort = {
+  name: string;
+  version: string;
+  description: string;
+  features: string[];
+  // What to hand find_package(), and what to link. Read from the port's `usage` file when it ships
+  // one; `guessed` marks the four-in-five that do not, where these are inferred from the port name
+  // and worth checking.
+  packages: string[];
+  targets: string[];
+  guessed: boolean;
+};
+type VcpkgProgress = { step: string; done: boolean; error: string | null };
 
 // Mirrors `Settings` — the Hub's machine-local preferences. An empty string means "no preference";
 // what that resolves to is reported separately as ResolvedDefaults.
@@ -767,6 +812,9 @@ export default function App() {
   const [name, setName] = createSignal("");
   const [location, setLocation] = createSignal("");
   const [kind, setKind] = createSignal<Kind>("Scene");
+  // The framework a new project targets. Seeded from the resolved default when the dialog opens —
+  // which on a machine that has registered a build from source is that build, not a download.
+  const [newFramework, setNewFramework] = createSignal("");
   const problem = () => nameProblem(name().trim());
   const canCreate = () => !!name().trim() && !!location() && !problem() && !busy();
 
@@ -953,6 +1001,174 @@ export default function App() {
   // Remove-project confirmation: the project awaiting confirmation, and whether to erase its files.
   const [removing, setRemoving] = createSignal<RecentProject | null>(null);
   const [deleteFiles, setDeleteFiles] = createSignal(false);
+
+  // --- Build profiles -------------------------------------------------------------------
+  //
+  // Which configuration a project builds in. Machine-local and read per project, so switching
+  // projects shows that project's choice rather than the last one looked at.
+  const [profiles, setProfiles] = createSignal<Profiles | null>(null);
+
+  async function loadProfiles(path: string) {
+    try {
+      setProfiles(await invoke<Profiles>("project_profiles", { path }));
+    } catch {
+      // Not worth an error banner: the picker simply does not appear, and ▶ still builds Debug.
+      setProfiles(null);
+    }
+  }
+
+  async function chooseProfile(path: string, profile: string) {
+    const previous = profiles();
+    // Optimistic, because the picker sits next to ▶ and a round trip would make it feel sticky.
+    setProfiles((p) => (p ? { ...p, selected: profile } : p));
+    try {
+      await invoke("set_project_profile", { path, profile });
+    } catch (e) {
+      setProfiles(previous);
+      setError(String(e));
+    }
+  }
+
+  // --- Update from git ------------------------------------------------------------------
+  //
+  // What is waiting on the confirmation, since this discards local work and is not undoable.
+  const [updating, setUpdating] = createSignal<
+    { kind: "project" | "collection"; path: string; name: string } | null
+  >(null);
+  const [updateResult, setUpdateResult] = createSignal<string | null>(null);
+
+  function askUpdate(target: { kind: "project" | "collection"; path: string; name: string }) {
+    setContextMenu(null);
+    setError(null);
+    setUpdateResult(null);
+    setUpdating(target);
+  }
+
+  async function confirmUpdate() {
+    const target = updating();
+    if (!target) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const command =
+        target.kind === "project" ? "update_project_from_git" : "update_collection_from_git";
+      const report = await invoke<UpdateReport>(command, { path: target.path });
+      setUpdating(null);
+      setUpdateResult(
+        report.changed
+          ? `${target.name} updated to ${report.to} on ${report.branch}.`
+          : `${target.name} was already up to date (${report.to}).`,
+      );
+      // Everything about it may have changed — name, colour, framework, entries.
+      await Promise.all([refetch(), refetchCollections(), refetchAuthored()]);
+      if (settingsPath() === target.path) await loadProjectSettings(target.path);
+    } catch (e) {
+      // Stay in the dialog: the usual failures (no origin, not signed in to a private remote) are
+      // things the message has to be read to act on.
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // --- Libraries (vcpkg) ----------------------------------------------------------------
+
+  const [vcpkg, setVcpkg] = createSignal<VcpkgStatus | null>(null);
+  // The last line the clone/update reported, so the panel can say what it is doing.
+  const [vcpkgStep, setVcpkgStep] = createSignal<string>("");
+  const [ports, setPorts] = createSignal<VcpkgPort[]>([]);
+  const [showLibraryPicker, setShowLibraryPicker] = createSignal(false);
+  const [portFilter, setPortFilter] = createSignal("");
+  // The port whose features are being chosen, before it is added.
+  const [portDraft, setPortDraft] = createSignal<{ port: VcpkgPort; features: string[] } | null>(
+    null,
+  );
+
+  async function refreshVcpkg() {
+    try {
+      setVcpkg(await invoke<VcpkgStatus>("vcpkg_status"));
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  // The catalogue is a few thousand entries; fetched once per open rather than held forever, and
+  // only when the picker is actually used.
+  async function loadPorts() {
+    try {
+      setPorts(await invoke<VcpkgPort[]>("vcpkg_ports"));
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  const libraries = (): Library[] => (draft.cfg?.libraries as Library[] | undefined) ?? [];
+
+  async function openLibraryPicker() {
+    setError(null);
+    setPortFilter("");
+    setPortDraft(null);
+    setShowLibraryPicker(true);
+    await refreshVcpkg();
+    if (ports().length === 0) await loadPorts();
+  }
+
+  // Ports the filter matches, capped: rendering 2500 rows makes the list unusable and nobody
+  // scrolls past the first screenful anyway — they type instead.
+  const PORT_LIMIT = 200;
+  const filteredPorts = () => {
+    const q = portFilter().trim().toLowerCase();
+    const taken = new Set(libraries().map((l) => l.vcpkgPort));
+    const all = ports().filter((p) => !taken.has(p.name));
+    if (!q) return all.slice(0, PORT_LIMIT);
+    // Name matches first — searching "imgui" should not bury it under ports that merely mention it.
+    const byName = all.filter((p) => p.name.toLowerCase().includes(q));
+    const byBlurb = all.filter(
+      (p) => !p.name.toLowerCase().includes(q) && p.description.toLowerCase().includes(q),
+    );
+    return [...byName, ...byBlurb].slice(0, PORT_LIMIT);
+  };
+
+  function addLibrary(port: VcpkgPort, features: string[]) {
+    // The CMake names are recorded with the port, not looked up at build time: they are a property
+    // of the project's build, they have to survive on a machine whose port tree has moved on, and
+    // a guessed one has to be correctable.
+    const entry: Library = {
+      vcpkgPort: port.name,
+      packages: port.packages,
+      targets: port.targets,
+    };
+    if (features.length > 0) entry.features = features;
+    setDraft("cfg", "libraries", [...libraries(), entry]);
+    setPortDraft(null);
+    setShowLibraryPicker(false);
+  }
+
+  function removeLibrary(name: string) {
+    setDraft(
+      "cfg",
+      "libraries",
+      libraries().filter((l) => l.vcpkgPort !== name),
+    );
+  }
+
+  /** Edit one library's CMake names. Space-separated, since both are lists and usually of one. */
+  function setLibraryCmake(name: string, field: "packages" | "targets", value: string) {
+    setDraft(
+      "cfg",
+      "libraries",
+      libraries().map((l) =>
+        l.vcpkgPort === name ? { ...l, [field]: value.split(/\s+/).filter(Boolean) } : l,
+      ),
+    );
+  }
+
+  function updateVcpkg() {
+    setError(null);
+    setVcpkgStep("Starting…");
+    setVcpkg((s) => (s ? { ...s, busy: true } : s));
+    invoke("update_vcpkg").catch((e) => setError(String(e)));
+  }
 
   // --- Sidebar: one list of everything, projects and the collections that group them ---
 
@@ -1171,12 +1387,16 @@ export default function App() {
       }
       const cfg = await invoke<ProjectConfig>("project_config", { path });
       // The backend omits an empty modules list entirely; the editor needs an array to exist so
-      // its store paths ("cfg", "modules", i) have something to write into.
+      // its store paths ("cfg", "modules", i) have something to write into. Same for libraries.
       cfg.modules ??= [];
+      cfg.libraries ??= [];
       // The selection may have moved on while this was in flight — don't clobber the new one.
       if (settingsPath() !== path) return;
       setDraft("cfg", cfg);
       setSavedConfig(JSON.stringify(cfg));
+      // Which configuration this project builds in, so the picker beside ▶ shows its choice and
+      // not the last project's.
+      void loadProfiles(path);
       // What this machine can offer depends on the project's framework, so it is fetched per
       // project rather than once. Local-only, so it is quick.
       const mods = await invoke<ModuleView[]>("available_modules", {
@@ -1193,6 +1413,7 @@ export default function App() {
     setDraft("cfg", null);
     setSavedConfig("");
     setAvailableModules([]);
+    setProfiles(null);
   }
 
   function revertSettings() {
@@ -1246,6 +1467,7 @@ export default function App() {
       const cleaned = {
         ...config,
         modules: (config.modules ?? []).map((m) => m.trim()).filter(Boolean),
+        libraries: (config.libraries ?? []).filter((l) => l.vcpkgPort.trim()),
       };
       await invoke("save_project_config", { path, config: cleaned });
       setSavedConfig(JSON.stringify(draft.cfg));
@@ -1325,6 +1547,25 @@ export default function App() {
         refetchAccounts();
       }),
     );
+
+    // The vcpkg port tree is fetched in the background from startup, so this can arrive long
+    // before anyone opens the Libraries panel — which is the point: by the time they do, it is
+    // usually just there.
+    unlisten.push(
+      await listen<VcpkgProgress>("vcpkg-progress", (e) => {
+        const { step, done, error: failure } = e.payload;
+        setVcpkgStep(failure ?? step);
+        if (done) {
+          // Only shout about a failure the user is waiting on. A first run with no network must
+          // not open on an error about a package manager no project has asked for yet.
+          if (failure && showLibraryPicker()) setError(failure);
+          void refreshVcpkg();
+          if (!failure) void loadPorts();
+        }
+      }),
+    );
+
+    void refreshVcpkg();
   });
 
   // Open the first project as soon as there is one, so the app never starts on an empty panel
@@ -1459,6 +1700,9 @@ export default function App() {
   // creation used) so the common case is still one click away.
   async function openCreate() {
     setError(null);
+    // Preselect whatever the Hub would have picked anyway, so the field states the answer instead
+    // of leaving the user to work out that "nothing chosen" is not the same as "nothing available".
+    setNewFramework(defaults()?.frameworkVersion ?? "");
     if (!location()) {
       try {
         setLocation(await invoke<string>("default_project_location"));
@@ -1489,7 +1733,14 @@ export default function App() {
     setError(null);
     try {
       const created = await invoke<RecentProject>("create_project", {
-        req: { location: location(), name: trimmed, kind: kind() },
+        req: {
+          location: location(),
+          name: trimmed,
+          kind: kind(),
+          // Null, not "", so the backend falls back to its own resolution rather than pinning the
+          // project to an empty version.
+          frameworkVersion: newFramework() || null,
+        },
       });
       await refetch();
       setCreating(false);
@@ -1539,6 +1790,35 @@ export default function App() {
     } catch (e) {
       // Stay in the dialog so the URL can be fixed — the usual failures are a bad URL, a private
       // repo, or a clone that isn't a Koral project.
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Add a project that is already on this machine — a folder cloned by hand, restored from a
+  // backup, or written before the Hub existed. Nothing is copied or moved: it is listed where it
+  // lies, so this is safe to point at work in progress.
+  //
+  // A folder picker rather than a dialog: there is exactly one thing to choose, and the validation
+  // that matters (is there a koral.json?) can only happen after it is chosen.
+  async function importLocalProject() {
+    setImportMenu(false);
+    setError(null);
+    const picked = await open({
+      directory: true,
+      multiple: false,
+      title: "Choose an existing Koral project folder",
+      defaultPath: location() || undefined,
+    });
+    if (typeof picked !== "string") return; // cancelled
+
+    setBusy(true);
+    try {
+      const imported = await invoke<RecentProject>("import_local_project", { path: picked });
+      await refetch();
+      applySelection({ kind: "project", path: imported.path });
+    } catch (e) {
       setError(String(e));
     } finally {
       setBusy(false);
@@ -1985,6 +2265,8 @@ export default function App() {
     !!deviceLogin() ||
     !!publishTarget() ||
     !!pendingSelection() ||
+    !!updating() ||
+    showLibraryPicker() ||
     showAddLocal() ||
     showFrameworks() ||
     showSettings();
@@ -2440,6 +2722,9 @@ export default function App() {
                   <button type="button" class="menu-item" onClick={openImport}>
                     Import from Git…
                   </button>
+                  <button type="button" class="menu-item" onClick={importLocalProject}>
+                    Import a folder…
+                  </button>
                   <button type="button" class="menu-item" onClick={openAddCollection}>
                     Add a collection by URL…
                   </button>
@@ -2488,6 +2773,22 @@ export default function App() {
                     </p>
                   </div>
                   <div class="detail-actions">
+                    {/* The configuration ▶ and Build use. Machine-local, so it is here beside the
+                        buttons it governs rather than in the project's committed settings. Each
+                        profile has a build tree and a preset of its own, so switching costs a
+                        rebuild but never a reconfigure of the one you came from. */}
+                    <Show when={profiles()}>
+                      {(pr) => (
+                        <span class="profile-picker" title="Build configuration">
+                          <Select
+                            value={pr().selected}
+                            options={pr().available.map((v) => ({ value: v, label: v }))}
+                            disabled={isRunning(p().path)}
+                            onChange={(v) => chooseProfile(p().path, v)}
+                          />
+                        </span>
+                      )}
+                    </Show>
                     {/* A module has no app to start — it runs inside projects that list it — so
                         offering ▶ would only lead to the backend's refusal. Build stays. */}
                     <Show when={p().kind !== "Module"}>
@@ -2570,6 +2871,23 @@ export default function App() {
                           onChange={(v) => setDraft("cfg", "frameworkVersion", v)}
                         />
                       </label>
+                      {/* A project can be moved onto a framework built here without downloading
+                          anything — which is the whole answer when GitHub is unreachable, or when
+                          the release this project names does not exist any more. */}
+                      <Show when={sourceBuilds().length === 0}>
+                        <p class="field-hint">
+                          <button
+                            type="button"
+                            class="link-button"
+                            onClick={() => {
+                              openFrameworks();
+                              openAddLocal();
+                            }}
+                          >
+                            Use a framework you built yourself…
+                          </button>
+                        </p>
+                      </Show>
                       <Show
                         when={isSourcePin(draft.cfg!.frameworkVersion)}
                         fallback={
@@ -2915,6 +3233,103 @@ export default function App() {
                       </section>
                     </Show>
 
+                    {/* External packages this project's own source needs, on top of what the SDK
+                        already vendors. Empty is the normal state and costs nothing: a project
+                        with no libraries gets no vcpkg.json and no toolchain file, and never
+                        involves vcpkg in its build at all. */}
+                    <section class="panel">
+                      <h2 class="panel-title">Libraries</h2>
+                      <Show
+                        when={libraries().length > 0}
+                        fallback={
+                          <p class="field-hint">
+                            None. The SDK already provides glm, imgui, spdlog and fmt through{" "}
+                            <code>Koral::Koral</code>, so most projects need nothing here.
+                          </p>
+                        }
+                      >
+                        <ul class="lib-list">
+                          <For each={libraries()}>
+                            {(lib) => (
+                              <li class="lib-row">
+                                <span class="lib-head">
+                                  <span class="lib-meta">
+                                    <span class="lib-name">{lib.vcpkgPort}</span>
+                                    <Show when={(lib.features ?? []).length > 0}>
+                                      <span class="lib-features">
+                                        [{(lib.features ?? []).join(", ")}]
+                                      </span>
+                                    </Show>
+                                  </span>
+                                  <button
+                                    type="button"
+                                    class="btn btn-ghost btn-icon"
+                                    title={`Remove ${lib.vcpkgPort}`}
+                                    onClick={() => removeLibrary(lib.vcpkgPort)}
+                                  >
+                                    ✕
+                                  </button>
+                                </span>
+
+                                {/* What goes into the generated CMakeLists. Shown rather than
+                                    hidden because it is guesswork for the four ports in five that
+                                    ship no `usage` file — and a wrong package name fails the build
+                                    at find_package, which is only fixable from here. */}
+                                <span class="lib-cmake">
+                                  <label class="lib-field">
+                                    <span class="lib-field-label">find_package</span>
+                                    <input
+                                      class="input"
+                                      value={(lib.packages ?? []).join(" ")}
+                                      placeholder={lib.vcpkgPort}
+                                      onInput={(e) =>
+                                        setLibraryCmake(
+                                          lib.vcpkgPort,
+                                          "packages",
+                                          e.currentTarget.value,
+                                        )
+                                      }
+                                    />
+                                  </label>
+                                  <label class="lib-field">
+                                    <span class="lib-field-label">link</span>
+                                    <input
+                                      class="input"
+                                      value={(lib.targets ?? []).join(" ")}
+                                      placeholder="nothing to link"
+                                      onInput={(e) =>
+                                        setLibraryCmake(
+                                          lib.vcpkgPort,
+                                          "targets",
+                                          e.currentTarget.value,
+                                        )
+                                      }
+                                    />
+                                  </label>
+                                </span>
+                              </li>
+                            )}
+                          </For>
+                        </ul>
+                      </Show>
+
+                      <button
+                        type="button"
+                        class="btn btn-ghost btn-small"
+                        onClick={openLibraryPicker}
+                      >
+                        + Add library…
+                      </button>
+
+                      <p class="field-hint">
+                        Resolved by vcpkg on the next build, from the port tree the Hub keeps —
+                        nothing to install, and no <code>VCPKG_ROOT</code> to set. The first build
+                        after adding one compiles it, which can take a while. The two fields above
+                        are written straight into the generated <code>CMakeLists.txt</code>, so a
+                        library added here is usable from your sources with no further setup.
+                      </p>
+                    </section>
+
                     {/* Sticky, and only present while there is something to save — a permanent
                         bar would make an unchanged project look unsaved. */}
                     <Show when={settingsDirty()}>
@@ -2950,13 +3365,23 @@ export default function App() {
                     <Show
                       when={c().authored}
                       fallback={
-                        <button
-                          class="btn btn-ghost"
-                          title="Stop following this collection (downloaded projects are kept)"
-                          onClick={() => removeCollection(c().key)}
-                        >
-                          Remove
-                        </button>
+                        <>
+                          <button
+                            class="btn btn-ghost"
+                            title="Fetch the author's current manifest again"
+                            disabled={collections.loading}
+                            onClick={() => refetchCollections()}
+                          >
+                            {collections.loading ? "Refreshing…" : "Refresh"}
+                          </button>
+                          <button
+                            class="btn btn-ghost"
+                            title="Stop following this collection (downloaded projects are kept)"
+                            onClick={() => removeCollection(c().key)}
+                          >
+                            Remove
+                          </button>
+                        </>
                       }
                     >
                       {(a) => (
@@ -2964,6 +3389,19 @@ export default function App() {
                           <button class="btn btn-ghost" onClick={() => openAddUrl(a())}>
                             + Add by URL
                           </button>
+                          {/* Only with a remote to pull from — a collection that has never been
+                              published has nothing upstream of it. */}
+                          <Show when={a().git?.remote}>
+                            <button
+                              class="btn btn-ghost"
+                              title={`Overwrite this copy with ${a().git!.remote}`}
+                              onClick={() =>
+                                askUpdate({ kind: "collection", path: a().path, name: a().title })
+                              }
+                            >
+                              Update
+                            </button>
+                          </Show>
                           <button
                             class="btn btn-primary"
                             title={
@@ -3215,12 +3653,26 @@ export default function App() {
                 <p class="error">{error()}</p>
               </Show>
 
+              {/* Nothing usable at all: no source build registered, nothing installed, and no
+                  release to download. Say what the two ways out are, rather than leaving an empty
+                  Releases list to imply that downloading is the only one. */}
+              <Show when={frameworkChoices().length === 0 && !available.loading}>
+                <p class="field-hint field-bad">
+                  This machine has no framework yet. Either install a release below, or — if you
+                  have built Koral yourself — register your install prefix, which needs no network
+                  and is the only framework a debugger can step into.
+                </p>
+              </Show>
+
               {/* Builds from source come first: someone who has registered one is working on the
                   framework itself, and it is what their projects resolve to. Listed even when GitHub
                   is unreachable, since nothing here needs the network. */}
               <div class="fw-local-head">
                 <span class="fw-local-title">Built from source</span>
-                <button class="btn btn-ghost btn-small" onClick={openAddLocal}>
+                <button
+                  class={sourceBuilds().length > 0 ? "btn btn-ghost btn-small" : "btn btn-primary btn-small"}
+                  onClick={openAddLocal}
+                >
                   + Add source build
                 </button>
               </div>
@@ -3468,6 +3920,20 @@ export default function App() {
                       Add to collection…
                     </button>
                     <hr class="menu-divider" />
+                    {/* Pull upstream's version over this one. Only offered when there is an
+                        upstream: a project cut loose from its origin (a downloaded lab) has
+                        nothing to update from, and a greyed-out row would only invite the click. */}
+                    <Show when={p().git?.remote}>
+                      <button
+                        type="button"
+                        class="menu-item"
+                        onClick={() =>
+                          askUpdate({ kind: "project", path: p().path, name: p().name })
+                        }
+                      >
+                        Update from Git…
+                      </button>
+                    </Show>
                     <button
                       type="button"
                       class="menu-item"
@@ -3491,16 +3957,31 @@ export default function App() {
                   <Show
                     when={c().authored}
                     fallback={
-                      <button
-                        type="button"
-                        class="menu-item menu-danger"
-                        onClick={() => {
-                          setContextMenu(null);
-                          removeCollection(c().key);
-                        }}
-                      >
-                        Stop following
-                      </button>
+                      <>
+                        {/* A subscribed collection has no checkout here — its manifest is fetched
+                            live — so "update" is a re-fetch rather than a git operation. */}
+                        <button
+                          type="button"
+                          class="menu-item"
+                          onClick={() => {
+                            setContextMenu(null);
+                            refetchCollections();
+                          }}
+                        >
+                          Refresh from the author
+                        </button>
+                        <hr class="menu-divider" />
+                        <button
+                          type="button"
+                          class="menu-item menu-danger"
+                          onClick={() => {
+                            setContextMenu(null);
+                            removeCollection(c().key);
+                          }}
+                        >
+                          Stop following
+                        </button>
+                      </>
                     }
                   >
                     {(a) => (
@@ -3515,6 +3996,20 @@ export default function App() {
                         >
                           Add entry by URL…
                         </button>
+                        {/* Bring the collection and every entry it checks out up to what the
+                            remote has — the counterpart to Publish, for a collection someone else
+                            (or another machine of yours) has moved on. */}
+                        <Show when={a().git?.remote}>
+                          <button
+                            type="button"
+                            class="menu-item"
+                            onClick={() =>
+                              askUpdate({ kind: "collection", path: a().path, name: a().title })
+                            }
+                          >
+                            Update from Git…
+                          </button>
+                        </Show>
                         <button
                           type="button"
                           class="menu-item"
@@ -3736,6 +4231,43 @@ export default function App() {
                 Creates <code>{joinPath(location(), name().trim())}</code>
               </p>
             </Show>
+
+            {/* Which framework the project builds against, chosen here rather than assumed. A
+                machine whose only framework is one the user built themselves used to have no way
+                to say so at this point, and creation simply refused. */}
+            <label class="field">
+              <span class="field-label">Framework</span>
+              <Show
+                when={frameworkChoices().length > 0}
+                fallback={
+                  <p class="field-hint field-bad">
+                    No framework on this machine, and no release to download. If you have built
+                    Koral yourself, register the directory you passed to{" "}
+                    <code>cmake --install --prefix</code> below — that is all a project needs.
+                  </p>
+                }
+              >
+                <Select
+                  value={newFramework()}
+                  options={frameworkChoices().map((v) => ({ value: v.value, label: v.label }))}
+                  onChange={setNewFramework}
+                />
+              </Show>
+            </label>
+            <p class="field-hint">
+              Recorded in <code>koral.json</code>, so it travels with the project.{" "}
+              <button
+                type="button"
+                class="link-button"
+                onClick={() => {
+                  setCreating(false);
+                  openFrameworks();
+                  openAddLocal();
+                }}
+              >
+                Use a framework you built yourself…
+              </button>
+            </p>
 
             <Show when={error()}>
               <p class="error">{error()}</p>
@@ -4554,6 +5086,252 @@ export default function App() {
               </button>
             </div>
           </form>
+        </div>
+      </Show>
+
+      {/* The library picker: search the port tree, then pick features before adding. Two steps
+          because a port's features change what gets compiled, and choosing them afterwards would
+          mean editing koral.json by hand. */}
+      <Show when={showLibraryPicker()}>
+        <div class="modal-scrim" onClick={() => setShowLibraryPicker(false)}>
+          <div class="modal modal-wide modal-tall" onClick={(e) => e.stopPropagation()}>
+            <h2 class="modal-title">Add Library</h2>
+
+            {/* What the Hub's checkout is doing. Present at the top rather than only as an empty
+                state, because a first run may still be cloning while the list already has the
+                previous contents to show. */}
+            <Show when={vcpkg()}>
+              {(v) => (
+                <div class="fw-local-head">
+                  <span class="fw-local-title">
+                    <Show when={v().externalRoot} fallback={<>vcpkg · {v().portCount} libraries</>}>
+                      vcpkg from your $VCPKG_ROOT · {v().portCount} libraries
+                    </Show>
+                    <Show when={v().revision}>
+                      <span class="fw-tag">{v().revision}</span>
+                    </Show>
+                  </span>
+                  <Show when={!v().externalRoot}>
+                    <button
+                      class="btn btn-ghost btn-small"
+                      disabled={v().busy}
+                      title={v().ready ? "Fetch the latest ports" : "Download the port tree"}
+                      onClick={updateVcpkg}
+                    >
+                      {v().busy ? "Working…" : v().ready ? "Update" : "Download"}
+                    </button>
+                  </Show>
+                </div>
+              )}
+            </Show>
+            <Show when={vcpkgStep() && vcpkg()?.busy}>
+              <p class="field-hint">{vcpkgStep()}</p>
+            </Show>
+
+            <Show when={error()}>
+              <p class="error">{error()}</p>
+            </Show>
+
+            <Show
+              when={ports().length > 0}
+              fallback={
+                <div class="empty">
+                  <p class="muted">
+                    {vcpkg()?.busy
+                      ? "Fetching the vcpkg port tree — this is a few hundred megabytes on first run."
+                      : "No port tree yet. Download it above; it is fetched once and shared by every project."}
+                  </p>
+                </div>
+              }
+            >
+              <label class="field">
+                <span class="field-label">Search</span>
+                <input
+                  class="input"
+                  value={portFilter()}
+                  placeholder="assimp, sdl2, nlohmann-json…"
+                  autofocus
+                  onInput={(e) => {
+                    setPortFilter(e.currentTarget.value);
+                    setPortDraft(null);
+                  }}
+                />
+              </label>
+
+              <div class="modal-scroll">
+                <Show
+                  when={filteredPorts().length > 0}
+                  fallback={<p class="muted">No library matches “{portFilter()}”.</p>}
+                >
+                  <ul class="fw-list">
+                    <For each={filteredPorts()}>
+                      {(port) => {
+                        const chosen = () => portDraft()?.port.name === port.name;
+                        return (
+                          <li class="fw-card" classList={{ "fw-installed": chosen() }}>
+                            <span class="fw-meta">
+                              <span class="fw-version">
+                                {port.name}
+                                <Show when={port.version}>
+                                  <span class="fw-tag">{port.version}</span>
+                                </Show>
+                              </span>
+                              <span class="fw-sub" title={port.description}>
+                                {port.description || "no description"}
+                              </span>
+                              {/* What will be written into CMakeLists. Stated up front, because
+                                  for a port with no `usage` file it is inferred from the name and
+                                  may well be wrong — better seen here than as a find_package
+                                  failure on the next build. */}
+                              <span class="fw-sub">
+                                <code>find_package({port.packages.join(" ")})</code>
+                                <Show when={port.targets.length > 0}>
+                                  {" · "}
+                                  <code>{port.targets.join(" ")}</code>
+                                </Show>
+                                <Show when={port.guessed}>
+                                  {" — "}
+                                  <span class="field-bad">
+                                    guessed from the port name; check it after adding
+                                  </span>
+                                </Show>
+                              </span>
+
+                              {/* Features are only worth the space once this is the port being
+                                  added — a list of 200 ports with every feature expanded is
+                                  unreadable. */}
+                              <Show when={chosen() && port.features.length > 0}>
+                                <span class="lib-feature-grid">
+                                  <For each={port.features}>
+                                    {(feature) => (
+                                      <label class="toggle">
+                                        <input
+                                          type="checkbox"
+                                          checked={portDraft()!.features.includes(feature)}
+                                          onChange={(e) =>
+                                            setPortDraft((d) =>
+                                              d && {
+                                                ...d,
+                                                features: e.currentTarget.checked
+                                                  ? [...d.features, feature]
+                                                  : d.features.filter((f) => f !== feature),
+                                              },
+                                            )
+                                          }
+                                        />
+                                        <span>{feature}</span>
+                                      </label>
+                                    )}
+                                  </For>
+                                </span>
+                              </Show>
+                            </span>
+
+                            <Show
+                              when={chosen()}
+                              fallback={
+                                <button
+                                  class="btn btn-ghost"
+                                  onClick={() =>
+                                    port.features.length > 0
+                                      ? setPortDraft({ port, features: [] })
+                                      : addLibrary(port, [])
+                                  }
+                                >
+                                  {port.features.length > 0 ? "Choose features" : "Add"}
+                                </button>
+                              }
+                            >
+                              <button
+                                class="btn btn-primary"
+                                onClick={() => addLibrary(port, portDraft()!.features)}
+                              >
+                                Add
+                              </button>
+                            </Show>
+                          </li>
+                        );
+                      }}
+                    </For>
+                  </ul>
+                  <Show when={filteredPorts().length >= PORT_LIMIT}>
+                    <p class="field-hint">
+                      Showing the first {PORT_LIMIT} of {vcpkg()?.portCount ?? 0} — keep typing to
+                      narrow it down.
+                    </p>
+                  </Show>
+                </Show>
+              </div>
+            </Show>
+
+            <div class="modal-actions">
+              <button class="btn btn-ghost" onClick={() => setShowLibraryPicker(false)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      </Show>
+
+      {/* Update from Git. Confirmed because it is an overwrite with nothing to undo it with —
+          and stated in those words, since "update" elsewhere usually means "merge". */}
+      <Show when={updating()}>
+        {(target) => (
+          <div class="modal-scrim" onClick={() => setUpdating(null)}>
+            <form
+              class="modal"
+              onClick={(e) => e.stopPropagation()}
+              onSubmit={(e) => {
+                e.preventDefault();
+                confirmUpdate();
+              }}
+            >
+              <h2 class="modal-title">Update {target().name} from Git?</h2>
+              <p class="field-hint">
+                <code>{target().path}</code>
+              </p>
+
+              <p class="field-hint field-bad">
+                This takes whatever the remote has, exactly. Commits you have made here and edits
+                to files the repository tracks are discarded — there is no merge, and nothing to
+                undo it with. Files the remote does not know about are left alone.
+              </p>
+              <Show when={target().kind === "collection"}>
+                <p class="field-hint">
+                  Every entry the collection checks out moves to the commit the refreshed manifest
+                  records. Projects you downloaded from it are separate copies and are untouched.
+                </p>
+              </Show>
+
+              <Show when={error()}>
+                <p class="error">{error()}</p>
+              </Show>
+
+              <div class="modal-actions">
+                <button type="button" class="btn btn-ghost" onClick={() => setUpdating(null)}>
+                  Cancel
+                </button>
+                <button type="submit" class="btn btn-destructive" disabled={busy()}>
+                  {busy() ? "Updating…" : "Overwrite with the remote"}
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+      </Show>
+
+      {/* What the update did, dismissed by acknowledging it — the only trace an overwrite leaves. */}
+      <Show when={updateResult()}>
+        <div class="modal-scrim" onClick={() => setUpdateResult(null)}>
+          <div class="modal" onClick={(e) => e.stopPropagation()}>
+            <h2 class="modal-title">Updated</h2>
+            <p class="field-hint">{updateResult()}</p>
+            <div class="modal-actions">
+              <button class="btn btn-primary" onClick={() => setUpdateResult(null)}>
+                Done
+              </button>
+            </div>
+          </div>
         </div>
       </Show>
 

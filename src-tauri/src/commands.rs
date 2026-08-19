@@ -17,6 +17,7 @@ use crate::modules;
 use crate::project;
 use crate::scaffold;
 use crate::settings::{self, Settings};
+use crate::vcpkg;
 
 /// A recent-projects list item sent to the UI. `path` is machine-local (from the recent
 /// index); the rest is read from each project's committed, portable Koral config.
@@ -90,8 +91,9 @@ pub fn create_project(req: CreateProjectRequest) -> Result<RecentProject, String
         // Refusing here beats scaffolding a project pinned to a version that does not exist: the
         // failure is the same either way, but this one names what to do about it.
         None => settings::load().framework_version().ok_or_else(|| {
-            "No framework version to target: none is installed, and the published releases could \
-             not be reached. Install one under Frameworks, or set a default in Settings."
+            "No framework to target: none is installed here, and the published releases could not \
+             be reached. If you have built Koral yourself, register your install prefix under \
+             Frameworks → Add source build — that needs no network. Otherwise install a release."
                 .to_string()
         })?,
     };
@@ -161,6 +163,96 @@ pub struct ImportProjectRequest {
     pub location: String,
 }
 
+/// Add a Koral project that is already on this machine to the list, leaving it exactly where it is.
+///
+/// The counterpart to [`import_project`]: a project does not have to come from a remote to be one.
+/// A folder cloned by hand, restored from a backup, copied off a memory stick or written before the
+/// Hub existed is a project the moment it has a `koral.json`, and the only thing standing between
+/// it and the sidebar was a git URL it may never have had.
+///
+/// Nothing is copied, moved or initialised — the folder is recorded in the recent index as-is, so
+/// this is safe to point at work in progress. It needs no network and cannot fail part way.
+#[tauri::command]
+pub fn import_local_project(path: String) -> Result<RecentProject, String> {
+    let root = Path::new(path.trim());
+    if path.trim().is_empty() {
+        return Err("choose a project folder to import".into());
+    }
+    if !root.is_dir() {
+        return Err(format!("{} is not a folder", root.display()));
+    }
+
+    // Canonicalised so the same project reached by two paths (a symlink, a relative path, a
+    // trailing slash) is one entry rather than a duplicate row pointing at the same files.
+    let root = std::fs::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
+    // On Windows canonicalize returns a `\\?\C:\…` extended-length path. Everything else here
+    // stores the plain form — the recent index compares paths as strings, and a project created by
+    // the Hub and the same project imported would otherwise be two rows. Strip it back.
+    let root = PathBuf::from(
+        root.to_string_lossy()
+            .strip_prefix(r"\\?\")
+            .map(str::to_string)
+            .unwrap_or_else(|| root.to_string_lossy().into_owned()),
+    );
+
+    project::load(&root).map_err(|e| {
+        format!(
+            "that folder has no valid {} — it does not look like a Koral project ({e})",
+            project::CONFIG_FILE
+        )
+    })?;
+
+    project::add_recent(&root)?;
+    RecentProject::load(&root)
+}
+
+/// Bring a project up to date with its git remote, **overwriting local work**.
+///
+/// There is no merge: `origin` wins outright, so local commits and edits to tracked files are gone.
+/// That is the point — this is for a lab or a shared project whose current version is upstream's,
+/// where an update that could stop half way through a conflict would be no use at all. The UI
+/// confirms it before calling, since it is not undoable.
+///
+/// Blocking: it fetches, so the UI shows a pending state, like an import.
+#[tauri::command]
+pub fn update_project_from_git(path: String) -> Result<git::UpdateReport, String> {
+    let root = Path::new(&path);
+    project::load(root).map_err(|e| format!("that folder is not a Koral project: {e}"))?;
+
+    let report = git::update_from_origin(root)?;
+    // A project can carry its modules as submodules; leaving them behind would update the sources
+    // and not what they depend on.
+    if let Err(e) = git::update_submodules(root) {
+        eprintln!("koral-hub: submodule update failed for {}: {e}", root.display());
+    }
+
+    // The overwrite replaced koral.json along with everything else, so confirm what landed is
+    // still a project rather than leaving a card that silently stops loading.
+    project::load(root).map_err(|e| {
+        format!("updated to {}, but the result is not a valid Koral project: {e}", report.to)
+    })?;
+    Ok(report)
+}
+
+/// Bring an authored collection up to date with its git remote, **overwriting local work** — the
+/// manifest, and every entry it checks out.
+///
+/// Same contract as [`update_project_from_git`], applied to the collection repository and then to
+/// each submodule, so entries move to the commits the refreshed manifest records.
+#[tauri::command]
+pub fn update_collection_from_git(path: String) -> Result<git::UpdateReport, String> {
+    let root = Path::new(&path);
+    collection::load_manifest(root).map_err(|e| format!("that folder is not a collection: {e}"))?;
+
+    let report = git::update_from_origin(root)?;
+    git::update_submodules(root)?;
+
+    collection::load_manifest(root).map_err(|e| {
+        format!("updated to {}, but the result is not a valid collection: {e}", report.to)
+    })?;
+    Ok(report)
+}
+
 /// Remove a project from the recent list and, if asked, delete its folder from disk.
 ///
 /// `delete_files` is irreversible — the UI must confirm it, and it defaults to off.
@@ -170,9 +262,23 @@ pub fn remove_project(path: String, delete_files: bool) -> Result<(), String> {
 }
 
 /// A project's full `koral.json`, for the settings panel.
+///
+/// Libraries that carry no CMake names get them filled in from this machine's port tree on the way
+/// out — a project written before those fields existed otherwise shows two blank boxes and gives
+/// the user nothing to check. This only *offers* the values; they reach the file when the panel is
+/// saved, and the build resolves them the same way regardless (see `scaffold::resolve_library`).
 #[tauri::command]
 pub fn project_config(path: String) -> Result<ProjectConfig, String> {
-    project::load(Path::new(&path))
+    let mut cfg = project::load(Path::new(&path))?;
+    for library in &mut cfg.libraries {
+        if library.packages.is_empty() {
+            if let Some((packages, targets)) = vcpkg::cmake_names(&library.vcpkg_port) {
+                library.packages = packages;
+                library.targets = targets;
+            }
+        }
+    }
+    Ok(cfg)
 }
 
 #[derive(Debug, Deserialize)]
@@ -888,7 +994,9 @@ pub fn open_in_ide(path: String, ide_id: Option<String>) -> Result<(), String> {
     // resolve(), not ensure_installed() + read_manifest(): a source build carries no
     // framework.json of its own, and its manifest is derived from the tree each time.
     let (sdk_root, manifest) = framework::resolve(&cfg.framework_version)?;
-    scaffold::generate(root, &cfg, &sdk_root, &manifest, DEFAULT_PROFILE)?;
+    // The profile the Hub is set to, so the IDE opens on the same configuration ▶ builds — it is
+    // the one whose run configuration and compile database the generated files preselect.
+    scaffold::generate(root, &cfg, &sdk_root, &manifest, &project::profile(root))?;
 
     ide::open(&ide_id, root)
 }
@@ -1022,6 +1130,72 @@ pub fn uninstall_framework(version: String) -> Result<(), String> {
     framework::uninstall(&version)
 }
 
+// --- Libraries (vcpkg) ------------------------------------------------------------------
+
+/// Emitted as `vcpkg-progress` while the port tree is being cloned or updated, and once more at
+/// the end with `done` or `error` set. One event stream for both, since the UI shows them the same
+/// way — a line of text and a spinner.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VcpkgProgress {
+    step: String,
+    done: bool,
+    error: Option<String>,
+}
+
+/// Report the Hub's vcpkg checkout to the UI as it changes.
+fn emit_vcpkg(app: &AppHandle, progress: vcpkg::Progress) {
+    let payload = match progress {
+        vcpkg::Progress::Step(step) => {
+            VcpkgProgress { step: step.to_string(), done: false, error: None }
+        }
+        vcpkg::Progress::Done { ports } => VcpkgProgress {
+            step: format!("{ports} libraries available"),
+            done: true,
+            error: None,
+        },
+        vcpkg::Progress::Failed(e) => VcpkgProgress {
+            step: String::new(),
+            done: true,
+            error: Some(e.to_string()),
+        },
+    };
+    let _ = app.emit("vcpkg-progress", payload);
+}
+
+/// Clone the port tree in the background if this machine has none.
+///
+/// Called once at startup (see `lib.rs`) and again from the Libraries panel, so a first run that
+/// was offline can be retried without restarting the Hub. Does nothing when a checkout is already
+/// there or one is already being fetched.
+pub fn ensure_vcpkg(app: AppHandle) {
+    std::thread::spawn(move || vcpkg::ensure(|p| emit_vcpkg(&app, p)));
+}
+
+/// Whether libraries can be picked yet, and where they come from.
+#[tauri::command]
+pub fn vcpkg_status() -> vcpkg::Status {
+    vcpkg::status()
+}
+
+/// Every port the checkout offers, alphabetically — the catalogue the library picker filters.
+///
+/// Purely local, and served from a cached index rather than by re-reading a few thousand port
+/// manifests, so opening the picker costs one file read.
+#[tauri::command]
+pub fn vcpkg_ports() -> Vec<vcpkg::Port> {
+    vcpkg::ports()
+}
+
+/// Fetch the latest ports. On demand only: a port tree that moved under a project between two
+/// builds is exactly the surprise the Hub is trying to avoid.
+///
+/// Returns immediately; progress arrives as `vcpkg-progress`.
+#[tauri::command]
+pub fn update_vcpkg(app: AppHandle) {
+    std::thread::spawn(move || vcpkg::update(|p| emit_vcpkg(&app, p)));
+}
+
 /// Run a build/run job on its own thread, addressed to `path`'s console.
 ///
 /// Nothing here serializes the jobs: consoles are per project, so two projects can build at once
@@ -1037,10 +1211,31 @@ where
     });
 }
 
+/// The profile a job runs in: the one asked for, or the one remembered for this project.
+///
+/// An unknown name is refused rather than passed through — it would become a CMake preset name
+/// nothing defines, and the build would fail with a message about presets instead of about the
+/// profile the caller actually got wrong.
+fn resolve_profile(root: &Path, asked: Option<String>) -> Result<String, String> {
+    match asked.filter(|p| !p.is_empty()) {
+        Some(profile) if project::is_profile(&profile) => Ok(profile),
+        Some(profile) => Err(format!(
+            "'{profile}' is not a build profile — expected one of {}",
+            project::PROFILES.join(", ")
+        )),
+        None => Ok(project::profile(root)),
+    }
+}
+
 /// Configure + build a project. Streams `build-output`, then `build-finished`.
 #[tauri::command]
 pub fn build_project(app: AppHandle, path: String, profile: Option<String>) {
-    let profile = profile.unwrap_or_else(|| DEFAULT_PROFILE.to_string());
+    let profile = match resolve_profile(Path::new(&path), profile) {
+        Ok(profile) => profile,
+        // No console has been opened for a job that never started, so report it the same way a
+        // failed build is reported rather than dropping it.
+        Err(e) => return spawn_job(app, path, move |_| Err(e)),
+    };
     spawn_job(app, path, move |console| {
         builder::build_only(console, &profile)
     });
@@ -1049,13 +1244,40 @@ pub fn build_project(app: AppHandle, path: String, profile: Option<String>) {
 /// Build a project and launch it. Streams `build-output`, then `build-finished`.
 #[tauri::command]
 pub fn run_project(app: AppHandle, path: String, profile: Option<String>) {
-    let profile = profile.unwrap_or_else(|| DEFAULT_PROFILE.to_string());
+    let profile = match resolve_profile(Path::new(&path), profile) {
+        Ok(profile) => profile,
+        Err(e) => return spawn_job(app, path, move |_| Err(e)),
+    };
     spawn_job(app, path, move |console| builder::run(console, &profile));
 }
 
-// The framework default now lives in `settings`, which prefers the user's choice, then the newest
-// SDK actually installed here, and only then a hardcoded version.
-const DEFAULT_PROFILE: &str = "Debug";
+/// The build profiles a project can be set to, and which one it is on.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Profiles {
+    pub available: Vec<String>,
+    pub selected: String,
+}
+
+/// What ▶ and Build will use for this project, and what else it could be set to.
+///
+/// Machine-local: which configuration you are working in is not something a project carries to
+/// someone else's machine, so it lives in the Hub's own state rather than in `koral.json` — the
+/// same split that keeps `CMakePresets.json` out of git.
+#[tauri::command]
+pub fn project_profiles(path: String) -> Profiles {
+    Profiles {
+        available: project::PROFILES.iter().map(|p| p.to_string()).collect(),
+        selected: project::profile(Path::new(&path)),
+    }
+}
+
+/// Set the profile a project builds in. Takes effect on the next build — which regenerates the
+/// IDE configuration too, so CLion and VS Code follow the Hub rather than drifting from it.
+#[tauri::command]
+pub fn set_project_profile(path: String, profile: String) -> Result<(), String> {
+    project::set_profile(Path::new(&path), &profile)
+}
 
 #[cfg(test)]
 mod tests {

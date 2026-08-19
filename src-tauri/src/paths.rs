@@ -24,6 +24,25 @@ pub fn recent_projects_file() -> PathBuf {
     data_dir().join("recent_projects.json")
 }
 
+/// Per-machine, per-project state that must not travel inside `koral.json`: the build profile
+/// selected for each project. Keyed by project path, like [`recent_projects_file`], and kept here
+/// rather than in the project folder so a checkout stays clean.
+pub fn project_state_file() -> PathBuf {
+    data_dir().join("project_state.json")
+}
+
+/// The Hub's own vcpkg checkout — one per machine, shared by every project that declares
+/// libraries. The Hub owns it: it clones it, updates it, and is the only thing that writes there.
+pub fn vcpkg_dir() -> PathBuf {
+    data_dir().join("vcpkg")
+}
+
+/// Cached index of the ports in [`vcpkg_dir`], so the library picker does not re-read a few
+/// thousand small manifests every time it opens.
+pub fn vcpkg_index_file() -> PathBuf {
+    data_dir().join("vcpkg_index.json")
+}
+
 /// Per-machine index of locally-built SDKs the user has registered by path — framework installs
 /// that did not come from a release. Paths and version labels only; the trees themselves stay
 /// wherever the user installed them and are never copied or modified.

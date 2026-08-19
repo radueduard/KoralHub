@@ -13,6 +13,7 @@ mod paths;
 mod project;
 mod scaffold;
 mod settings;
+mod vcpkg;
 
 /// Recover a usable `PATH` when launched from a GUI.
 ///
@@ -105,6 +106,9 @@ pub fn run() {
             commands::project_details,
             commands::create_project,
             commands::import_project,
+            commands::import_local_project,
+            commands::update_project_from_git,
+            commands::update_collection_from_git,
             commands::remove_project,
             commands::list_collections,
             commands::add_collection,
@@ -143,7 +147,20 @@ pub fn run() {
             commands::ensure_framework,
             commands::build_project,
             commands::run_project,
+            commands::project_profiles,
+            commands::set_project_profile,
+            commands::vcpkg_status,
+            commands::vcpkg_ports,
+            commands::update_vcpkg,
         ])
+        .setup(|app| {
+            // Fetch the vcpkg port tree if this machine has none — in the background, because it
+            // is a few hundred megabytes and nothing else waits on it. A project that declares no
+            // libraries never needs it; one that does would otherwise have to have vcpkg installed
+            // by hand, which is the thing the Hub exists to avoid.
+            commands::ensure_vcpkg(app.handle().clone());
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running Koral Hub");
 }
