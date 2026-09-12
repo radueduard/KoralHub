@@ -3,7 +3,7 @@ import { createStore, produce } from "solid-js/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import logo from "./assets/logo.png";
 import "./App.css";
 
@@ -28,6 +28,27 @@ type RecentProject = {
   git: GitInfo | null;
 };
 
+// Mirrors `ToolId` — the build dependencies the wizard knows about.
+type ToolId = "cmake" | "ninja" | "compiler" | "vcpkg";
+
+// Mirrors `Source` — where a tool came from, which is what says who is responsible for it.
+// "bundled" means it came with something else (the ninja inside Visual Studio or CLion).
+type ToolSource = "missing" | "system" | "bundled" | "hub";
+
+// Mirrors `Tool` — one build dependency as the toolchain wizard shows it. `installable` is the
+// Hub's promise that it can obtain this one alone; `handoff` is the label for launching someone
+// else's installer when it cannot.
+type Tool = {
+  id: ToolId;
+  name: string;
+  purpose: string;
+  source: ToolSource;
+  path?: string;
+  version?: string;
+  installable: boolean;
+  guidance?: string;
+  handoff?: string;
+};
 // Mirrors `AvailableFramework` — a release publishing an SDK for this platform.
 type AvailableFramework = {
   version: string;
@@ -84,6 +105,10 @@ type CollectionView = {
   contents: Contents;
   labs: Lab[];
   error: string | null;
+  /// Set when these contents came from the offline cache because the fetch failed, carrying why.
+  /// Never set together with `error`: this collection has real, usable entries, they are just not
+  /// known to be current. Shown as a quiet note rather than a failure.
+  stale?: string;
   /// Set when this subscription points at a collection the user authors locally — the same
   /// collection, reached by its published URL. The sidebar then shows only the authored copy.
   authoredPath?: string;
@@ -301,6 +326,8 @@ type SidebarCollection = {
   contents: Contents;
   labs: Lab[];
   error: string | null;
+  /// See `CollectionView.stale` — always null for an authored collection, which is read off disk.
+  stale: string | null;
   authored: AuthoredCollection | null;
   subscribed: CollectionView | null;
 };
@@ -926,6 +953,47 @@ export default function App() {
   const [progress, setProgress] = createSignal<Record<string, number>>({});
 
   // IDEs on this machine. Fixed for the session — nobody installs CLion mid-session.
+  // --- The toolchain wizard: what a build needs before it can run at all ---
+  //
+  // Separate from Frameworks on purpose. A framework is a choice the project makes; these are the
+  // preconditions for compiling anything, and a machine missing one used to find out deep inside
+  // CMake, in an error that named nothing actionable.
+  const [showToolchain, setShowToolchain] = createSignal(false);
+  const [toolchain, { refetch: refetchToolchain }] = createResource<Tool[]>(() =>
+    invoke("toolchain_status"),
+  );
+  // Percent per tool while it downloads; -1 when the server sent no length.
+  const [toolProgress, setToolProgress] = createSignal<Record<string, number>>({});
+  const [compilerNote, setCompilerNote] = createSignal<string | null>(null);
+  const installing = (id: ToolId) => toolProgress()[id] !== undefined;
+
+  const missingTools = () => (toolchain() ?? []).filter((t) => t.source === "missing");
+  // vcpkg is excluded: only a project that declares libraries needs it, and it fetches itself.
+  const blockingTools = () => missingTools().filter((t) => t.id !== "vcpkg");
+
+  async function installTool(id: ToolId) {
+    setError(null);
+    setToolProgress((p) => ({ ...p, [id]: -1 }));
+    try {
+      await invoke("install_tool", { tool: id });
+    } catch (e) {
+      setError(String(e));
+      setToolProgress(({ [id]: _dropped, ...rest }) => rest);
+    }
+  }
+
+  // Hand off to the platform's own compiler installer. The Hub never accepts a licence or asks for
+  // a password itself — on Windows and macOS this starts the official installer, and on Linux it
+  // comes back with the command to run.
+  async function installCompiler() {
+    setError(null);
+    setCompilerNote(null);
+    try {
+      setCompilerNote(await invoke<string>("install_compiler"));
+    } catch (e) {
+      setError(String(e));
+    }
+  }
   const [ides] = createResource<Ide[]>(() => invoke("installed_ides"));
 
   // Hub preferences, and what they currently resolve to. `defaults` refetches after a save, so an
@@ -1238,6 +1306,7 @@ export default function App() {
       contents: c.contents,
       labs: c.labs,
       error: null,
+      stale: null,
       authored: c,
       subscribed: null,
     })),
@@ -1250,6 +1319,7 @@ export default function App() {
         contents: c.contents,
         labs: c.labs,
         error: c.error,
+        stale: c.stale ?? null,
         authored: null,
         subscribed: c,
       })),
@@ -1517,6 +1587,32 @@ export default function App() {
       }),
     );
 
+    unlisten.push(
+      await listen<{ tool: ToolId; downloaded: number; total: number }>("tool-progress", (e) => {
+        const { tool, downloaded, total } = e.payload;
+        setToolProgress((p) => ({
+          ...p,
+          [tool]: total > 0 ? Math.round((downloaded / total) * 100) : -1,
+        }));
+      }),
+    );
+    unlisten.push(
+      await listen<{ tool: ToolId; success: boolean; error?: string }>("tool-finished", (e) => {
+        const { tool, success, error: failure } = e.payload;
+        setToolProgress(({ [tool]: _dropped, ...rest }) => rest);
+        if (!success) setError(failure ?? `failed to install ${tool}`);
+        refetchToolchain();
+      }),
+    );
+
+    // Open the wizard unprompted the first time the machine cannot build at all. Only then: a
+    // dialog on every launch would be noise, and a fresh laptop missing a compiler is precisely
+    // the case where finding out later — from a CMake error — is worst.
+    try {
+      if (!(await invoke<boolean>("toolchain_ready"))) setShowToolchain(true);
+    } catch {
+      // A failed check is not worth a dialog of its own; the wizard is still reachable by hand.
+    }
     unlisten.push(
       await listen<InstallProgress>("framework-progress", (e) => {
         const { version, downloaded, total } = e.payload;
@@ -1825,6 +1921,57 @@ export default function App() {
     }
   }
 
+  // Write a project out as a zip: the way to hand work over with no account, no remote and no
+  // network. Sources, assets and koral.json travel; the build tree and the Hub's generated CMake
+  // files do not, since they are rebuilt on the other side and CMakePresets.json names this
+  // machine's SDK paths.
+  async function exportProject(p: RecentProject) {
+    setContextMenu(null);
+    setError(null);
+    const dest = await save({
+      title: `Export ${p.name}`,
+      defaultPath: `${p.name}.zip`,
+      filters: [{ name: "Zip archive", extensions: ["zip"] }],
+    });
+    if (typeof dest !== "string") return; // cancelled
+
+    setBusy(true);
+    try {
+      await invoke<string>("export_project", { path: p.path, dest });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // The counterpart: unpack a project zip into the projects folder and list it. Like the git
+  // import, it refuses to write over a folder that is already there.
+  async function importProjectZip() {
+    setImportMenu(false);
+    setError(null);
+    const picked = await open({
+      multiple: false,
+      title: "Choose a project zip",
+      filters: [{ name: "Zip archive", extensions: ["zip"] }],
+    });
+    if (typeof picked !== "string") return; // cancelled
+
+    setBusy(true);
+    try {
+      const loc = await ensureLocation();
+      const imported = await invoke<RecentProject>("import_project_zip", {
+        path: picked,
+        location: loc,
+      });
+      await refetch();
+      applySelection({ kind: "project", path: imported.path });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
   // The folder new work lands in, seeded from Settings the first time it's needed. Shared by the
   // create/import dialogs (where it's editable) and lab downloads (which use it silently).
   async function ensureLocation(): Promise<string> {
@@ -1879,14 +2026,20 @@ export default function App() {
     }
   }
 
-  // Download a lab into the default project folder as a fresh project, then select it. No dialog —
-  // a lab is meant to be one click from the collection into your workspace.
-  async function downloadLab(url: string) {
+  // Download a lab as a fresh project, then select it. No dialog — a lab is meant to be one click
+  // from the collection into your workspace.
+  //
+  // It lands in a folder named for the collection rather than loose in the projects folder, so a
+  // course's labs sit together on disk the way they are grouped here. Only a subscription names
+  // one: an authored collection already holds its entries as submodules, so its downloads stay put.
+  async function downloadLab(c: SidebarCollection, url: string) {
     setError(null);
     setDownloadingLab(url);
     try {
       const loc = await ensureLocation();
-      const project = await invoke<RecentProject>("download_lab", { req: { url, location: loc } });
+      const project = await invoke<RecentProject>("download_lab", {
+        req: { url, location: loc, collection: c.subscribed?.url ?? "" },
+      });
       // Both lists change: the project is new, and the collection entry now has a local path.
       await Promise.all([refetch(), refetchCollections(), refetchAuthored()]);
       applySelection({ kind: "project", path: project.path });
@@ -2269,6 +2422,7 @@ export default function App() {
     showLibraryPicker() ||
     showAddLocal() ||
     showFrameworks() ||
+    showToolchain() ||
     showSettings();
 
   // Removal is confirmed, and deleting the folder is a separate, explicit opt-in that resets each
@@ -2584,7 +2738,7 @@ export default function App() {
                           <span class="row-sub">
                             {c.error
                               ? "unavailable"
-                              : `${c.labs.length} ${entryWord(c.contents)}${c.labs.length === 1 ? "" : "s"}`}
+                              : `${c.labs.length} ${entryWord(c.contents)}${c.labs.length === 1 ? "" : "s"}${c.stale ? " • offline" : ""}`}
                           </span>
                         </span>
                         <Show when={!c.authored}>
@@ -2653,6 +2807,36 @@ export default function App() {
               New Project, which wears its label until a neighbour is pointed at, because starting
               one is what this panel is for. */}
           <div class="sidebar-foot">
+            {/* Sits beside Frameworks: same kind of thing (what this machine has), one level
+                lower down — a framework is nothing without something to compile it with. The dot
+                marks a missing dependency, since builds fail until it is dealt with. */}
+            <button
+              class="btn btn-ghost btn-foot"
+              onClick={() => {
+                setError(null);
+                refetchToolchain();
+                setShowToolchain(true);
+              }}
+              title="CMake, Ninja, the C++ compiler and vcpkg"
+            >
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 16 16"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M11.9 2.6a3.5 3.5 0 0 0-4.4 4.4l-4.9 4.9a1.3 1.3 0 0 0 1.9 1.9l4.9-4.9a3.5 3.5 0 0 0 4.4-4.4l-2.2 2.2-1.9-1.9z" />
+              </svg>
+              <span class="btn-foot-label">Toolchain</span>
+              <Show when={blockingTools().length > 0}>
+                <span class="foot-dot" title="Something a build needs is missing" />
+              </Show>
+            </button>
             <button class="btn btn-ghost btn-foot" onClick={openFrameworks}>
               {/* A package: the framework as a thing you install. */}
               <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
@@ -2725,7 +2909,9 @@ export default function App() {
                   <button type="button" class="menu-item" onClick={importLocalProject}>
                     Import a folder…
                   </button>
-                  <button type="button" class="menu-item" onClick={openAddCollection}>
+                  <button type="button" class="menu-item" onClick={importProjectZip}>
+                    Import from a zip…
+                  </button>                  <button type="button" class="menu-item" onClick={openAddCollection}>
                     Add a collection by URL…
                   </button>
                   <p class="menu-note">
@@ -2773,22 +2959,7 @@ export default function App() {
                     </p>
                   </div>
                   <div class="detail-actions">
-                    {/* The configuration ▶ and Build use. Machine-local, so it is here beside the
-                        buttons it governs rather than in the project's committed settings. Each
-                        profile has a build tree and a preset of its own, so switching costs a
-                        rebuild but never a reconfigure of the one you came from. */}
-                    <Show when={profiles()}>
-                      {(pr) => (
-                        <span class="profile-picker" title="Build configuration">
-                          <Select
-                            value={pr().selected}
-                            options={pr().available.map((v) => ({ value: v, label: v }))}
-                            disabled={isRunning(p().path)}
-                            onChange={(v) => chooseProfile(p().path, v)}
-                          />
-                        </span>
-                      )}
-                    </Show>
+
                     {/* A module has no app to start — it runs inside projects that list it — so
                         offering ▶ would only lead to the backend's refusal. Build stays. */}
                     <Show when={p().kind !== "Module"}>
@@ -2871,7 +3042,31 @@ export default function App() {
                           onChange={(v) => setDraft("cfg", "frameworkVersion", v)}
                         />
                       </label>
-                      {/* A project can be moved onto a framework built here without downloading
+                      {/* Moved here from beside ▶ and Build: as a <select> its width follows the
+                          longest name ("RelWithDebInfo"), which made it the odd size in a row of
+                          buttons and, as the panel narrowed, pushed the row over the project's
+                          name. In the settings grid it is a field like any other, so nothing
+                          reflows. Still machine-local, and still applied immediately — hence the
+                          hint, since everything else in this form waits for Save. */}
+                      <Show when={profiles()}>
+                        {(pr) => (
+                          <label class="field">
+                            <span class="field-label">Configuration</span>
+                            <Select
+                              value={pr().selected}
+                              options={pr().available.map((v) => ({ value: v, label: v }))}
+                              disabled={isRunning(p().path)}
+                              onChange={(v) => chooseProfile(p().path, v)}
+                            />
+                            <p class="field-hint">
+                              What ▶ and Build use. Applies as soon as you pick it, and stays on
+                              this machine — it is not written to <code>koral.json</code>. Each
+                              configuration builds in a tree of its own, so switching costs a
+                              rebuild but never disturbs the one you came from.
+                            </p>
+                          </label>
+                        )}
+                      </Show>                      {/* A project can be moved onto a framework built here without downloading
                           anything — which is the whole answer when GitHub is unreachable, or when
                           the release this project names does not exist any more. */}
                       <Show when={sourceBuilds().length === 0}>
@@ -3455,6 +3650,12 @@ export default function App() {
                   </p>
                 </Show>
 
+                <Show when={c().stale}>
+                  <p class="muted-note">
+                    Offline — showing this collection as it was the last time it loaded. Entries
+                    already downloaded work normally; the list refreshes when you are back online.
+                  </p>
+                </Show>
                 <Show when={c().error}>
                   <p class="error">Couldn't load this collection: {c().error}</p>
                 </Show>
@@ -3501,7 +3702,7 @@ export default function App() {
                                   <button
                                     class="btn btn-ghost btn-small"
                                     disabled={downloadingLab() !== null}
-                                    onClick={() => downloadLab(lab.url)}
+                                    onClick={() => downloadLab(c(), lab.url)}
                                   >
                                     {downloadingLab() === lab.url ? "Downloading…" : "Download"}
                                   </button>
@@ -3599,7 +3800,7 @@ export default function App() {
                     <button
                       class="btn btn-primary"
                       disabled={downloadingLab() !== null}
-                      onClick={() => downloadLab(picked().lab.url)}
+                      onClick={() => downloadLab(picked().collection, picked().lab.url)}
                     >
                       {downloadingLab() === picked().lab.url ? "Downloading…" : "Download"}
                     </button>
@@ -3644,6 +3845,124 @@ export default function App() {
       </div>
 
       {/* --- Frameworks --- */}
+      {/* --- Toolchain: the preconditions for building anything --- */}
+      <Show when={showToolchain()}>
+        <div class="modal-scrim" onClick={() => setShowToolchain(false)}>
+          <div class="modal modal-wide" onClick={(e) => e.stopPropagation()}>
+            <h2 class="modal-title">Build toolchain</h2>
+            <div class="modal-scroll">
+              <Show when={error()}>
+                <p class="error">{error()}</p>
+              </Show>
+
+              <Show
+                when={blockingTools().length > 0}
+                fallback={
+                  <p class="field-hint">
+                    Everything a build needs is here. Nothing to do — this is just where to check.
+                  </p>
+                }
+              >
+                <p class="field-hint field-bad">
+                  {blockingTools().length === 1
+                    ? "One thing is missing, so builds will fail until it is installed."
+                    : `${blockingTools().length} things are missing, so builds will fail until they are installed.`}
+                </p>
+              </Show>
+
+              <ul class="tool-list">
+                <For each={toolchain() ?? []}>
+                  {(tool) => (
+                    <li class="tool-card" classList={{ "tool-missing": tool.source === "missing" }}>
+                      <span class="tool-meta">
+                        <span class="tool-name">
+                          {tool.name}
+                          <span
+                            class="tool-tag"
+                            classList={{
+                              "tool-tag-missing": tool.source === "missing",
+                            }}
+                            title={
+                              tool.source === "hub"
+                                ? "Installed by the Hub, in its own data folder"
+                                : tool.source === "bundled"
+                                  ? "Came with something else already on this machine"
+                                  : tool.source === "system"
+                                    ? "Installed on this machine independently of the Hub"
+                                    : "Not on this machine"
+                            }
+                          >
+                            {tool.source === "missing" ? "missing" : tool.source}
+                          </span>
+                        </span>
+                        <span class="tool-sub">{tool.purpose}</span>
+                        <Show when={tool.version}>
+                          <span class="tool-sub">{tool.version}</span>
+                        </Show>
+                        <Show when={tool.path}>
+                          <span class="tool-path" title={tool.path}>
+                            {tool.path}
+                          </span>
+                        </Show>
+                        {/* Only shown when it is missing: guidance for something already present
+                            is just noise. */}
+                        <Show when={tool.source === "missing" && tool.guidance}>
+                          <span class="tool-guidance">{tool.guidance}</span>
+                        </Show>
+                      </span>
+
+                      <span class="tool-actions">
+                        <Show when={tool.source === "missing" && tool.installable}>
+                          <button
+                            class="btn btn-primary btn-small"
+                            disabled={installing(tool.id)}
+                            onClick={() => installTool(tool.id)}
+                          >
+                            {installing(tool.id)
+                              ? toolProgress()[tool.id] >= 0
+                                ? `${toolProgress()[tool.id]}%`
+                                : "Installing…"
+                              : "Install"}
+                          </button>
+                        </Show>
+                        <Show when={tool.source === "missing" && tool.handoff}>
+                          <button class="btn btn-ghost btn-small" onClick={installCompiler}>
+                            {tool.handoff}
+                          </button>
+                        </Show>
+                      </span>
+                    </li>
+                  )}
+                </For>
+              </ul>
+
+              <Show when={compilerNote()}>
+                <p class="field-hint">{compilerNote()}</p>
+              </Show>
+            </div>
+
+            <div class="modal-actions">
+              <button
+                type="button"
+                class="btn btn-ghost"
+                onClick={() => {
+                  setCompilerNote(null);
+                  refetchToolchain();
+                }}
+              >
+                Check again
+              </button>
+              <button
+                type="button"
+                class="btn btn-primary"
+                onClick={() => setShowToolchain(false)}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      </Show>
       <Show when={showFrameworks()}>
         <div class="modal-scrim" onClick={() => setShowFrameworks(false)}>
           <div class="modal modal-wide modal-tall" onClick={(e) => e.stopPropagation()}>
@@ -3934,7 +4253,14 @@ export default function App() {
                         Update from Git…
                       </button>
                     </Show>
+                    {/* The offline sibling of "Save to Git": hand the work over as a file. */}
                     <button
+                      type="button"
+                      class="menu-item"
+                      onClick={() => exportProject(p())}
+                    >
+                      Export as zip…
+                    </button>                    <button
                       type="button"
                       class="menu-item"
                       onClick={() => openPublishProject(p())}

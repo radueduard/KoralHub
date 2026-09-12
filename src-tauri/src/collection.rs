@@ -151,6 +151,9 @@ pub fn add(url: &str) -> Result<(), String> {
 pub fn remove(url: &str) -> Result<(), String> {
     let mut cache = load_cache();
     cache.collections.retain(|c| c.url != url);
+    // Drop the offline copy too: it is only ever read for a collection on the list above, so
+    // leaving it would be dead weight that grows with every collection the user tries and drops.
+    forget_manifest(url);
     save_cache(&cache)
 }
 
@@ -159,6 +162,12 @@ pub fn remove(url: &str) -> Result<(), String> {
 fn http() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
+        // A manifest is a few kilobytes, and this runs on every open of the collections list — so
+        // unlike an SDK download there is no legitimate slow case to leave room for. Without a
+        // bound, a host that accepts the connection and then says nothing (a captive portal, a
+        // hotel network) hangs the sidebar indefinitely instead of falling back to the cache.
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("failed to create HTTP client: {e}"))
 }
@@ -304,7 +313,16 @@ pub fn fetch(url: &str) -> Result<CollectionManifest, String> {
         {
             Ok(text) => text,
             Err(e) => {
+                let unreachable = e.is_connect() || e.is_timeout();
                 last_err = format!("{}: {e}", candidate.url);
+                // The candidates are alternative paths into the *same* repository, not
+                // alternative hosts — so a host that cannot be reached at all will not become
+                // reachable for the next one. Offline, trying the rest only multiplies the
+                // timeout the collections list waits through before falling back to the cache.
+                // A 404 is different: that is a real answer, and the next candidate may exist.
+                if unreachable {
+                    break;
+                }
                 continue;
             }
         };
@@ -331,6 +349,83 @@ pub fn fetch(url: &str) -> Result<CollectionManifest, String> {
         }
     }
     Err(format!("could not load a collection from {url} — {last_err}"))
+}
+
+// --- Offline cache of fetched manifests -------------------------------------------------
+
+/// Last-known-good manifest per collection URL. See [`paths::collection_manifests_file`].
+#[derive(Default, Serialize, Deserialize)]
+struct ManifestCache {
+    #[serde(default)]
+    manifests: std::collections::BTreeMap<String, CollectionManifest>,
+}
+
+fn load_manifest_cache() -> ManifestCache {
+    std::fs::read_to_string(paths::collection_manifests_file())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_manifest_cache(cache: &ManifestCache) -> Result<(), String> {
+    let file = paths::collection_manifests_file();
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let text = serde_json::to_string_pretty(cache).map_err(|e| e.to_string())?;
+    std::fs::write(file, text).map_err(|e| e.to_string())
+}
+
+/// Remember what this collection last looked like, so it survives going offline.
+fn cache_manifest(url: &str, manifest: &CollectionManifest) {
+    let mut cache = load_manifest_cache();
+    cache.manifests.insert(url.trim().to_string(), manifest.clone());
+    // Best-effort: a cache that cannot be written costs the *next* offline open, not this one.
+    if let Err(e) = save_manifest_cache(&cache) {
+        eprintln!("koral-hub: could not cache the manifest for {url}: {e}");
+    }
+}
+
+/// Forget a collection’s cached manifest. Called when it is unsubscribed from, so the cache does
+/// not accumulate collections the user has left.
+fn forget_manifest(url: &str) {
+    let mut cache = load_manifest_cache();
+    if cache.manifests.remove(url.trim()).is_some() {
+        let _ = save_manifest_cache(&cache);
+    }
+}
+
+/// How a collection’s contents were obtained — freshly fetched, or served from the cache because
+/// the fetch failed. The UI needs the difference: stale contents are still worth showing and
+/// working from, but must not be presented as current.
+pub struct Fetched {
+    pub manifest: CollectionManifest,
+    /// True when this came from the cache after a failed fetch, with the reason it failed.
+    pub stale: Option<String>,
+}
+
+/// Fetch a collection, falling back to the last copy that worked when the network does not.
+///
+/// This is what makes a subscribed collection usable offline. [`fetch`] is still the honest
+/// network answer and is what validates a URL on subscribe — nothing should be added to the list
+/// on the strength of a cache. But *listing* collections happens on every open, including the
+/// ones with no network, and there a collection that is merely unreachable should not read as a
+/// collection that is empty or broken.
+///
+/// A successful fetch always refreshes the cache, so a course revising its labs still propagates
+/// the moment the student is online.
+pub fn fetch_or_cached(url: &str) -> Result<Fetched, String> {
+    match fetch(url) {
+        Ok(manifest) => {
+            cache_manifest(url, &manifest);
+            Ok(Fetched { manifest, stale: None })
+        }
+        // Nothing cached either: this really is a collection the Hub cannot show, so say so.
+        Err(e) => match load_manifest_cache().manifests.remove(url.trim()) {
+            Some(manifest) => Ok(Fetched { manifest, stale: Some(e) }),
+            None => Err(e),
+        },
+    }
 }
 
 // --- Downloading a lab ------------------------------------------------------------------
@@ -387,7 +482,49 @@ pub fn download_lab(url: &str, location: &Path) -> Result<(PathBuf, ProjectConfi
     }
 
     project::add_recent(&root)?;
+    // Record where it came from. For a repository the user owns this merely duplicates the
+    // `origin` kept above, but for anyone else's it is the only surviving link back to the
+    // collection entry: the branch above threw the remote away with the history. Without it the
+    // download lists as a loose project instead of under the collection it came from.
+    if let Err(e) = project::set_source_url(&root, url) {
+        eprintln!("koral-hub: could not record the source of {}: {e}", root.display());
+    }
     Ok((root, cfg))
+}
+
+/// Where a subscribed collection's downloads live: `<location>/<the collection's repo name>/`.
+///
+/// Downloads used to land straight in the general projects folder, which left a course's labs
+/// scattered among everything else the user had. Giving each collection a folder of its own keeps
+/// them together on disk the way they are grouped in the sidebar.
+///
+/// Named from the URL rather than from the manifest title, for two reasons. The title is written
+/// by whoever publishes the collection, and a remote-supplied string has no business becoming a
+/// path component unchecked. And a course can revise its title whenever it likes, which would
+/// strand every lab already downloaded under the old name. The URL is the one stable thing a
+/// subscription has.
+///
+/// An empty URL means "not from a collection" and yields `location` unchanged — the flat layout,
+/// which is still right for an authored collection, whose entries already live inside its repo.
+pub fn downloads_dir(location: &Path, collection_url: &str) -> Result<PathBuf, String> {
+    let url = collection_url.trim();
+    if url.is_empty() {
+        return Ok(location.to_path_buf());
+    }
+
+    let name = git::repo_name_from_url(url);
+    // `repo_name_from_url` returns the last path segment, so it can never contain a separator —
+    // but "." and ".." would still resolve somewhere other than a child of `location`, and this
+    // string comes from a URL the user pasted. Refuse them rather than build the path.
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(format!("could not work out a folder name for the collection at {url}"));
+    }
+
+    let dir = location.join(name);
+    // Created here rather than left to the clone: `git::clone` makes the repo directory, not the
+    // collection directory above it, and would fail on the missing parent the very first time.
+    std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+    Ok(dir)
 }
 
 // --- Authoring a collection -------------------------------------------------------------
@@ -656,6 +793,91 @@ pub fn delete_authored(root: &Path, delete_files: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of the offline cache: a collection whose host cannot be reached still
+    /// reports its entries, flagged as stale rather than failing. Without this a student with no
+    /// network opens the Hub to an empty, “unavailable” collection and loses the grouping of the
+    /// labs they already downloaded.
+    ///
+    /// Port 9 (discard) on the loopback refuses immediately, so this is an offline machine’s
+    /// behaviour without the wait or a real network.
+    #[test]
+    fn an_unreachable_collection_falls_back_to_its_cached_contents() {
+        let url = "https://127.0.0.1:9/koral-test-offline-fallback.json";
+        let manifest = CollectionManifest {
+            schema_version: SCHEMA_VERSION,
+            title: "Graphics Labs".into(),
+            description: String::new(),
+            contents: Contents::Projects,
+            labs: vec![Lab {
+                name: "Lab 01".into(),
+                description: String::new(),
+                url: "https://github.com/prof/lab01".into(),
+                kind: None,
+            }],
+        };
+
+        // Nothing cached yet: an unreachable collection with no history is a real failure.
+        forget_manifest(url);
+        assert!(fetch_or_cached(url).is_err(), "no cache means no contents to show");
+
+        cache_manifest(url, &manifest);
+        let got = fetch_or_cached(url).expect("the cached copy should stand in");
+        assert_eq!(got.manifest.title, "Graphics Labs");
+        assert_eq!(got.manifest.labs.len(), 1);
+        assert!(got.stale.is_some(), "served from cache, so it must be marked stale");
+
+        // The fallback must not consume the cache — every later open is offline too.
+        assert!(fetch_or_cached(url).is_ok(), "the cache survives being read");
+
+        forget_manifest(url);
+        assert!(fetch_or_cached(url).is_err(), "unsubscribing drops the cached copy");
+    }
+
+    /// The point of the collection folder: a course’s labs land together under a folder named for
+    /// the collection, not loose beside every other project the user has.
+    #[test]
+    fn downloads_land_in_a_folder_named_for_the_collection() {
+        let projects = std::env::temp_dir().join("koral-downloads-dir-test");
+        let _ = std::fs::remove_dir_all(&projects);
+
+        let dir = downloads_dir(&projects, "https://github.com/prof/graphics-labs.git").unwrap();
+        assert_eq!(dir, projects.join("graphics-labs"));
+        // The clone needs the folder to exist, so it is created rather than merely computed.
+        assert!(dir.is_dir());
+
+        // The same collection spelled differently is still the same folder — labs must not end up
+        // split across two of them because a URL gained a suffix or a trailing slash.
+        for spelling in [
+            "https://github.com/prof/graphics-labs",
+            "https://github.com/prof/graphics-labs/",
+            "git@github.com:prof/graphics-labs.git",
+        ] {
+            assert_eq!(downloads_dir(&projects, spelling).unwrap(), dir, "{spelling}");
+        }
+
+        let _ = std::fs::remove_dir_all(&projects);
+    }
+
+    /// No collection means the old flat layout, which is what an authored collection still wants.
+    #[test]
+    fn no_collection_url_leaves_the_location_alone() {
+        let projects = std::env::temp_dir().join("koral-downloads-dir-none");
+        assert_eq!(downloads_dir(&projects, "").unwrap(), projects);
+        assert_eq!(downloads_dir(&projects, "   ").unwrap(), projects);
+        // Nothing was created for a path that is only being passed through.
+        assert!(!projects.exists());
+    }
+
+    /// A pasted URL must never name a folder outside the projects directory.
+    #[test]
+    fn a_url_that_names_no_usable_folder_is_refused() {
+        let projects = std::env::temp_dir().join("koral-downloads-dir-bad");
+        for bad in ["https://example.com/labs/..", "https://example.com/labs/."] {
+            assert!(downloads_dir(&projects, bad).is_err(), "{bad}");
+        }
+        assert!(!projects.exists());
+    }
 
     fn candidate_urls(input: &str) -> Vec<String> {
         manifest_candidates(input).into_iter().map(|c| c.url).collect()

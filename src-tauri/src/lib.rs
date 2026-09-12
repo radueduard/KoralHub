@@ -1,3 +1,4 @@
+mod archive;
 mod auth;
 mod builder;
 mod collection;
@@ -9,10 +10,12 @@ mod git;
 mod ide;
 mod model;
 mod modules;
+mod msvc;
 mod paths;
 mod project;
 mod scaffold;
 mod settings;
+mod toolchain;
 mod vcpkg;
 
 /// Recover a usable `PATH` when launched from a GUI.
@@ -107,6 +110,8 @@ pub fn run() {
             commands::create_project,
             commands::import_project,
             commands::import_local_project,
+            commands::export_project,
+            commands::import_project_zip,
             commands::update_project_from_git,
             commands::update_collection_from_git,
             commands::remove_project,
@@ -149,6 +154,10 @@ pub fn run() {
             commands::run_project,
             commands::project_profiles,
             commands::set_project_profile,
+            commands::toolchain_status,
+            commands::toolchain_ready,
+            commands::install_tool,
+            commands::install_compiler,
             commands::vcpkg_status,
             commands::vcpkg_ports,
             commands::update_vcpkg,

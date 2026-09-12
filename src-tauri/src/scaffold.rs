@@ -15,11 +15,11 @@
 //! no `vcpkg.json` and no `CMAKE_TOOLCHAIN_FILE`, and does not need vcpkg installed at all. Only
 //! a project that names extra ports pulls it in. See [`vcpkg_toolchain`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use crate::framework::FrameworkManifest;
+use crate::framework::{self, FrameworkManifest};
 use crate::model::ProjectConfig;
 
 /// Per-profile build directory, e.g. `cmake-build-debug`.
@@ -41,7 +41,13 @@ pub fn generate(
     manifest: &FrameworkManifest,
     profile: &str,
 ) -> Result<(), String> {
-    let modules = crate::modules::build_inputs(&cfg.modules, sdk_root);
+    // The tree the *active* profile builds against. Everything below that names one configuration
+    // — the module headers on the include path, the runtime the IDE launches — has to name this
+    // one and not the registered path, which may be a different flavour entirely. The presets are
+    // the exception: they cover every profile and each resolves its own.
+    let active_tree = framework::tree_for_profile(sdk_root, profile);
+
+    let modules = crate::modules::build_inputs(&cfg.modules, &active_tree);
     write(
         project_root.join("CMakeLists.txt"),
         &cmakelists(project_root, &cfg.name, &modules.sdk_targets, &cfg.libraries),
@@ -58,7 +64,7 @@ pub fn generate(
         let _ = std::fs::remove_file(manifest_file);
     }
 
-    let runtime = sdk_root.join(&manifest.runtime);
+    let runtime = active_tree.join(&manifest.runtime);
     let generator = preferred_generator();
     write(
         project_root.join("CMakePresets.json"),
@@ -66,7 +72,6 @@ pub fn generate(
             sdk_root,
             manifest,
             vcpkg.as_deref(),
-            &runtime,
             &generator,
             &modules.include_dirs,
         ),
@@ -77,7 +82,7 @@ pub fn generate(
         clear_foreign_build_dir(project_root, p, &generator);
     }
 
-    ide_configs(project_root, cfg, profile, &runtime, sdk_root)?;
+    ide_configs(project_root, cfg, profile, &runtime, &active_tree)?;
     Ok(())
 }
 
@@ -93,6 +98,19 @@ fn debug_source_dirs(cfg: &ProjectConfig) -> Vec<std::path::PathBuf> {
     dirs
 }
 
+/// The build tool the presets pin: the CMake generator name, and the binary that runs it.
+///
+/// The two travel together because on Windows they have to. Pinning "Ninja" is worthless if CMake
+/// cannot then find a `ninja` — and it usually cannot, since the copies that exist live inside
+/// Visual Studio and CLion rather than on `PATH`. Resolving both at once also means the filesystem
+/// is searched once per build rather than once per profile.
+struct Toolchain {
+    /// The CMake generator name, e.g. "Ninja".
+    name: String,
+    /// Absolute path to the tool, handed to CMake as `CMAKE_MAKE_PROGRAM`.
+    program: PathBuf,
+}
+
 /// The CMake generator to pin in the preset.
 ///
 /// Pinning one is a correctness requirement, not a preference: CMake's platform default is
@@ -100,20 +118,31 @@ fn debug_source_dirs(cfg: &ProjectConfig) -> Vec<std::path::PathBuf> {
 /// tool configures the build directory first wins and the other refuses to touch it — "created
 /// with incompatible generator". Naming it in the preset makes the Hub, VS Code and CLion agree.
 ///
-/// Ninja when it is installed (what CLion wants, and faster); otherwise leave the field out and
-/// let CMake pick its default.
-fn preferred_generator() -> Option<String> {
-    crate::ide::which("ninja").map(|_| "Ninja".to_string())
+/// Ninja whenever one can be found — it is the one generator that behaves the same on every
+/// platform, and the only single-config one available everywhere, which is what keeps a build
+/// tree's layout identical on Windows, Linux and macOS. Only if no ninja exists at all is the
+/// field left out for CMake to pick its platform default (Makefiles, or Visual Studio).
+fn preferred_generator() -> Option<Toolchain> {
+    ninja_program().map(|program| Toolchain { name: "Ninja".to_string(), program })
 }
 
+/// The `ninja` binary to build with. Resolved by [`crate::toolchain`], which owns every question of
+/// "is this tool on the machine, and where" — including the copies bundled inside Visual Studio and
+/// CLion, and any the Hub installed itself.
+///
+/// The absolute path matters as much as the fact: a ninja that is not on `PATH` has to be handed to
+/// CMake as `CMAKE_MAKE_PROGRAM`, or configuring fails with "CMAKE_MAKE_PROGRAM not set".
+fn ninja_program() -> Option<PathBuf> {
+    crate::toolchain::ninja_program()
+}
 /// Delete a build directory that was configured with a *different* generator.
 ///
 /// CMake cannot switch a build tree's generator in place — it errors and tells the user to
 /// delete the directory by hand. The Hub owns this directory, so it does that itself. Without
 /// this, the first build after the generator is pinned fails for every project that already has
 /// a Makefiles tree on disk.
-fn clear_foreign_build_dir(project_root: &Path, profile: &str, generator: &Option<String>) {
-    let Some(want) = generator else {
+fn clear_foreign_build_dir(project_root: &Path, profile: &str, generator: &Option<Toolchain>) {
+    let Some(want) = generator.as_ref().map(|g| g.name.as_str()) else {
         return;
     };
     let build_dir = project_root.join(build_dir_name(profile));
@@ -855,23 +884,29 @@ fn vcpkg_json(cfg: &ProjectConfig, manifest: &FrameworkManifest) -> String {
 
 /// One configure + build preset pair per profile, so every configuration the Hub or an IDE can
 /// select is already defined and generates into a build tree of its own.
+///
+/// Each profile resolves its *own* SDK tree. An SDK is installed once per configuration and the
+/// builds are not interchangeable — see [`framework::tree_for_profile`] — so a single registered
+/// path cannot serve every preset. Where only one flavour exists every profile resolves back to
+/// it, which is the previous behaviour exactly.
 fn presets_json(
     sdk_root: &Path,
     manifest: &FrameworkManifest,
     vcpkg_toolchain: Option<&str>,
-    runtime: &Path,
-    generator: &Option<String>,
+    generator: &Option<Toolchain>,
     module_includes: &[std::path::PathBuf],
 ) -> String {
     let configure: Vec<Value> = crate::project::PROFILES
         .iter()
         .map(|profile| {
+            let tree = framework::tree_for_profile(sdk_root, profile);
+            let runtime = tree.join(&manifest.runtime);
             configure_preset(
-                sdk_root,
+                &tree,
                 manifest,
                 profile,
                 vcpkg_toolchain,
-                runtime,
+                &runtime,
                 generator,
                 module_includes,
             )
@@ -906,7 +941,7 @@ fn configure_preset(
     profile: &str,
     vcpkg_toolchain: Option<&str>,
     runtime: &Path,
-    generator: &Option<String>,
+    generator: &Option<Toolchain>,
     module_includes: &[std::path::PathBuf],
 ) -> Value {
     let sdk_cmake = cmake_path(&sdk_root.join(&manifest.cmake_dir));
@@ -937,18 +972,29 @@ fn configure_preset(
     if let Some(toolchain) = vcpkg_toolchain {
         cache.insert("CMAKE_TOOLCHAIN_FILE".into(), json!(toolchain));
     }
-    // Link the *release* C runtime even in Debug, on Windows only.
+    // Match the C runtime to the SDK tree this profile resolved to, on Windows only.
     //
-    // MSVC cannot mix CRTs in one image, and the SDK publishes a single build of its vendored
-    // static libraries (`fmt.lib`, …) compiled against the release CRT. A Debug project would
-    // otherwise default to `/MDd` and fail to link with LNK2038 on both `RuntimeLibrary` and
-    // `_ITERATOR_DEBUG_LEVEL` — two faces of the same mismatch, since `/MD` leaves `_DEBUG`
-    // undefined and the iterator level follows it. Choosing `/MD` costs the debug heap and
-    // iterator debugging; optimisation and debug info are set by the build type and unaffected,
-    // so debugging still works. The real fix is for the SDK to ship a debug set of vendored
-    // libraries, at which point this goes away.
+    // MSVC cannot mix CRTs in one image. `/MDd` defines `_DEBUG` and sets `_ITERATOR_DEBUG_LEVEL`
+    // to 2, which changes the layout of `std::string` and every other standard type; `/MD` leaves
+    // both alone. A scene built one way and an engine built the other agree on nothing they pass
+    // across the DLL boundary. Neither the link nor the load complains — the import library
+    // carries no `detect_mismatch` directive — so it surfaces as a segfault on the first standard
+    // type handed to the engine, which is how this was found: a crash inside
+    // `Shader::Builder::setEntryPoint`, the first call in a scene's Initialize() taking a string.
+    //
+    // This used to be an unconditional `/MD` on every profile, because the SDK shipped one build
+    // of its vendored static libraries and it was compiled against the release CRT. That is no
+    // longer true — Koral installs a debug set (`fmtd.lib`, `spdlogd.lib`, `imguid.lib`) — so the
+    // override has become the thing that breaks a Debug SDK rather than the thing that saves it.
+    //
+    // Derived from the tree, not the profile: a Debug *profile* that resolved to a release tree
+    // (the only flavour registered, or a downloaded release archive) still has to link `/MD`.
     if cfg!(windows) {
-        cache.insert("CMAKE_MSVC_RUNTIME_LIBRARY".into(), json!("MultiThreadedDLL"));
+        let runtime_library = match framework::configuration_of(sdk_root, profile) {
+            "debug" => "MultiThreadedDebugDLL",
+            _ => "MultiThreadedDLL",
+        };
+        cache.insert("CMAKE_MSVC_RUNTIME_LIBRARY".into(), json!(runtime_library));
     }
 
     let mut configure = serde_json::Map::new();
@@ -960,7 +1006,15 @@ fn configure_preset(
     // Pinned so the Hub, VS Code and CLion do not each pick a different one and then refuse to
     // share the build directory. Omitted only when the preferred generator is unavailable.
     if let Some(generator) = generator {
-        configure.insert("generator".into(), json!(generator));
+        configure.insert("generator".into(), json!(generator.name));
+        // Hand CMake the exact ninja we found. On Windows it is usually inside a Visual Studio or
+        // CLion install rather than on PATH, and without this configuring fails outright with
+        // "CMAKE_MAKE_PROGRAM not set". Naming it also means the Hub and the IDEs drive the same
+        // binary rather than whichever each happens to discover.
+        cache.insert(
+            "CMAKE_MAKE_PROGRAM".into(),
+            json!(generator.program.to_string_lossy().replace('\\', "/")),
+        );
     }
     configure.insert("cacheVariables".into(), Value::Object(cache));
     Value::Object(configure)
@@ -983,14 +1037,9 @@ mod tests {
 
     fn presets() -> Value {
         let sdk = Path::new("/sdk");
-        let text = presets_json(
-            sdk,
-            &manifest(),
-            None,
-            &sdk.join("bin/Koral_Runtime.exe"),
-            &None,
-            &[],
-        );
+        // The runtime is no longer passed in: each profile derives it from the tree it resolves
+        // to, so that a Debug and a Release preset can name different runtimes.
+        let text = presets_json(sdk, &manifest(), None, &None, &[]);
         serde_json::from_str(&text).expect("presets must be valid JSON")
     }
 
@@ -1005,6 +1054,60 @@ mod tests {
             .unwrap_or_else(|| panic!("no configure preset named {profile}"))
             .clone();
         found["cacheVariables"].clone()
+    }
+
+    /// Ninja is the point of pinning a generator at all: it is the one that behaves identically on
+    /// every platform, so a project's build tree looks the same wherever it is opened. Pinning the
+    /// name alone is not enough on Windows, where the ninja that exists is inside Visual Studio or
+    /// CLion rather than on PATH — CMake has to be handed the binary too, or configuring fails
+    /// with "CMAKE_MAKE_PROGRAM not set".
+    #[test]
+    fn a_pinned_generator_names_both_itself_and_its_binary() {
+        let toolchain = Some(Toolchain {
+            name: "Ninja".into(),
+            program: std::path::PathBuf::from(r"C:\Program Files\Ninja\ninja.exe"),
+        });
+        let text = presets_json(Path::new("/sdk"), &manifest(), None, &toolchain, &[]);
+        let doc: Value = serde_json::from_str(&text).expect("presets must be valid JSON");
+
+        for profile in crate::project::PROFILES {
+            let configure = doc["configurePresets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == json!(profile))
+                .unwrap_or_else(|| panic!("no configure preset for {profile}"));
+
+            assert_eq!(configure["generator"], json!("Ninja"), "{profile}");
+            // Forward slashes: CMake reads this out of JSON, where a Windows backslash would be an
+            // escape character rather than a separator.
+            assert_eq!(
+                configure["cacheVariables"]["CMAKE_MAKE_PROGRAM"],
+                json!("C:/Program Files/Ninja/ninja.exe"),
+                "{profile}"
+            );
+        }
+    }
+
+    /// With no ninja anywhere, the field is left out entirely rather than pinned to nothing — CMake
+    /// then picks its platform default, which still builds. A machine without ninja must not be a
+    /// machine that cannot build.
+    #[test]
+    fn no_toolchain_leaves_the_generator_to_cmake() {
+        let doc = presets();
+        for profile in crate::project::PROFILES {
+            let configure = doc["configurePresets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == json!(profile))
+                .unwrap();
+            assert!(configure.get("generator").is_none(), "{profile}");
+            assert!(
+                configure["cacheVariables"].get("CMAKE_MAKE_PROGRAM").is_none(),
+                "{profile}"
+            );
+        }
     }
 
     /// Every profile the Hub lets a project be built in has to have a preset pair, or selecting it
@@ -1041,16 +1144,73 @@ mod tests {
         }
     }
 
-    /// The SDK ships its vendored static libraries built against the release CRT only, and MSVC
-    /// refuses to mix CRTs — a Debug build defaulting to /MDd fails with LNK2038.
+    /// MSVC refuses to mix CRTs, so a project has to link whichever one the SDK it resolved to was
+    /// built with. Against a release-only SDK — every one published so far, and what an
+    /// unresolvable path is treated as — that is `/MD` even for a Debug project.
     #[test]
-    fn windows_pins_the_release_msvc_runtime() {
+    fn windows_links_the_release_runtime_against_a_release_sdk() {
         let cache = cache_of("Debug");
         if cfg!(windows) {
             assert_eq!(cache["CMAKE_MSVC_RUNTIME_LIBRARY"], "MultiThreadedDLL");
         } else {
             assert!(cache.get("CMAKE_MSVC_RUNTIME_LIBRARY").is_none());
         }
+    }
+
+    /// The other half of the same rule, and the one that was missing: a Debug profile that
+    /// resolves to a Debug SDK must link `/MDd`. Pinning `/MD` there gives the scene
+    /// `_ITERATOR_DEBUG_LEVEL=0` against an engine built with 2 — a different `std::string`
+    /// layout on each side of the DLL boundary, which links cleanly and then segfaults on the
+    /// first string handed across, inside `Shader::Builder::setEntryPoint`.
+    #[test]
+    #[cfg(windows)]
+    fn windows_links_the_debug_runtime_against_a_debug_sdk() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("koral-scaffold-crt-{n}"));
+        let debug = base.join("stage/debug");
+        let release = base.join("stage/release");
+        for (tree, config) in [(&debug, "debug"), (&release, "release")] {
+            let cmake = tree.join("lib/cmake/Koral");
+            std::fs::create_dir_all(&cmake).unwrap();
+            std::fs::create_dir_all(tree.join("bin")).unwrap();
+            std::fs::write(tree.join("bin/Koral_Runtime.exe"), "x").unwrap();
+            std::fs::write(cmake.join("KoralConfig.cmake"), "x").unwrap();
+            std::fs::write(cmake.join(format!("KoralTargets-{config}.cmake")), "x").unwrap();
+        }
+
+        let text = presets_json(&debug, &manifest(), None, &None, &[]);
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        let cache_for = |profile: &str| {
+            doc["configurePresets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == json!(profile))
+                .unwrap()["cacheVariables"]
+                .clone()
+        };
+
+        assert_eq!(
+            cache_for("Debug")["CMAKE_MSVC_RUNTIME_LIBRARY"],
+            "MultiThreadedDebugDLL"
+        );
+        // And the Release preset resolves to the sibling and goes back to /MD, rather than
+        // inheriting the flavour of whichever tree happened to be registered.
+        assert_eq!(
+            cache_for("Release")["CMAKE_MSVC_RUNTIME_LIBRARY"],
+            "MultiThreadedDLL"
+        );
+        let release_prefix = cache_for("Release")["CMAKE_PREFIX_PATH"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            release_prefix.contains("stage/release"),
+            "Release preset should point at the release tree, got {release_prefix}"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// Picking a profile has to reach the IDEs too, or the Hub says Release and CLion's dropdown
@@ -1309,7 +1469,6 @@ mod tests {
             sdk,
             &manifest(),
             None,
-            &sdk.join("bin/Koral_Runtime.exe"),
             &None,
             &[std::path::PathBuf::from("/home/u/Koral/MyCameras/src")],
         );

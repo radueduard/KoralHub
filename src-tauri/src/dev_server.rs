@@ -61,11 +61,26 @@ pub fn ensure() -> DevServer {
         None => return DevServer(None),
     };
 
-    // On Windows the pnpm shim is a `.cmd`, which `Command` won't find by the bare name.
-    let pnpm = if cfg!(windows) { "pnpm.cmd" } else { "pnpm" };
-    let child = match Command::new(pnpm).args(["dev"]).current_dir(&project_root).spawn() {
-        Ok(child) => child,
-        Err(e) => {
+    // How pnpm is spelled on disk depends on how it was installed, and `Command` needs the exact
+    // name: `CreateProcess` only ever appends `.exe`, so a bare "pnpm" finds a standalone binary
+    // (winget, Scoop, the pnpm installer) but never the `.cmd` shim that npm and Corepack write.
+    // Try both rather than betting on one — guessing wrong leaves the window on a dead port with
+    // nothing but "Could not connect to localhost" to explain it.
+    let candidates: &[&str] = if cfg!(windows) { &["pnpm.cmd", "pnpm.exe"] } else { &["pnpm"] };
+    let mut last_err = None;
+    let spawned = candidates.iter().find_map(|pnpm| {
+        match Command::new(pnpm).args(["dev"]).current_dir(&project_root).spawn() {
+            Ok(child) => Some(child),
+            Err(e) => {
+                last_err = Some(e);
+                None
+            }
+        }
+    });
+    let child = match spawned {
+        Some(child) => child,
+        None => {
+            let e = last_err.expect("at least one candidate is always tried");
             eprintln!(
                 "koral-hub: could not auto-start the Vite dev server ({e}). \
                  Run `pnpm tauri dev`, or start `pnpm dev` yourself, then relaunch."

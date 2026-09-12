@@ -226,6 +226,17 @@ struct StateCache {
 struct ProjectState {
     /// Empty means "never chosen", which resolves to [`DEFAULT_PROFILE`].
     profile: String,
+    /// The git URL this project was downloaded from, when it came from a collection.
+    ///
+    /// A lab downloaded from someone else's repository has its `.git` replaced (see
+    /// `collection::download_lab`), so it keeps no `origin` to identify it by. But `origin` is
+    /// exactly what tells the sidebar that a project *is* a collection's entry rather than a
+    /// loose project, so the copy was orphaned the moment it landed. Remembering the URL here
+    /// restores that link without giving the copy an upstream it could be pulled over by: this
+    /// is machine-local state, not a remote.
+    ///
+    /// Empty means "not from a collection" — every project created or imported the usual way.
+    source_url: String,
 }
 
 fn load_state() -> StateCache {
@@ -271,6 +282,30 @@ pub fn set_profile(project_root: &Path, profile: &str) -> Result<(), String> {
     save_state(&cache)
 }
 
+/// The git URL this project was downloaded from, when the Hub recorded one.
+///
+/// Only ever set by a collection download; `None` for every other project. See
+/// [`ProjectState::source_url`] for why this is kept here rather than as a git remote.
+pub fn source_url(project_root: &Path) -> Option<String> {
+    let key = project_root.to_string_lossy().into_owned();
+    load_state()
+        .projects
+        .get(&key)
+        .map(|s| s.source_url.trim().to_string())
+        .filter(|u| !u.is_empty())
+}
+
+/// Remember where this project was downloaded from, so the collection it came from can still
+/// recognise it after its `.git` has been replaced.
+///
+/// Best-effort by contract, like the `git init` it accompanies: a lab that downloads but fails to
+/// record its origin is still a perfectly good project, it just lists loose until re-downloaded.
+pub fn set_source_url(project_root: &Path, url: &str) -> Result<(), String> {
+    let key = project_root.to_string_lossy().into_owned();
+    let mut cache = load_state();
+    cache.projects.entry(key).or_default().source_url = url.trim().to_string();
+    save_state(&cache)
+}
 /// Remove a project from the recent list, optionally deleting its folder from disk.
 ///
 /// Refuses any directory that holds no `koral.json`. That guard is the whole safety story: this is

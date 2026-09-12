@@ -177,7 +177,7 @@ fn github_token() -> Option<&'static str> {
         .as_deref()
 }
 
-fn http() -> Result<reqwest::blocking::Client, String> {
+pub(crate) fn http() -> Result<reqwest::blocking::Client, String> {
     let mut headers = reqwest::header::HeaderMap::new();
     if let Some(token) = github_token() {
         // reqwest drops Authorization when a redirect crosses hosts, so following an asset
@@ -922,7 +922,11 @@ pub mod local {
         // Canonicalised so the same tree reached by two different paths is one registration, and
         // so a relative path typed into the dialog is stored as something that still resolves
         // from wherever the Hub runs next.
-        let path = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        //
+        // Through paths::canonicalize, not std::fs::, because this prefix is what every generated
+        // preset's CMAKE_PREFIX_PATH is built from — see the note there for what a `\\?\` path does
+        // to find_package.
+        let path = crate::paths::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
 
         // The real check: does this tree look like an installed SDK? describe_tree fails with a
         // specific reason ("SDK has no bin/ directory", "no *Config.cmake found under …"), which
@@ -1092,7 +1096,7 @@ fn safe_path(path: &Path) -> Option<PathBuf> {
 /// zip stores `bin/...` at the top. Unpacking verbatim and unwrapping afterwards handles both
 /// without having to guess from entry paths mid-extraction — an already-flat tree has more
 /// than one top-level entry (`bin`, `include`, `lib`), so it is left alone.
-fn unwrap_single_root(dest: &Path) -> Result<(), String> {
+pub(crate) fn unwrap_single_root(dest: &Path) -> Result<(), String> {
     let mut entries = std::fs::read_dir(dest)
         .map_err(|e| format!("failed to read {}: {e}", dest.display()))?
         .flatten();
@@ -1115,7 +1119,7 @@ fn unwrap_single_root(dest: &Path) -> Result<(), String> {
     std::fs::remove_dir(&wrapper).map_err(|e| e.to_string())
 }
 
-fn extract_tar_gz(bytes: &[u8], dest: &Path) -> Result<(), String> {
+pub(crate) fn extract_tar_gz(bytes: &[u8], dest: &Path) -> Result<(), String> {
     let decoder = flate2::read::GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(decoder);
     // Preserve the executable bit on bin/* and the .so symlink chains (libvulkan.so.1 ->
@@ -1152,7 +1156,7 @@ fn extract_tar_gz(bytes: &[u8], dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn extract_zip(bytes: &[u8], dest: &Path) -> Result<(), String> {
+pub(crate) fn extract_zip(bytes: &[u8], dest: &Path) -> Result<(), String> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| format!("invalid SDK archive: {e}"))?;
 
@@ -1197,6 +1201,107 @@ mod tests {
         use std::time::{SystemTime, UNIX_EPOCH};
         let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("koral-framework-test-{n}"))
+    }
+
+    /// An installed SDK prefix providing exactly `configs`, laid out the way `cmake --install`
+    /// leaves one: a runtime under `bin/`, and the package's umbrella target file plus one
+    /// per-configuration file beside it.
+    fn sdk_tree(root: &Path, configs: &[&str]) {
+        let cmake = root.join("lib/cmake/Koral");
+        std::fs::create_dir_all(&cmake).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let runtime = if cfg!(windows) {
+            "Koral_Runtime.exe"
+        } else {
+            "Koral_Runtime"
+        };
+        std::fs::write(root.join("bin").join(runtime), "x").unwrap();
+        std::fs::write(cmake.join("KoralConfig.cmake"), "x").unwrap();
+        std::fs::write(cmake.join("KoralTargets.cmake"), "x").unwrap();
+        for config in configs {
+            std::fs::write(cmake.join(format!("KoralTargets-{config}.cmake")), "x").unwrap();
+        }
+    }
+
+    /// The per-configuration target files are what say which configurations a tree can be linked
+    /// against — the umbrella `KoralTargets.cmake` names none and must not be counted as one.
+    #[test]
+    fn a_trees_configurations_come_from_its_per_config_target_files() {
+        let base = scratch();
+        let debug = base.join("debug");
+        sdk_tree(&debug, &["debug"]);
+        assert_eq!(configurations(&debug), ["debug".to_string()].into());
+
+        let both = base.join("both");
+        sdk_tree(&both, &["debug", "release"]);
+        assert_eq!(
+            configurations(&both),
+            ["debug".to_string(), "release".to_string()].into()
+        );
+
+        // Nothing recognisable: "cannot tell", not "provides nothing".
+        assert!(configurations(&base.join("missing")).is_empty());
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// An SDK installed once per configuration is a set, and registering either half has to be
+    /// enough — a Debug project pointed at the release prefix would otherwise link a `/MD` engine
+    /// with a `/MDd` scene and crash on the first std::string across the boundary.
+    #[test]
+    fn a_profile_resolves_to_the_sibling_tree_that_provides_its_configuration() {
+        let base = scratch();
+        let debug = base.join("stage/debug");
+        let release = base.join("stage/release");
+        sdk_tree(&debug, &["debug"]);
+        sdk_tree(&release, &["release"]);
+
+        // Registered on either half, both profiles find their own tree.
+        for registered in [&debug, &release] {
+            assert_eq!(tree_for_profile(registered, "Debug"), debug);
+            assert_eq!(tree_for_profile(registered, "Release"), release);
+            // The release-flavoured profiles are not their own flavour of SDK; they link release.
+            assert_eq!(tree_for_profile(registered, "RelWithDebInfo"), release);
+            assert_eq!(tree_for_profile(registered, "MinSizeRel"), release);
+        }
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// One prefix holding both configurations — which Windows allows, since the debug postfix
+    /// keeps the filenames apart — serves every profile itself and is never passed over.
+    #[test]
+    fn a_tree_with_both_configurations_serves_every_profile() {
+        let base = scratch();
+        let both = base.join("stage/sdk");
+        sdk_tree(&both, &["debug", "release"]);
+        // A sibling that could also answer, to prove the registered tree wins.
+        sdk_tree(&base.join("stage/other"), &["debug", "release"]);
+
+        for profile in crate::project::PROFILES {
+            assert_eq!(tree_for_profile(&both, profile), both);
+        }
+        assert_eq!(configuration_of(&both, "Debug"), "debug");
+        assert_eq!(configuration_of(&both, "Release"), "release");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The fallback that keeps every SDK published so far working: one flavour, no siblings, and a
+    /// Debug project still has to build — against the release tree, linking release.
+    #[test]
+    fn a_lone_release_tree_still_answers_every_profile() {
+        let base = scratch();
+        let release = base.join("stage/release");
+        sdk_tree(&release, &["release"]);
+
+        assert_eq!(tree_for_profile(&release, "Debug"), release);
+        assert_eq!(configuration_of(&release, "Debug"), "release");
+
+        // And a tree that says nothing at all is treated as release rather than guessed at.
+        assert_eq!(configuration_of(&base.join("missing"), "Debug"), "release");
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     fn zip_of(entries: &[&str]) -> Vec<u8> {
@@ -1684,6 +1789,123 @@ fn find_cmake_dir(root: &Path) -> Result<String, String> {
         })
         .and_then(|dir| dir.file_name().map(|n| format!("lib/cmake/{}", n.to_string_lossy())))
         .ok_or_else(|| format!("no *Config.cmake found under {}", cmake.display()))
+}
+
+/// The CMake configurations an installed SDK tree can be linked against, lowercased
+/// (`{"debug"}`, `{"release"}`, or both).
+///
+/// Read from the package's per-configuration target files — `KoralTargets-debug.cmake` and
+/// friends — because that *is* the statement of what the tree provides: CMake writes one per
+/// configuration installed into the prefix, and an imported target has no usable library for any
+/// configuration without one. Nothing else in the tree says it as directly; guessing from the
+/// directory name would be a convention the SDK never agreed to.
+///
+/// An empty set means "could not tell" — a tree laid out differently, or one whose package
+/// directory cannot be read. Callers treat that as "use it for anything" rather than rejecting it.
+pub fn configurations(tree: &Path) -> std::collections::BTreeSet<String> {
+    let mut found = std::collections::BTreeSet::new();
+    let Ok(cmake_dir) = find_cmake_dir(tree) else {
+        return found;
+    };
+    let Ok(entries) = std::fs::read_dir(tree.join(cmake_dir)) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        // "koraltargets-debug.cmake" -> "debug". The umbrella "koraltargets.cmake" has no dash
+        // before the extension and is skipped, which is what distinguishes it.
+        if let Some(rest) = name.strip_suffix(".cmake") {
+            if let Some((stem, config)) = rest.rsplit_once('-') {
+                if stem.ends_with("targets") && !config.is_empty() {
+                    found.insert(config.to_string());
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The CMake configuration a build profile has to link against.
+///
+/// Debug is its own; everything else is a release-flavoured build and links the release set. That
+/// mirrors what CMake itself does when an imported target has no entry for the active
+/// configuration, and — the part that actually bites on Windows — it is what keeps the C runtime
+/// consistent, since MSVC ties `_ITERATOR_DEBUG_LEVEL` to `/MDd` and a project cannot mix.
+pub fn configuration_for_profile(profile: &str) -> &'static str {
+    if profile.eq_ignore_ascii_case("Debug") {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
+/// The configuration a consumer will actually link when it builds `profile` against `tree`.
+///
+/// Usually just [`configuration_for_profile`], but not when the tree cannot supply that
+/// configuration: a Debug profile resolved to a release-only SDK links release, whatever the
+/// profile is called. Callers need the answer rather than the intent, because the C runtime and
+/// the vendored libraries both follow it.
+///
+/// A tree that says nothing about its configurations is treated as release — the conservative
+/// answer, and the one every SDK published so far actually is.
+pub fn configuration_of(tree: &Path, profile: &str) -> &'static str {
+    let wanted = configuration_for_profile(profile);
+    let provided = configurations(tree);
+    if provided.contains(wanted) {
+        wanted
+    } else if provided.len() == 1 && provided.contains("debug") {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
+/// The installed SDK tree to build `profile` against, given the one the user registered.
+///
+/// An SDK is installed once per configuration — `cmake --install --config Debug --prefix …/debug`
+/// and again for Release — and the two are not interchangeable. On Windows they cannot even be
+/// mixed: a Debug engine is `/MDd`, a Release engine `/MD`, and a scene compiled against the wrong
+/// one has a different `std::string` layout than the engine it hands strings to. That does not
+/// fail to link, it segfaults on the first call across the boundary — which is exactly how this
+/// was found, as a crash inside `Shader::Builder::setEntryPoint`.
+///
+/// So the registered path is treated as one flavour of a set rather than the whole SDK: if it does
+/// not provide the configuration this profile needs, its siblings are searched for one that does.
+/// That makes `…/stage/debug` and `…/stage/release` a pair with either one registered.
+///
+/// Falls back to the registered tree whenever no better answer exists — a single-flavour SDK, a
+/// downloaded release archive, an unrecognisable layout. Nothing here can make a working setup
+/// stop working; it can only redirect a profile that had no correct tree to one that has.
+pub fn tree_for_profile(registered: &Path, profile: &str) -> PathBuf {
+    let wanted = configuration_for_profile(profile);
+
+    // The registered tree first, so a prefix holding both configurations — which Windows allows,
+    // since the debug postfix keeps the filenames apart — is never passed over for a sibling.
+    let provided = configurations(registered);
+    if provided.is_empty() || provided.contains(wanted) {
+        return registered.to_path_buf();
+    }
+
+    let Some(parent) = registered.parent() else {
+        return registered.to_path_buf();
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return registered.to_path_buf();
+    };
+
+    let mut siblings: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p != registered)
+        .collect();
+    // Deterministic: two siblings could both provide the configuration (a stale copy beside a
+    // current one), and picking by directory order would depend on the filesystem.
+    siblings.sort();
+
+    siblings
+        .into_iter()
+        .find(|tree| configurations(tree).contains(wanted))
+        .unwrap_or_else(|| registered.to_path_buf())
 }
 
 

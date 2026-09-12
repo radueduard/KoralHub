@@ -202,6 +202,17 @@
   line-height: 1.5;
 }
 
+/* A collection served from the offline cache. Deliberately not `.error`: the entries are real and
+   usable, they just may not be current, so this reads as a note rather than a failure. */
+.muted-note {
+  color: var(--text-dim);
+  border-radius: var(--r-control);
+  padding: 13px 18px;
+  margin-bottom: 16px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 /* --- Library: sidebar list + detail panel --- */
 /* The two halves scroll independently and the page itself never does, so the list stays put while
    you read a long settings panel — the whole point of the split. */
@@ -277,7 +288,7 @@
   border-top: 1px solid var(--border);
 }
 
-/* A round icon that grows its label on hover: four labels at once would shout over the list, but a
+/* A round icon that grows its label on hover: every label at once would shout over the list, but a
    bare icon has to be able to say what it is. The icon never moves — only the label's width
    animates — so the row reads as still until it is pointed at. */
 .btn-foot {
@@ -1312,16 +1323,108 @@
   margin-top: 8px;
 }
 
-/* --- Build profile picker --- */
 
-/* Sits in the detail header beside Run/Build. Narrow on purpose: the profile names are short and
-   it must not push the buttons it belongs to off the row. */
-.profile-picker {
-  display: block;
-  width: 132px;
+/* --- Toolchain wizard --- */
+
+.tool-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* One dependency. The row keeps its shape whether or not it has a path or guidance to show, so a
+   missing tool does not make the list jump about as it is installed. */
+.tool-card {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--card-border);
+  border-radius: var(--r-panel);
+}
+
+/* Missing is the only state worth colouring: it is the one that stops a build. */
+.tool-card.tool-missing {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.tool-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.tool-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.tool-tag {
+  font-weight: 500;
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: var(--r-pill);
+  background: var(--bg-input);
+  color: var(--text-dim);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.tool-tag-missing {
+  background: var(--danger);
+  color: #fff;
+}
+
+.tool-sub {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* Paths are long and are reference material, not reading material — clipped, with the full value
+   on hover. */
+.tool-path {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* What the user has to do themselves. Wraps, and keeps the newlines the backend put in the Linux
+   package-manager command. */
+.tool-guidance {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.tool-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   flex: none;
 }
 
+/* The "something is missing" marker on the Toolchain footer button. */
+.foot-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--danger);
+  flex: none;
+}
 /* --- Menus --- */
 .menu-wrap {
   position: relative;

@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
+use crate::archive;
+use crate::toolchain;
 use crate::auth::{self, AccountView, DeviceLogin, Provider};
 use crate::builder;
 use crate::collection;
@@ -183,17 +185,10 @@ pub fn import_local_project(path: String) -> Result<RecentProject, String> {
     }
 
     // Canonicalised so the same project reached by two paths (a symlink, a relative path, a
-    // trailing slash) is one entry rather than a duplicate row pointing at the same files.
-    let root = std::fs::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
-    // On Windows canonicalize returns a `\\?\C:\…` extended-length path. Everything else here
-    // stores the plain form — the recent index compares paths as strings, and a project created by
-    // the Hub and the same project imported would otherwise be two rows. Strip it back.
-    let root = PathBuf::from(
-        root.to_string_lossy()
-            .strip_prefix(r"\\?\")
-            .map(str::to_string)
-            .unwrap_or_else(|| root.to_string_lossy().into_owned()),
-    );
+    // trailing slash) is one entry rather than a duplicate row pointing at the same files —
+    // and through paths::canonicalize, which strips the Windows `\\?\` prefix that would
+    // otherwise make the plain and verbatim forms of one project two rows in the recent index.
+    let root = crate::paths::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
 
     project::load(&root).map_err(|e| {
         format!(
@@ -202,6 +197,38 @@ pub fn import_local_project(path: String) -> Result<RecentProject, String> {
         )
     })?;
 
+    project::add_recent(&root)?;
+    RecentProject::load(&root)
+}
+
+/// Write a project to a zip at `dest`, and return where it landed.
+///
+/// The offline way to hand work over: no account, no remote, no network. Build trees and the
+/// Hub's generated CMake files are left out — they are rebuilt from `koral.json` on the other
+/// end, and `CMakePresets.json` names this machine's SDK paths, so sending it would be wrong
+/// rather than merely wasteful. See `archive::is_excluded`.
+///
+/// Blocking: it walks and compresses the tree, so the UI shows a pending state, like an import.
+#[tauri::command]
+pub fn export_project(path: String, dest: String) -> Result<String, String> {
+    let dest = dest.trim();
+    if dest.is_empty() {
+        return Err("choose where to save the zip".into());
+    }
+    archive::export(Path::new(&path), Path::new(dest))
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Unpack a project zip into `location` and add it to the recent list.
+///
+/// The counterpart to [`export_project`], and the third way in alongside [`import_project`] (git)
+/// and [`import_local_project`] (a folder already here). Refuses if the target folder exists, so
+/// an import never clobbers local work.
+///
+/// Blocking: it decompresses on the command thread while the UI shows a pending state.
+#[tauri::command]
+pub fn import_project_zip(path: String, location: String) -> Result<RecentProject, String> {
+    let root = archive::import(Path::new(path.trim()), Path::new(location.trim()))?;
     project::add_recent(&root)?;
     RecentProject::load(&root)
 }
@@ -404,7 +431,10 @@ fn same_repo(a: &str, b: &str) -> bool {
 /// of entries and the user has dozens of projects; without this, listing collections is a few
 /// thousand repository opens.
 struct LocalIndex {
-    /// Recent projects and the remote each came from.
+    /// Recent projects and the repository each came from — its `origin` when it still has one,
+    /// otherwise the source URL the Hub recorded when it downloaded it (see
+    /// `project::source_url`). A lab from someone else's repo has no `origin` by design, so
+    /// without the fallback every downloaded lab would look unrelated to its collection.
     projects: Vec<(PathBuf, Option<String>)>,
     /// Authored collections and the remote each publishes to.
     authored: Vec<(String, String)>,
@@ -416,7 +446,8 @@ impl LocalIndex {
             projects: project::recent_paths()
                 .into_iter()
                 .map(|path| {
-                    let origin = git::origin_url(&path);
+                    let origin = git::origin_url(&path)
+                        .or_else(|| project::source_url(&path));
                     (path, origin)
                 })
                 .collect(),
@@ -480,6 +511,14 @@ pub struct CollectionView {
     pub contents: collection::Contents,
     pub labs: Vec<LabView>,
     pub error: Option<String>,
+    /// Set when these contents came from the offline cache because the fetch failed, carrying why.
+    ///
+    /// Distinct from `error`, and never set at the same time: `error` means there is nothing to
+    /// show, while this means “this is what it looked like last time”. The entries are real and
+    /// still worth working from — a lab already downloaded opens and builds with no network at
+    /// all — they just may not be current.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale: Option<String>,
     /// Set when this subscription is to a collection the user authors locally — the same
     /// collection reached by its published URL. The UI shows the authored copy instead, since it
     /// can do everything this one can and more.
@@ -490,8 +529,11 @@ pub struct CollectionView {
 impl CollectionView {
     fn fetched(url: String, index: &LocalIndex) -> Self {
         let authored_path = index.authored_at(&url);
-        match collection::fetch(&url) {
-            Ok(manifest) => CollectionView {
+        // Cache-backed, so a collection stays browsable with no network. `add_collection` still
+        // validates with a bare `fetch` — a cache must never be what puts a collection on the list.
+        match collection::fetch_or_cached(&url) {
+            Ok(collection::Fetched { manifest, stale }) => CollectionView {
+                stale,
                 authored_path,
                 title: manifest.title,
                 description: manifest.description,
@@ -511,6 +553,7 @@ impl CollectionView {
             },
             Err(e) => CollectionView {
                 authored_path,
+                stale: None,
                 title: String::new(),
                 description: String::new(),
                 contents: collection::Contents::default(),
@@ -523,14 +566,32 @@ impl CollectionView {
 }
 
 /// Every collection the user has added, each re-fetched now. Hits the network once per collection;
-/// a slow or offline one surfaces as that collection's `error`, not as a failed command.
+/// a slow or offline one falls back to its cached contents (marked `stale`), and only a collection
+/// with no cache at all surfaces as that collection's `error` — never as a failed command.
+///
+/// The fetches run concurrently, which matters most in the case that motivates the cache. Serially,
+/// a machine with no network pays the connect timeout once per collection before any of them can
+/// be drawn; in parallel the whole list costs one timeout. `LocalIndex` is read-only here and
+/// shared by reference, which is what `scope` exists to make safe.
 #[tauri::command]
 pub fn list_collections() -> Vec<CollectionView> {
     let index = LocalIndex::load();
-    collection::subscribed_urls()
-        .into_iter()
-        .map(|url| CollectionView::fetched(url, &index))
-        .collect()
+    let urls = collection::subscribed_urls();
+
+    // A shared reference, so each closure moves its own `url` but only borrows the one index.
+    let index = &index;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = urls
+            .into_iter()
+            .map(|url| scope.spawn(move || CollectionView::fetched(url, index)))
+            .collect();
+        handles
+            .into_iter()
+            // A panicked fetch must not take the whole list with it: drop that one collection
+            // and still show the rest, exactly as an unreachable one does.
+            .filter_map(|h| h.join().ok())
+            .collect()
+    })
 }
 
 /// Add a collection by URL and return its freshly-fetched view.
@@ -562,8 +623,14 @@ pub fn remove_collection(url: String) -> Result<(), String> {
 pub struct DownloadLabRequest {
     /// HTTPS git URL of the lab's repository.
     pub url: String,
-    /// Parent folder; the lab lands in `location/<repo-name>` as a fresh project.
+    /// The user's projects folder. The lab lands under the collection's own folder inside it —
+    /// see [`collection::downloads_dir`] — as a fresh project.
     pub location: String,
+    /// URL of the collection this lab is being taken from, which names the folder its downloads
+    /// share. Empty (the default) keeps the old flat layout, so a caller that does not know or
+    /// care which collection an entry came from still works.
+    #[serde(default)]
+    pub collection: String,
 }
 
 /// Download a lab into `location` as a fresh project, and add it to the recent list.
@@ -573,7 +640,8 @@ pub struct DownloadLabRequest {
 /// the copy is the student's own (see `collection::download_lab`).
 #[tauri::command]
 pub fn download_lab(req: DownloadLabRequest) -> Result<RecentProject, String> {
-    let (root, _cfg) = collection::download_lab(&req.url, Path::new(&req.location))?;
+    let location = collection::downloads_dir(Path::new(&req.location), &req.collection)?;
+    let (root, _cfg) = collection::download_lab(&req.url, &location)?;
     RecentProject::load(&root)
 }
 
@@ -1249,6 +1317,75 @@ pub fn run_project(app: AppHandle, path: String, profile: Option<String>) {
         Err(e) => return spawn_job(app, path, move |_| Err(e)),
     };
     spawn_job(app, path, move |console| builder::run(console, &profile));
+}
+
+/// Every build dependency and whether this machine has it — what the toolchain wizard shows.
+///
+/// Cheap and entirely local: a few `PATH` lookups and, on Windows, the cached MSVC probe. Safe to
+/// call whenever the wizard opens or an install finishes.
+#[tauri::command]
+pub fn toolchain_status() -> Vec<toolchain::Tool> {
+    toolchain::status()
+}
+
+/// Whether a build could run right now — everything present except vcpkg, which only a project
+/// that declares libraries needs. Used to decide whether to open the wizard unprompted.
+#[tauri::command]
+pub fn toolchain_ready() -> bool {
+    toolchain::ready()
+}
+
+/// Emitted as `tool-progress` while a build tool downloads.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolProgress {
+    tool: toolchain::ToolId,
+    downloaded: u64,
+    total: u64,
+}
+
+/// Emitted as `tool-finished` when an install ends, either way.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolFinished {
+    tool: toolchain::ToolId,
+    success: bool,
+    /// Where it landed, on success.
+    path: Option<String>,
+    error: Option<String>,
+}
+
+/// Download and unpack one of the tools the Hub can supply (CMake, Ninja).
+///
+/// Not blocking: CMake is ~50 MB, so this runs on its own thread and reports as `tool-progress`
+/// then `tool-finished`, the same shape as a framework install.
+#[tauri::command]
+pub fn install_tool(app: AppHandle, tool: toolchain::ToolId) {
+    std::thread::spawn(move || {
+        let progress_app = app.clone();
+        let result = toolchain::install(tool, |downloaded, total| {
+            let _ = progress_app.emit(
+                "tool-progress",
+                ToolProgress { tool, downloaded, total },
+            );
+        });
+        let payload = match result {
+            Ok(path) => ToolFinished { tool, success: true, path: Some(path), error: None },
+            Err(e) => ToolFinished { tool, success: false, path: None, error: Some(e) },
+        };
+        let _ = app.emit("tool-finished", payload);
+    });
+}
+
+/// Start the platform's own compiler installer, and say what happened.
+///
+/// The Hub never installs a compiler itself — see `toolchain::install_compiler`. On Windows and
+/// macOS this launches the official installer (which asks for its own approval and licence
+/// acceptance); on Linux it returns the command to run, because a root password is not the Hub's to
+/// ask for.
+#[tauri::command]
+pub fn install_compiler() -> Result<String, String> {
+    toolchain::install_compiler()
 }
 
 /// The build profiles a project can be set to, and which one it is on.

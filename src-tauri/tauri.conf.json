@@ -28,6 +28,14 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "linux": {
+      "deb": {
+        "depends": ["build-essential", "cmake", "ninja-build"]
+      },
+      "rpm": {
+        "depends": ["gcc-c++", "make", "cmake", "ninja-build"]
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

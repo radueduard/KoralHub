@@ -10,6 +10,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// Used by the Unix launcher (and its tests); the Windows launcher deliberately uses pipes.
+#[cfg(unix)]
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -105,6 +107,14 @@ pub(crate) fn external_command(program: impl AsRef<std::ffi::OsStr>) -> Command 
         // Hub either way, so nothing is lost. A child's own GUI window (the app) still appears.
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000);
+
+        // Ninja, unlike the Visual Studio generator, does not know how to find MSVC: it needs
+        // cl.exe on PATH and the INCLUDE/LIB variables that go with it. A GUI app inherits none
+        // of that, so the Hub supplies what a Developer Command Prompt would. Empty when a
+        // compiler is already reachable, which leaves a deliberate setup alone.
+        for (key, value) in crate::msvc::environment() {
+            cmd.env(key, value);
+        }
     }
 
     // We pipe every child's output, so tools see stdout is not a TTY and (cmake, ninja, gcc/clang,
@@ -117,6 +127,15 @@ pub(crate) fn external_command(program: impl AsRef<std::ffi::OsStr>) -> Command 
     cmd
 }
 
+/// The CMake to drive: the Hub's own copy when it installed one, else the system's.
+///
+/// Falls back to the bare name so a machine with neither still produces CMake's own "not found"
+/// error rather than a panic — and the toolchain wizard is what turns that into an answer.
+fn cmake() -> std::ffi::OsString {
+    crate::toolchain::cmake_program()
+        .map(Into::into)
+        .unwrap_or_else(|| "cmake".into())
+}
 /// Platform-specific shared-library file name for a scene target.
 pub fn lib_file_name(name: &str) -> String {
     if cfg!(target_os = "windows") {
@@ -158,7 +177,7 @@ fn compile_tree(
     scaffold::generate(project_root, &cfg, &sdk_root, &manifest, profile)?;
 
     let configure = || {
-        let mut c = external_command("cmake");
+        let mut c = external_command(cmake());
         c.arg("--preset").arg(profile).current_dir(project_root);
         c
     };
@@ -181,7 +200,7 @@ fn compile_tree(
         run_step(console, &mut configure())?;
     }
 
-    let mut compile = external_command("cmake");
+    let mut compile = external_command(cmake());
     compile
         .arg("--build")
         .arg("--preset")
@@ -190,7 +209,13 @@ fn compile_tree(
     console.build(&format!("$ cmake --build --preset {profile}\n"));
     run_step(console, &mut compile)?;
 
-    Ok((sdk_root, manifest))
+    // The tree this profile was actually built against, not the registered one. They differ
+    // whenever the SDK is installed once per configuration, and ▶ has to launch the runtime that
+    // matches what was just compiled — a Debug scene handed to the release runtime is the same
+    // CRT mismatch that scaffold's CMAKE_MSVC_RUNTIME_LIBRARY exists to prevent, arriving by a
+    // different route. scaffold::generate is still given the registered root: it resolves a tree
+    // per profile itself, because the presets it writes cover all of them.
+    Ok((framework::tree_for_profile(&sdk_root, profile), manifest))
 }
 
 /// Build the project and everything it needs to run: its own library, plus each module it lists
@@ -272,17 +297,40 @@ pub fn run(console: &Console, profile: &str) -> Result<(), String> {
     // The launch line and everything the app prints belong on the Output tab, not the Build tab.
     console.run(&format!("$ {} {}\n", runtime.display(), args.join(" ")));
 
-    // Launch the app under a pseudo-terminal. Attached to a PTY it sees a real, colour-capable TTY
-    // and so emits ANSI colour exactly as it would in a terminal — which piping its stdout could
-    // never achieve, since programs disable colour when their output is not a terminal. On Windows
-    // the PTY is a ConPTY, which also means no extra console window pops up.
+    // Hand off to the platform launcher, which streams the app's output to the Output tab and
+    // returns as soon as it is running — the app outlives this job.
+    launch(console, &runtime, &args)
+}
+
+/// Forward everything a launched app writes to its project's Output tab, until it closes the stream.
+///
+/// Carries its own [`Console`] rather than borrowing one: the app outlives the job that started it,
+/// so its output must keep landing on that project's tab whichever project the user has selected by
+/// then.
+fn pump(mut stream: impl Read, console: Console) {
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => console.run(&String::from_utf8_lossy(&buf[..n])),
+        }
+    }
+}
+
+/// Unix: launch the app under a pseudo-terminal.
+///
+/// Attached to a PTY it sees a real, colour-capable TTY and so emits ANSI colour exactly as it
+/// would in a terminal — which piping its stdout could never achieve, since programs disable colour
+/// when their output is not a terminal.
+#[cfg(unix)]
+fn launch(console: &Console, runtime: &Path, args: &[String]) -> Result<(), String> {
     let pty = native_pty_system();
     let pair = pty
         .openpty(PtySize { rows: 40, cols: 140, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| format!("failed to open a pseudo-terminal: {e}"))?;
 
-    let mut cmd = CommandBuilder::new(&runtime);
-    cmd.args(&args);
+    let mut cmd = CommandBuilder::new(runtime);
+    cmd.args(args);
     cmd.env("TERM", "xterm-256color");
     // Match `external_command`: don't hand the app the Hub's bundled-library loader environment.
     // The Linux windowing backend is not set here — it rides in as the runtime's `--platform` flag
@@ -301,23 +349,12 @@ pub fn run(console: &Console, profile: &str) -> Result<(), String> {
     // exits, rather than blocking forever.
     drop(pair.slave);
 
-    let mut reader = pair
+    let reader = pair
         .master
         .try_clone_reader()
         .map_err(|e| format!("failed to read the app's output: {e}"))?;
-    // The app outlives the job that launched it, so these threads carry their own handle on the
-    // project's console — its output keeps landing on that project's Output tab, whichever project
-    // the user has selected by then.
     let console_out = console.clone();
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => console_out.run(&String::from_utf8_lossy(&buf[..n])),
-            }
-        }
-    });
+    std::thread::spawn(move || pump(reader, console_out));
 
     // Wait for the app in the background, holding the master open for its whole lifetime (dropping it
     // early would SIGHUP the app), then note the exit code on the Output tab.
@@ -327,6 +364,59 @@ pub fn run(console: &Console, profile: &str) -> Result<(), String> {
         drop(pair.master);
         if let Ok(status) = status {
             console_wait.run(&format!("\n[app exited: {}]\n", status.exit_code()));
+        }
+    });
+    Ok(())
+}
+
+/// Windows: launch the app with piped stdio.
+///
+/// Deliberately *not* a pseudo-terminal, unlike Unix. A console program started under a ConPTY
+/// blocks before it executes a single instruction: opening one makes conhost ask the terminal where
+/// the cursor is (`ESC[6n`) and hold the child until something answers. The Hub only ever reads from
+/// the pty — it is not a terminal emulator and has no cursor to report — so nothing ever answers and
+/// the app hangs forever, having produced no output and no window. That is precisely the symptom
+/// this exists to avoid: the launch line printed and then nothing, with no error to explain it.
+///
+/// The cost is the app's ANSI colour, which it turns off when it sees a pipe — the same trade the
+/// build tools already make on every platform. Running is worth more than colour.
+#[cfg(windows)]
+fn launch(console: &Console, runtime: &Path, args: &[String]) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+
+    let mut cmd = Command::new(runtime);
+    cmd.args(args)
+        // The Hub is a GUI process with no console of its own, so there is no stdin to inherit.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // The runtime is a console program: without this it opens a black console window next to
+        // the app's own window. Its output is piped here either way, so nothing is lost — the same
+        // reasoning as `external_command`.
+        .creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to launch runtime {}: {e}", runtime.display()))?;
+
+    // Two pipes rather than a pty's single merged stream, so each needs its own pump. Both land on
+    // the same Output tab, which is how it read before.
+    if let Some(out) = child.stdout.take() {
+        let console = console.clone();
+        std::thread::spawn(move || pump(out, console));
+    }
+    if let Some(err) = child.stderr.take() {
+        let console = console.clone();
+        std::thread::spawn(move || pump(err, console));
+    }
+
+    // As on Unix, the app outlives the job that launched it: wait in the background, then note the
+    // exit code on the project's Output tab.
+    let console_wait = console.clone();
+    std::thread::spawn(move || {
+        if let Ok(status) = child.wait() {
+            console_wait.run(&format!("\n[app exited: {}]\n", status.code().unwrap_or(-1)));
         }
     });
     Ok(())
@@ -353,7 +443,7 @@ pub fn run(console: &Console, profile: &str) -> Result<(), String> {
 ///
 /// Shared with `scaffold`.
 pub fn runtime_args(lib: &Path) -> Vec<String> {
-    let mut args = vec![lib.to_string_lossy().into_owned()];
+    let args = vec![lib.to_string_lossy().into_owned()];
     #[cfg(target_os = "linux")]
     {
         // `""` means "no preference" (leave `platform` at the config's `auto`); `"x11"` / `"wayland"`
@@ -387,6 +477,32 @@ fn run_step(console: &Console, cmd: &mut Command) -> Result<(), String> {
     Ok(())
 }
 
+/// Windows: the tools the Hub spawns must be able to find the compiler.
+///
+/// This is the whole reason `msvc::environment` exists. Ninja will not go looking for MSVC the way
+/// the Visual Studio generator does, so if a child of `external_command` cannot resolve `cl.exe`,
+/// every build fails with "No CMAKE_CXX_COMPILER could be found" — and it fails inside CMake, far
+/// from the cause.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn a_spawned_tool_can_find_the_compiler() {
+        if crate::msvc::environment().is_empty() && crate::ide::which("cl").is_none() {
+            return; // no C++ toolchain installed here — nothing this test can assert
+        }
+        let out = external_command("cmd")
+            .args(["/c", "where cl"])
+            .output()
+            .expect("cmd should run");
+        let found = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && found.to_lowercase().contains("cl.exe"),
+            "a spawned tool should resolve cl.exe, got: {found:?}"
+        );
+    }
+}
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;

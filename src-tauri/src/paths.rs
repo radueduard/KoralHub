@@ -2,7 +2,7 @@
 //! local-state side of the portable/local split (installed SDKs, the recent-projects
 //! index, caches).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Root of the Hub's local data.
 /// - Linux:   `~/.local/share/KoralHub`
@@ -56,6 +56,17 @@ pub fn collections_file() -> PathBuf {
     data_dir().join("collections.json")
 }
 
+/// Last-known-good copy of each subscribed collection’s manifest, keyed by URL.
+///
+/// Purely a cache, and safe to delete: a collection is still *defined* by the URL in
+/// [`collections_file`], and a successful fetch always overwrites what is here. It exists so the
+/// Hub works offline — without it, a student on a train opens the app to collections that are empty
+/// and marked unavailable, and the labs they already downloaded stop being grouped under the
+/// collection they came from. Fresh data still wins whenever the network answers.
+pub fn collection_manifests_file() -> PathBuf {
+    data_dir().join("collection_manifests.json")
+}
+
 /// Per-machine index of collection repos the user is *authoring* locally (paths only), so the Hub
 /// can list them for editing. Distinct from [`collections_file`], which tracks remote URLs to browse.
 pub fn authored_collections_file() -> PathBuf {
@@ -80,4 +91,25 @@ pub fn default_projects_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("Koral")
+}
+
+/// `std::fs::canonicalize` without the Windows extended-length prefix.
+///
+/// On Windows the standard canonicalize returns a `\\?\C:\…` verbatim path. That form is correct
+/// for the Win32 API and wrong for nearly everything the Hub does with a path afterwards: the
+/// recent-projects index compares paths as strings, so the same folder reached two ways becomes
+/// two rows; and a stored SDK prefix is written into the generated CMake presets, where CMake's
+/// `file(GLOB)` matches nothing under `//?/`. That last one is not a cosmetic difference — the
+/// glob at the end of `KoralTargets.cmake` is what pulls in `KoralTargets-debug.cmake`, so a
+/// verbatim `CMAKE_PREFIX_PATH` leaves the imported target with no configurations at all and the
+/// consumer's configure dies with "IMPORTED_IMPLIB not set for imported target Koral::Koral".
+///
+/// Any canonicalize whose result is stored or handed to another tool should go through this.
+/// A no-op off Windows.
+pub fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+    let path = std::fs::canonicalize(path)?;
+    match path.to_string_lossy().strip_prefix(r"\\?\") {
+        Some(plain) => Ok(PathBuf::from(plain)),
+        None => Ok(path),
+    }
 }
