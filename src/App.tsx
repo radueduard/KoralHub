@@ -11,6 +11,8 @@ import "./App.css";
 // Scene = realtime app with an Update/Render loop and a window.
 // Job   = single-dispatch headless app: Run() once to completion, then exit.
 type Kind = "Scene" | "Job" | "Module";
+// Mirrors `model::Language`: what a project's scenes are written in.
+type Language = "c++" | "csharp";
 
 // Mirrors `GitInfo` — the bit of git status shown beside a project. Null when it isn't a repo.
 type GitInfo = {
@@ -25,6 +27,7 @@ type RecentProject = {
   color: [number, number, number];
   frameworkVersion: string;
   kind: Kind;
+  language: Language;
   git: GitInfo | null;
 };
 
@@ -166,7 +169,18 @@ type InstalledFramework = {
   sourceDir?: string;
   /// CMAKE_BUILD_TYPE of the build it was installed from — a Release build has no debug info.
   buildType?: string;
+  /// What the SDK can do, from the capabilities.json it ships (see `Capabilities` in framework.rs).
+  capabilities: Capabilities;
 };
+
+// Mirrors `Capabilities`: what an SDK can do. An SDK that ships none is a v1 SDK.
+type Capabilities = {
+  line: number;
+  apis: string[];
+  sceneAbiVersion: number;
+  features: string[];
+};
+const V1_CAPABILITIES: Capabilities = { line: 1, apis: ["Vulkan", "OpenGL"], sceneAbiVersion: 0, features: [] };
 
 // Mirrors `DetectedSource` — what the Hub can work out about an install prefix before it is
 // registered, so the Add dialog can show it rather than asking blind.
@@ -178,10 +192,12 @@ type ProjectConfig = {
   name: string;
   kind: Kind;
   frameworkVersion: string;
+  // Which of the library's scenes the runtime opens (v2 frameworks, where a library offers several).
+  scene?: string;
   rendering: {
     api: "Vulkan" | "OpenGL";
     // Linux windowing system the Scene opens on; ignored on other platforms. Editable below.
-    platform: "auto" | "x11" | "wayland";
+    platform: "auto" | "x11" | "wayland" | "none";
     window: {
       width: number;
       height: number;
@@ -209,6 +225,8 @@ type ProjectConfig = {
   // Extra vcpkg ports this project's own source needs, beyond what the SDK already vendors.
   // Empty for most projects; edited by the Libraries panel.
   libraries?: Library[];
+  // Absent for C++: only a C# project's file carries it.
+  language?: Language;
   [key: string]: unknown;
 };
 
@@ -839,6 +857,7 @@ export default function App() {
   const [name, setName] = createSignal("");
   const [location, setLocation] = createSignal("");
   const [kind, setKind] = createSignal<Kind>("Scene");
+  const [language, setLanguage] = createSignal<Language>("c++");
   // The framework a new project targets. Seeded from the resolved default when the dialog opens —
   // which on a machine that has registered a build from source is that build, not a download.
   const [newFramework, setNewFramework] = createSignal("");
@@ -943,6 +962,15 @@ export default function App() {
 
   // Installed SDKs are local and always readable. Available ones come off the network, so the
   // resource can reject — the UI distinguishes "no releases" from "GitHub unreachable".
+  // What the framework a project pins can do; v1's when it is not installed (nothing to read).
+  const capabilitiesOf = (version: string): Capabilities =>
+    installed()?.find((f) => f.version === version)?.capabilities ?? V1_CAPABILITIES;
+  // Whether the framework picked for a new project can run C# scenes.
+  const csharpOffered = () => capabilitiesOf(newFramework()).features.includes("csharp");
+  createEffect(() => {
+    if (language() === "csharp" && !csharpOffered()) setLanguage("c++");
+  });
+
   const [installed, { refetch: refetchInstalled }] = createResource<InstalledFramework[]>(() =>
     invoke("installed_frameworks"),
   );
@@ -1833,6 +1861,7 @@ export default function App() {
           location: location(),
           name: trimmed,
           kind: kind(),
+          language: language(),
           // Null, not "", so the backend falls back to its own resolution rather than pinning the
           // project to an empty version.
           frameworkVersion: newFramework() || null,
@@ -3003,7 +3032,7 @@ export default function App() {
                   <span
                     class="project-kind"
                   >
-                    {p().kind}
+                    {p().language === "csharp" ? `C# ${p().kind}` : p().kind}
                   </span>
                   <span class="project-fw">{frameworkLabel(p().frameworkVersion)}</span>
                   <Show when={p().git}>
@@ -3183,23 +3212,66 @@ export default function App() {
                             )}
                           </For>
                         </Show>
+                        {/* Only the APIs the pinned framework has: OpenGL is a v1 backend, and a v2
+                            runtime refuses a project asking for it. A project already set to one
+                            the framework lacks keeps it listed — flagged — rather than being
+                            silently switched. */}
                         <label class="field">
                           <span class="field-label">Graphics API</span>
                           <Select
                             value={draft.cfg!.rendering.api}
-                            options={[
-                              { value: "Vulkan", label: "Vulkan" },
-                              { value: "OpenGL", label: "OpenGL" },
-                            ]}
+                            options={(() => {
+                              const apis = capabilitiesOf(draft.cfg!.frameworkVersion).apis;
+                              const current = draft.cfg!.rendering.api;
+                              const listed = apis.includes(current) ? apis : [...apis, current];
+                              return listed.map((api) => ({
+                                value: api,
+                                label: apis.includes(api) ? api : `${api} (not in this framework)`,
+                              }));
+                            })()}
                             onChange={(v) =>
                               setDraft("cfg", "rendering", "api", v as "Vulkan" | "OpenGL")
                             }
                           />
                         </label>
+                        <Show
+                          when={
+                            !capabilitiesOf(draft.cfg!.frameworkVersion).apis.includes(
+                              draft.cfg!.rendering.api,
+                            )
+                          }
+                        >
+                          <p class="field-hint field-bad">
+                            This framework has no {draft.cfg!.rendering.api} backend, and its runtime
+                            will refuse to start the project. OpenGL is only on the v1 line.
+                          </p>
+                        </Show>
+                        {/* Which scene opens, for a library that can offer several (a v2 scene
+                            table). Empty keeps the runtime's default: the first scene it lists. */}
+                        <Show
+                          when={
+                            draft.cfg!.kind === "Scene" &&
+                            capabilitiesOf(draft.cfg!.frameworkVersion).features.includes("sceneTable")
+                          }
+                        >
+                          <label class="field">
+                            <span class="field-label">Start scene</span>
+                            <input
+                              class="input"
+                              type="text"
+                              placeholder="The library's first"
+                              value={draft.cfg!.scene ?? ""}
+                              onInput={(e) => {
+                                const name = e.currentTarget.value.trim();
+                                setDraft("cfg", "scene", name === "" ? undefined : name);
+                              }}
+                            />
+                          </label>
+                        </Show>
                         {/* A Scene's windowing system on Linux. Ignored on Windows/macOS, so only
                             shown there; a Job has no window. `auto` lets the runtime (GLFW)
-                            choose. Note OpenGL always runs on X11/XWayland — a Wayland choice
-                            with OpenGL is ignored by the runtime. */}
+                            choose. On a v1 framework, OpenGL always runs on X11/XWayland — a
+                            Wayland choice with OpenGL is ignored by the runtime. */}
                         <Show when={isLinux && draft.cfg!.kind === "Scene"}>
                           <label class="field">
                             <span class="field-label">Windowing (Linux)</span>
@@ -3432,6 +3504,7 @@ export default function App() {
                         already vendors. Empty is the normal state and costs nothing: a project
                         with no libraries gets no vcpkg.json and no toolchain file, and never
                         involves vcpkg in its build at all. */}
+                    <Show when={draft.cfg!.language !== "csharp"}>
                     <section class="panel">
                       <h2 class="panel-title">Libraries</h2>
                       <Show
@@ -3524,6 +3597,7 @@ export default function App() {
                         library added here is usable from your sources with no further setup.
                       </p>
                     </section>
+                    </Show>
 
                     {/* Sticky, and only present while there is something to save — a permanent
                         bar would make an unchanged project look unsaved. */}
@@ -4498,6 +4572,40 @@ export default function App() {
           <form class="modal" onClick={(e) => e.stopPropagation()} onSubmit={submitCreate}>
             <h2 class="modal-title">New Project</h2>
 
+            {/* C# needs a framework built with its bindings: offered only when the chosen one says
+                so, and falling back to C++ when the framework changes to one that does not. */}
+            <span class="field-label">Language</span>
+            <div class="template-picker">
+              <For
+                each={
+                  [
+                    ["c++", "C++", "A scene library, built with CMake and run on the Koral runtime."],
+                    ["csharp", "C#", "Scripts run by koral-dotnet, which compiles them and reloads them as you save."],
+                  ] as const
+                }
+              >
+                {([value, label, blurb]) => {
+                  const offered = () => value === "c++" || csharpOffered();
+                  return (
+                    <button
+                      type="button"
+                      class="template-card"
+                      classList={{ "template-active": language() === value }}
+                      disabled={!offered()}
+                      title={offered() ? undefined : "This framework was built without its C# bindings (-DKORAL_BUILD_DOTNET=ON)"}
+                      onClick={() => {
+                        setLanguage(value);
+                        if (value === "csharp") setKind("Scene");
+                      }}
+                    >
+                      <span class="template-name">{label}</span>
+                      <span class="template-blurb">{blurb}</span>
+                    </button>
+                  );
+                }}
+              </For>
+            </div>
+
             <span class="field-label">Template</span>
             <div class="template-picker">
               <For
@@ -4514,6 +4622,8 @@ export default function App() {
                     type="button"
                     class="template-card"
                     classList={{ "template-active": kind() === value }}
+                    disabled={language() === "csharp" && value !== "Scene"}
+                    title={language() === "csharp" && value !== "Scene" ? `A ${value} is C++ only` : undefined}
                     onClick={() => setKind(value)}
                   >
                     <span class="template-name">{value}</span>

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{self, Kind, ProjectConfig};
+use crate::model::{self, Kind, Language, ProjectConfig};
 use crate::paths;
 
 /// Committed, portable project metadata file.
@@ -45,9 +45,13 @@ pub fn create(
     framework_version: &str,
     color: [f32; 3],
     kind: Kind,
+    language: Language,
 ) -> Result<PathBuf, String> {
     if name.trim().is_empty() {
         return Err("project name cannot be empty".into());
+    }
+    if language == Language::CSharp && kind != Kind::Scene {
+        return Err("a C# project is a scene: jobs and modules are C++ only".into());
     }
     let root = location.join(name);
     if root.exists() {
@@ -61,9 +65,23 @@ pub fn create(
         std::fs::create_dir_all(root.join(sub)).map_err(|e| e.to_string())?;
     }
 
-    save(&root, &ProjectConfig::new(name, framework_version, color, kind))?;
-    write_sources(&root, name, kind)?;
-    write_gitignore(&root)?;
+    let mut config = ProjectConfig::new(name, framework_version, color, kind);
+    config.language = language;
+    save(&root, &config)?;
+    if language == Language::CSharp {
+        crate::csharp::write_sources(&root, name)?;
+        // Best-effort: the SDK may not be on this machine yet, and every run writes it again.
+        if let Ok((sdk_root, _)) = crate::framework::resolve(framework_version) {
+            let _ = crate::csharp::write_local_props(&root, &sdk_root);
+            let _ = crate::csharp::write_vscode(&root, &sdk_root);
+        }
+    } else {
+        // The framework decides how a scene library exports its scenes: a table of them on v2, the
+        // one `CreateScene` before it.
+        let scene_table = crate::framework::capabilities_for(framework_version).has("sceneTable");
+        write_sources(&root, name, kind, scene_table)?;
+        write_gitignore(&root)?;
+    }
 
     // Make the scaffold a git repo with an initial commit. Best-effort: a project is fine without
     // git, so a failure here (e.g. no identity configured and the fallback somehow unavailable)
@@ -82,7 +100,7 @@ pub fn create(
 /// never be picked up. A module instead exports the pair `KORAL_DECLARE_MODULE` defines, and its
 /// header is the *interface* other projects compile against, so the split between the two files is
 /// the whole lesson the template teaches.
-fn write_sources(root: &Path, name: &str, kind: Kind) -> Result<(), String> {
+fn write_sources(root: &Path, name: &str, kind: Kind, scene_table: bool) -> Result<(), String> {
     let src = root.join("src");
 
     if kind == Kind::Module {
@@ -97,6 +115,7 @@ fn write_sources(root: &Path, name: &str, kind: Kind) -> Result<(), String> {
     }
 
     let (header_tpl, source_tpl, export_tpl) = match kind {
+        Kind::Scene if scene_table => (SCENE_HEADER_TABLE, SCENE_SOURCE, SCENE_EXPORT_TABLE),
         Kind::Scene => (SCENE_HEADER, SCENE_SOURCE, SCENE_EXPORT),
         Kind::Job => (JOB_HEADER, JOB_SOURCE, JOB_EXPORT),
         Kind::Module => unreachable!("handled above"),
@@ -399,6 +418,36 @@ KORAL_EXPORT kor::Scene* CreateScene()
 }
 "#;
 
+// The same scene on the v2 line: its interface is opted into (a scene has ImGui only when it asks),
+// and the library exports a table of its scenes, which a library can grow to several.
+const SCENE_HEADER_TABLE: &str = r#"#pragma once
+
+#include <koral.h>
+
+class {NAME} final : public kor::Scene
+{
+public:
+    // RenderUI draws with ImGui, which a scene has only when it asks for an interface.
+    {NAME}() { EnableInterface(); }
+
+    void Initialize() override;
+    void Update() override;
+    void Render(kor::CommandBuffer& commandBuffer) override;
+    void RenderUI() override;
+};
+"#;
+
+const SCENE_EXPORT_TABLE: &str = r#"#include <sceneLibrary.h>
+
+#include "{HEADER}"
+
+// The scenes this library offers, by name. The runtime opens the one koral.json names ("scene"),
+// or the first. Add a KORAL_SCENE line for each scene the library grows.
+KORAL_SCENES(
+    KORAL_SCENE("{CLASS}", {CLASS}),
+)
+"#;
+
 const JOB_HEADER: &str = r#"#pragma once
 
 #include <koral.h>
@@ -507,6 +556,33 @@ mod tests {
     use super::*;
     use crate::model::Kind;
 
+    fn sources_for(scene_table: bool) -> (String, String) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("koral-template-test-{n}-{scene_table}"));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        write_sources(&root, "Game", Kind::Scene, scene_table).unwrap();
+        let header = std::fs::read_to_string(root.join("src/Game.h")).unwrap();
+        let export = std::fs::read_to_string(root.join("src/export.cpp")).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        (header, export)
+    }
+
+    #[test]
+    fn a_v2_scene_exports_a_table_and_asks_for_its_interface() {
+        let (header, export) = sources_for(true);
+        assert!(export.contains("KORAL_SCENES(") && export.contains(r#"KORAL_SCENE("Game", Game)"#), "{export}");
+        assert!(!export.contains("CreateScene"));
+        assert!(header.contains("EnableInterface()"), "{header}");
+    }
+
+    #[test]
+    fn a_v1_scene_exports_create_scene() {
+        let (header, export) = sources_for(false);
+        assert!(export.contains("CreateScene"), "{export}");
+        assert!(!header.contains("EnableInterface"));
+    }
+
     fn scratch() -> PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};
         let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -520,7 +596,7 @@ mod tests {
         let base = scratch();
         std::fs::create_dir_all(&base).unwrap();
 
-        let root = create(&base, "MyProj", "0.0.1", [0.5, 0.5, 0.5], Kind::Scene).unwrap();
+        let root = create(&base, "MyProj", "0.0.1", [0.5, 0.5, 0.5], Kind::Scene, Language::Cpp).unwrap();
         assert!(root.join(".git").is_dir(), "create should git-init the project");
         assert!(
             crate::git::info(&root).and_then(|g| g.branch).is_some(),
@@ -535,6 +611,27 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// A C# project: a scene script and a .csproj instead of C++ sources, marked as C# in koral.json
+    /// (and only there — a C++ project's file does not gain the key), and a scene only.
+    #[test]
+    fn a_csharp_project_is_scripts_and_says_so() {
+        let base = scratch();
+        std::fs::create_dir_all(&base).unwrap();
+        let root = create(&base, "Orbit", "0.0.9", [0.5, 0.5, 0.5], Kind::Scene, Language::CSharp).unwrap();
+        assert!(root.join("src/Orbit.cs").is_file());
+        assert!(root.join("Orbit.csproj").is_file());
+        assert!(!root.join("src/export.cpp").exists(), "no C++ in a C# project");
+        assert_eq!(load(&root).unwrap().language, Language::CSharp);
+        let text = std::fs::read_to_string(root.join(CONFIG_FILE)).unwrap();
+        assert!(text.contains(r#""language": "csharp""#), "{text}");
+
+        let cpp = create(&base, "Native", "0.0.9", [0.5, 0.5, 0.5], Kind::Scene, Language::Cpp).unwrap();
+        assert!(!std::fs::read_to_string(cpp.join(CONFIG_FILE)).unwrap().contains("language"));
+
+        assert!(create(&base, "Worker", "0.0.9", [0.5, 0.5, 0.5], Kind::Job, Language::CSharp).is_err());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     /// Everything the Hub generates is ignored, because every one of them is derived from
     /// `koral.json` and rewritten on the next build — a committed copy can only ever be stale.
     /// The project's own sources and `koral.json` are what a clone needs, and must stay tracked.
@@ -542,7 +639,7 @@ mod tests {
     fn generated_build_files_are_ignored_but_the_project_is_not() {
         let base = scratch();
         std::fs::create_dir_all(&base).unwrap();
-        let root = create(&base, "Ignored", "0.0.9", [0.5, 0.5, 0.5], Kind::Scene).unwrap();
+        let root = create(&base, "Ignored", "0.0.9", [0.5, 0.5, 0.5], Kind::Scene, Language::Cpp).unwrap();
 
         let rules: Vec<String> = std::fs::read_to_string(root.join(".gitignore"))
             .unwrap()
@@ -579,7 +676,7 @@ mod tests {
         let base = scratch();
         std::fs::create_dir_all(&base).unwrap();
 
-        let root = create(&base, "MyCameras", "0.0.9", [0.5, 0.5, 0.5], Kind::Module).unwrap();
+        let root = create(&base, "MyCameras", "0.0.9", [0.5, 0.5, 0.5], Kind::Module, Language::Cpp).unwrap();
         assert_eq!(load(&root).unwrap().kind, Kind::Module);
 
         let header = std::fs::read_to_string(root.join("src/MyCameras.h")).unwrap();

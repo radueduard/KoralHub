@@ -49,6 +49,54 @@ pub struct ProjectConfig {
     /// of other modules. Skipped when empty so older projects are not churned.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modules: Vec<String>,
+    /// What the project's scenes are written in. C++ builds a scene library with CMake and runs it on
+    /// the C++ runtime; C# runs its scripts on `koral-dotnet`, which compiles them itself. Skipped for
+    /// C++, so every project from before C# existed reads and writes as it did.
+    #[serde(default, skip_serializing_if = "Language::is_cpp")]
+    pub language: Language,
+    /// Which of the scene library's scenes the runtime opens (a library can offer several, on the
+    /// v2 line). Unset opens the first the library lists. Skipped when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<String>,
+    /// How the project is built, for one that is more than a scene library — an engine with modules,
+    /// tests and tools of its own. Absent for every project the Hub scaffolded: the Hub owns their
+    /// `CMakeLists.txt`. Skipped when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<Build>,
+}
+
+/// A project that writes its own build, and which of its targets ▶ runs.
+///
+/// The Hub still writes the machine-local `CMakePresets.json` (the SDK's paths, `KORAL_RUNTIME`) and
+/// the IDE run configurations; it only stops writing — and ignoring — `CMakeLists.txt`. The
+/// project's own CMake has to meet the scaffold's contract: `find_package(Koral)` through the
+/// preset's `CMAKE_PREFIX_PATH`, and the scene library at the top of the build directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Build {
+    /// The project's `CMakeLists.txt` is its own: never generated, never git-ignored.
+    #[serde(default, rename = "ownCMakeLists")]
+    pub own_cmake_lists: bool,
+    /// The CMake target whose library ▶ and the IDEs run. Unset means the project's name, as for a
+    /// scaffolded project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
+impl ProjectConfig {
+    /// Whether the project writes its own `CMakeLists.txt`. @see Build
+    pub fn owns_cmake_lists(&self) -> bool {
+        self.build.as_ref().is_some_and(|b| b.own_cmake_lists)
+    }
+
+    /// The CMake target that builds the scene library to run: [`Build::target`], else the name.
+    pub fn scene_target(&self) -> &str {
+        self.build
+            .as_ref()
+            .and_then(|b| b.target.as_deref())
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or(&self.name)
+    }
 }
 
 impl ProjectConfig {
@@ -78,7 +126,26 @@ impl ProjectConfig {
             paths: Paths::default(),
             libraries: Vec::new(),
             modules: Vec::new(),
+            language: Language::default(),
+            scene: None,
+            build: None,
         }
+    }
+}
+
+/// The language a project's scenes are written in. Serialized as `"c++"` / `"csharp"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Language {
+    #[default]
+    #[serde(rename = "c++")]
+    Cpp,
+    #[serde(rename = "csharp")]
+    CSharp,
+}
+
+impl Language {
+    pub fn is_cpp(&self) -> bool {
+        *self == Language::Cpp
     }
 }
 
@@ -203,8 +270,8 @@ pub struct Rendering {
     pub api: Api,
     /// Linux windowing system a Scene opens on; ignored on Windows and macOS. The runtime turns
     /// this into a GLFW init hint before `glfwInit()` — `auto` keeps GLFW's own choice (Wayland
-    /// when a Wayland session is present, X11 otherwise). OpenGL always runs on X11/XWayland
-    /// regardless, so a `wayland` request there is ignored by the runtime with a warning.
+    /// when a Wayland session is present, X11 otherwise). OpenGL — a v1 backend — always runs on
+    /// X11/XWayland regardless, so a `wayland` request there is ignored by the runtime with a warning.
     ///
     /// A per-machine `--platform` override still rides in on the launch (see `builder::runtime_args`)
     /// and wins over this; this is the project's committed default, editable in the settings panel.
@@ -219,14 +286,18 @@ impl Default for Rendering {
     }
 }
 
+/// The graphics backend. Which ones a framework has is its [`Capabilities::apis`]: both on the v1
+/// line, only Vulkan on v2, whose runtime refuses a project asking for OpenGL.
+///
+/// [`Capabilities::apis`]: crate::framework::Capabilities
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Api {
     OpenGL,
     Vulkan,
 }
 
-/// Linux windowing system, spelled exactly as the runtime's `rendering.platform` / `--platform`
-/// accepts it. Serialized lowercase (`auto` / `x11` / `wayland`).
+/// Windowing system, spelled exactly as the runtime's `rendering.platform` / `--platform` accepts
+/// it. Serialized lowercase (`auto` / `x11` / `wayland` / `none`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Platform {
@@ -235,6 +306,9 @@ pub enum Platform {
     Auto,
     X11,
     Wayland,
+    /// No windowing system, on any OS: offscreen scenes only (a v2 runtime). The Hub never offers
+    /// it, but reads a project that says it rather than refusing the file.
+    None,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,6 +415,21 @@ mod contract_tests {
         println!("{}", serde_json::to_string_pretty(&cfg).unwrap());
     }
 
+    /// `"none"` is the runtime's for an offscreen-only project (headless servers, tests, C# scenes
+    /// run with no display): the Hub must read such a project, and write it back as it was.
+    #[test]
+    fn platform_none_round_trips() {
+        let cfg: ProjectConfig = serde_json::from_str(
+            r#"{ "schemaVersion":1, "name":"Server", "color":[1,0,0], "frameworkVersion":"0.0.9",
+                 "rendering": { "api": "Vulkan", "platform": "none",
+                   "window": { "width": 8, "height": 8, "resizable": false, "fullscreen": false,
+                               "borderless": false, "transparent": false } } }"#,
+        )
+        .expect("a project with no windowing system should parse");
+        assert_eq!(cfg.rendering.platform, Platform::None);
+        assert!(serde_json::to_string(&cfg).unwrap().contains(r#""platform":"none""#));
+    }
+
     /// The modules list is the runtime's feature switch; the Hub carrying it through a load/save
     /// round trip is what makes editing any *other* setting safe for a project that uses modules.
     #[test]
@@ -357,6 +446,33 @@ mod contract_tests {
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("koral-camera"), "saving must not drop the modules list");
         assert!(json.contains("moduleDirectories"));
+    }
+
+    /// A project that owns its CMakeLists says so in koral.json; the Hub must carry that through a
+    /// load/save round trip, or the next build would overwrite the project's own build with the
+    /// scaffold's.
+    #[test]
+    fn an_own_build_survives_a_round_trip() {
+        let cfg: ProjectConfig = serde_json::from_str(
+            r#"{ "schemaVersion":1, "name":"KoralEngine", "color":[1,0,0], "frameworkVersion":"source",
+                 "scene": "Editor",
+                 "build": { "ownCMakeLists": true, "target": "KoralEditor" } }"#,
+        )
+        .expect("a config with a build section should parse");
+        assert!(cfg.owns_cmake_lists());
+        assert_eq!(cfg.scene_target(), "KoralEditor");
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains(r#""build":{"ownCMakeLists":true,"target":"KoralEditor"}"#), "{json}");
+    }
+
+    /// Without a build section the Hub owns the CMakeLists, and runs the library named after the project.
+    #[test]
+    fn a_scaffolded_project_has_no_build_section() {
+        let cfg = ProjectConfig::new("Plain", "0.0.9", [0.0, 0.0, 0.0], Kind::Scene);
+        assert!(!cfg.owns_cmake_lists());
+        assert_eq!(cfg.scene_target(), "Plain");
+        assert!(!serde_json::to_string(&cfg).unwrap().contains("\"build\""));
     }
 
     /// A project with no modules must not gain the keys just because the Hub saved it.

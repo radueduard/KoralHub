@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn a_project_round_trips_through_a_zip() {
         let dir = scratch("roundtrip");
-        let root = project::create(&dir, "Lab1", "0.1.0", [0.5, 0.5, 0.5], Kind::Scene).unwrap();
+        let root = project::create(&dir, "Lab1", "0.1.0", [0.5, 0.5, 0.5], Kind::Scene, crate::model::Language::Cpp).unwrap();
         std::fs::write(root.join("assets").join("note.txt"), "hello").unwrap();
 
         let zip = dir.join("Lab1.zip");
@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn build_output_and_generated_files_are_left_out() {
         let dir = scratch("excludes");
-        let root = project::create(&dir, "Lab2", "0.1.0", [0.5, 0.5, 0.5], Kind::Scene).unwrap();
+        let root = project::create(&dir, "Lab2", "0.1.0", [0.5, 0.5, 0.5], Kind::Scene, crate::model::Language::Cpp).unwrap();
         std::fs::create_dir_all(root.join("cmake-build-debug")).unwrap();
         std::fs::write(root.join("cmake-build-debug").join("Lab2.dll"), "binary").unwrap();
         std::fs::write(root.join("CMakePresets.json"), "{}").unwrap();
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn importing_over_an_existing_folder_is_refused() {
         let dir = scratch("clash");
-        let root = project::create(&dir, "Lab3", "0.1.0", [0.5, 0.5, 0.5], Kind::Scene).unwrap();
+        let root = project::create(&dir, "Lab3", "0.1.0", [0.5, 0.5, 0.5], Kind::Scene, crate::model::Language::Cpp).unwrap();
         let zip = dir.join("Lab3.zip");
         export(&root, &zip).unwrap();
 

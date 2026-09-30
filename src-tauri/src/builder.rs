@@ -61,12 +61,12 @@ impl Console {
     }
 
     /// Build-tab output: configure/compile progress and diagnostics.
-    fn build(&self, text: &str) {
+    pub(crate) fn build(&self, text: &str) {
         let _ = self.app.emit("build-output", Line { project: &self.project, text });
     }
 
     /// Output-tab output: the launch line and the running app's own stdout/stderr.
-    fn run(&self, text: &str) {
+    pub(crate) fn run(&self, text: &str) {
         let _ = self.app.emit("run-output", Line { project: &self.project, text });
     }
 
@@ -258,12 +258,15 @@ fn build(console: &Console, profile: &str) -> Result<BuildOutcome, String> {
     Ok(BuildOutcome {
         sdk_root,
         runtime_rel: manifest.runtime,
-        lib_path: build_dir.join(lib_file_name(&cfg.name)),
+        lib_path: build_dir.join(lib_file_name(cfg.scene_target())),
     })
 }
 
 /// Build the project (as a `build-*` event stream) and return once done.
 pub fn build_only(console: &Console, profile: &str) -> Result<(), String> {
+    if project::load(console.root())?.language == crate::model::Language::CSharp {
+        return crate::csharp::build(console, profile).map(|_| ());
+    }
     build(console, profile).map(|_| ())
 }
 
@@ -273,6 +276,9 @@ pub fn run(console: &Console, profile: &str) -> Result<(), String> {
     // CreateJob, and fail with a much less helpful message than this one. Checked before the
     // build so the user is told immediately, not after a full compile.
     let cfg = project::load(console.root())?;
+    if cfg.language == crate::model::Language::CSharp {
+        return crate::csharp::run(console, profile);
+    }
     if !cfg.kind.is_runnable() {
         return Err(format!(
             "'{}' is a module — it cannot run on its own. Build it here, then run a project that \
@@ -292,7 +298,12 @@ pub fn run(console: &Console, profile: &str) -> Result<(), String> {
     }
 
     let runtime = outcome.sdk_root.join(&outcome.runtime_rel);
-    let args = runtime_args(&outcome.lib_path);
+    let mut args = runtime_args(&outcome.lib_path);
+    // A run from the Hub is development: rebuilding while it runs reloads the scene library, each
+    // scene keeping its state — on a framework that can.
+    if crate::framework::Capabilities::read(&outcome.sdk_root).has("hotReload") {
+        args.push("--hot-reload".into());
+    }
 
     // The launch line and everything the app prints belong on the Output tab, not the Build tab.
     console.run(&format!("$ {} {}\n", runtime.display(), args.join(" ")));
@@ -323,7 +334,7 @@ fn pump(mut stream: impl Read, console: Console) {
 /// would in a terminal — which piping its stdout could never achieve, since programs disable colour
 /// when their output is not a terminal.
 #[cfg(unix)]
-fn launch(console: &Console, runtime: &Path, args: &[String]) -> Result<(), String> {
+pub(crate) fn launch(console: &Console, runtime: &Path, args: &[String]) -> Result<(), String> {
     let pty = native_pty_system();
     let pair = pty
         .openpty(PtySize { rows: 40, cols: 140, pixel_width: 0, pixel_height: 0 })
@@ -381,7 +392,7 @@ fn launch(console: &Console, runtime: &Path, args: &[String]) -> Result<(), Stri
 /// The cost is the app's ANSI colour, which it turns off when it sees a pipe — the same trade the
 /// build tools already make on every platform. Running is worth more than colour.
 #[cfg(windows)]
-fn launch(console: &Console, runtime: &Path, args: &[String]) -> Result<(), String> {
+pub(crate) fn launch(console: &Console, runtime: &Path, args: &[String]) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     use std::process::Stdio;
 
@@ -443,7 +454,7 @@ fn launch(console: &Console, runtime: &Path, args: &[String]) -> Result<(), Stri
 ///
 /// Shared with `scaffold`.
 pub fn runtime_args(lib: &Path) -> Vec<String> {
-    let args = vec![lib.to_string_lossy().into_owned()];
+    let mut args = vec![lib.to_string_lossy().into_owned()];
     #[cfg(target_os = "linux")]
     {
         // `""` means "no preference" (leave `platform` at the config's `auto`); `"x11"` / `"wayland"`
@@ -460,7 +471,7 @@ pub fn runtime_args(lib: &Path) -> Vec<String> {
 
 /// Run one child process to completion, forwarding its stdout+stderr to the UI. Errors if
 /// the process can't launch or exits non-zero.
-fn run_step(console: &Console, cmd: &mut Command) -> Result<(), String> {
+pub(crate) fn run_step(console: &Console, cmd: &mut Command) -> Result<(), String> {
     let output = cmd
         .output()
         .map_err(|e| format!("failed to launch {:?}: {e}", cmd.get_program()))?;

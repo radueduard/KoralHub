@@ -14,7 +14,7 @@ use crate::collection;
 use crate::framework::{self, AvailableFramework, InstalledFramework};
 use crate::git::{self, GitInfo};
 use crate::ide;
-use crate::model::{Kind, ProjectConfig};
+use crate::model::{Kind, Language, ProjectConfig};
 use crate::modules;
 use crate::project;
 use crate::scaffold;
@@ -33,6 +33,8 @@ pub struct RecentProject {
     pub framework_version: String,
     /// Shown on the card, and decides whether the settings panel offers window options.
     pub kind: Kind,
+    /// What its scenes are written in: decides how it is built and run, and what settings apply.
+    pub language: Language,
     /// Git status for the card (branch / dirty / remote), or `None` if the folder isn't a repo.
     pub git: Option<GitInfo>,
 }
@@ -48,6 +50,7 @@ impl RecentProject {
             color: cfg.color,
             framework_version: cfg.framework_version,
             kind: cfg.kind,
+            language: cfg.language,
         })
     }
 }
@@ -83,6 +86,9 @@ pub struct CreateProjectRequest {
     /// Scene (realtime, windowed) or Job (single dispatch, headless). Defaults to Scene.
     #[serde(default)]
     pub kind: Kind,
+    /// C++ or C#. Defaults to C++.
+    #[serde(default)]
+    pub language: Language,
 }
 
 /// Scaffold a new project, add it to the recent index, and return its list entry.
@@ -101,7 +107,7 @@ pub fn create_project(req: CreateProjectRequest) -> Result<RecentProject, String
     };
     let color = project::random_color();
 
-    let root = project::create(Path::new(&req.location), &req.name, &version, color, req.kind)?;
+    let root = project::create(Path::new(&req.location), &req.name, &version, color, req.kind, req.language)?;
     project::add_recent(&root)?;
 
     Ok(RecentProject {
@@ -111,6 +117,7 @@ pub fn create_project(req: CreateProjectRequest) -> Result<RecentProject, String
         color,
         framework_version: version,
         kind: req.kind,
+        language: req.language,
     })
 }
 
@@ -1059,6 +1066,11 @@ pub fn open_in_ide(path: String, ide_id: Option<String>) -> Result<(), String> {
     };
 
     let cfg = project::load(root)?;
+    if cfg.language == Language::CSharp {
+        // No CMake here: the .csproj is the IDE's project, and only needs to know where the SDK is.
+        crate::csharp::prepare(root)?;
+        return ide::open(&ide_id, root);
+    }
     // resolve(), not ensure_installed() + read_manifest(): a source build carries no
     // framework.json of its own, and its manifest is derived from the tree each time.
     let (sdk_root, manifest) = framework::resolve(&cfg.framework_version)?;

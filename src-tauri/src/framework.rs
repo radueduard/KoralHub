@@ -83,6 +83,64 @@ pub struct InstalledFramework {
     /// debug info, so a crash in it can never land on a line of framework source.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_type: Option<String>,
+    /// What this SDK can do — its graphics APIs, the scene interface it speaks. What the settings
+    /// panel offers and the templates a new project gets follow from it.
+    pub capabilities: Capabilities,
+}
+
+/// What an SDK can do, from the `share/Koral/capabilities.json` it ships.
+///
+/// An SDK from before that file existed is a v1 SDK: OpenGL and Vulkan, and a scene library that
+/// exports `CreateScene`. Everything newer says what it is rather than leaving the Hub to guess from
+/// a version number, which the release line does not follow.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Capabilities {
+    /// The framework line: 1 (OpenGL and Vulkan, `CreateScene`) or 2 (Vulkan, scene tables).
+    #[serde(default = "Capabilities::v1_line")]
+    pub line: u32,
+    /// The graphics APIs `rendering.api` may name.
+    #[serde(default = "Capabilities::v1_apis")]
+    pub apis: Vec<String>,
+    /// `KORAL_SCENE_ABI_VERSION`; 0 for an SDK whose libraries export `CreateScene`.
+    #[serde(default)]
+    pub scene_abi_version: u32,
+    /// What it can do beyond that: `sceneTable`, `hotReload`, `offscreenScenes`, `cApi`, ...
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+impl Capabilities {
+    fn v1_line() -> u32 { 1 }
+    fn v1_apis() -> Vec<String> { vec!["Vulkan".into(), "OpenGL".into()] }
+
+    /// What an SDK without the file is.
+    pub fn v1() -> Self {
+        Self { line: 1, apis: Self::v1_apis(), scene_abi_version: 0, features: Vec::new() }
+    }
+
+    pub fn has(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
+
+    /// The SDK at `sdk_root`'s capabilities; v1 when it ships none (or they cannot be read).
+    pub fn read(sdk_root: &Path) -> Self {
+        let file = sdk_root.join("share").join("Koral").join("capabilities.json");
+        std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_else(Self::v1)
+    }
+}
+
+/// The capabilities of the SDK a project pinned to `version` builds against, when it is installed;
+/// v1 when it is not (nothing to read, and v1 is what offers the most).
+pub fn capabilities_for(version: &str) -> Capabilities {
+    installed()
+        .into_iter()
+        .find(|f| f.version == version)
+        .map(|f| f.capabilities)
+        .unwrap_or_else(Capabilities::v1)
 }
 
 /// A release that *could* be installed on this machine — i.e. one that publishes an SDK
@@ -395,6 +453,7 @@ pub fn installed() -> Vec<InstalledFramework> {
                 version: version_name.clone(),
                 platform: platform.file_name().to_string_lossy().into_owned(),
                 size_bytes: dir_size(&dir),
+                capabilities: Capabilities::read(&dir),
                 path: dir.to_string_lossy().into_owned(),
                 local: false,
                 source_dir: None,
@@ -422,6 +481,7 @@ pub fn installed() -> Vec<InstalledFramework> {
             name: entry.name,
             platform: host.clone(),
             size_bytes: 0,
+            capabilities: Capabilities::read(Path::new(&entry.path)),
             path: entry.path,
             local: true,
             source_dir: (!entry.source_dir.is_empty()).then_some(entry.source_dir),
@@ -1196,6 +1256,41 @@ pub(crate) fn extract_zip(bytes: &[u8], dest: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_sdk_without_capabilities_is_a_v1_sdk() {
+        let root = scratch();
+        let caps = Capabilities::read(&root);
+        assert_eq!(caps, Capabilities::v1());
+        assert!(caps.apis.iter().any(|a| a == "OpenGL"), "v1 offers OpenGL");
+        assert!(!caps.has("sceneTable"));
+    }
+
+    #[test]
+    fn an_sdk_says_what_it_can_do() {
+        let root = scratch();
+        let dir = root.join("share").join("Koral");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("capabilities.json"), r#"{
+            "schemaVersion": 1, "version": "0.1.0", "line": 2, "apis": ["Vulkan"],
+            "sceneAbiVersion": 2, "features": ["sceneTable", "hotReload"], "somethingNewer": true
+        }"#).unwrap();
+        let caps = Capabilities::read(&root);
+        assert_eq!(caps.line, 2);
+        assert_eq!(caps.apis, vec!["Vulkan".to_string()]);
+        assert_eq!(caps.scene_abi_version, 2);
+        assert!(caps.has("sceneTable") && caps.has("hotReload"));
+        assert!(!caps.has("cApi"));
+    }
+
+    #[test]
+    fn unreadable_capabilities_are_taken_as_v1() {
+        let root = scratch();
+        let dir = root.join("share").join("Koral");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("capabilities.json"), "{ not json").unwrap();
+        assert_eq!(Capabilities::read(&root), Capabilities::v1());
+    }
 
     fn scratch() -> PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};

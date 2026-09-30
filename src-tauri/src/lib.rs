@@ -3,6 +3,7 @@ mod auth;
 mod builder;
 mod collection;
 mod commands;
+mod csharp;
 #[cfg(debug_assertions)]
 mod dev_server;
 mod framework;

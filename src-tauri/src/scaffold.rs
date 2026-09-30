@@ -48,10 +48,13 @@ pub fn generate(
     let active_tree = framework::tree_for_profile(sdk_root, profile);
 
     let modules = crate::modules::build_inputs(&cfg.modules, &active_tree);
-    write(
-        project_root.join("CMakeLists.txt"),
-        &cmakelists(project_root, &cfg.name, &modules.sdk_targets, &cfg.libraries),
-    )?;
+    // A project that writes its own build keeps it: only the machine-local files below are ours.
+    if !cfg.owns_cmake_lists() {
+        write(
+            project_root.join("CMakeLists.txt"),
+            &cmakelists(project_root, &cfg.name, &modules.sdk_targets, &cfg.libraries),
+        )?;
+    }
 
     let vcpkg = vcpkg_toolchain(cfg)?;
     let manifest_file = project_root.join("vcpkg.json");
@@ -213,21 +216,25 @@ fn ide_configs(
     // `/.koral/` is in the template a fresh project gets, but a project scaffolded before the
     // debug script existed has no rule for it — and would commit a file full of this machine's
     // absolute paths.
-    ensure_ignored(
-        project_root,
-        &[
-            "/.idea/",
-            "/.vscode/launch.json",
-            "/.vscode/c_cpp_properties.json",
-            "/.koral/",
-            // Generated from koral.json on every build, so a committed copy is only ever a stale
-            // duplicate of it. Older projects committed these before that was settled; the rule
-            // stops the churn, but untracking an already-committed copy is the user's call —
-            // `git rm --cached` is not something the Hub should do to a repository behind them.
-            "/CMakeLists.txt",
-            "/vcpkg.json",
-        ],
-    )
+    let mut rules = vec![
+        "/.idea/",
+        "/.vscode/launch.json",
+        "/.vscode/c_cpp_properties.json",
+        "/.koral/",
+        // This machine's absolute SDK paths: never portable. A fresh project's template already has
+        // it; a project imported from elsewhere may not.
+        "/CMakePresets.json",
+        // Generated from koral.json on every build, so a committed copy is only ever a stale
+        // duplicate of it. Older projects committed these before that was settled; the rule
+        // stops the churn, but untracking an already-committed copy is the user's call —
+        // `git rm --cached` is not something the Hub should do to a repository behind them.
+        "/vcpkg.json",
+    ];
+    // Unless the project writes its own: then it is source, and ignoring it would lose it.
+    if !cfg.owns_cmake_lists() {
+        rules.push("/CMakeLists.txt");
+    }
+    ensure_ignored(project_root, &rules)
 }
 
 /// Write the gdb script that puts the framework's and modules' sources on the debugger's search
@@ -558,7 +565,7 @@ fn launch_config(
     let build_dir = build_dir_name(profile);
     let lib = format!(
         "${{workspaceFolder}}/{build_dir}/{}",
-        crate::builder::lib_file_name(&cfg.name)
+        crate::builder::lib_file_name(cfg.scene_target())
     );
     // The library is the only argument, and there is no environment to set: the runtime reads the
     // project's koral.json for its API, window and content directories. See `builder::runtime_args`.
@@ -671,7 +678,7 @@ fn clion_run_config(cfg: &ProjectConfig, profile: &str, runtime: &Path) -> Strin
     let build_dir = build_dir_name(profile);
     let lib = format!(
         "$PROJECT_DIR$/{build_dir}/{}",
-        crate::builder::lib_file_name(&cfg.name)
+        crate::builder::lib_file_name(cfg.scene_target())
     );
     // The library alone, and no <envs> block: the runtime takes its API, window and content
     // directories from the project's koral.json. See `builder::runtime_args`.
@@ -679,7 +686,7 @@ fn clion_run_config(cfg: &ProjectConfig, profile: &str, runtime: &Path) -> Strin
 
     format!(
         r#"<component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="Koral: {name} ({profile})" type="CMakeRunConfiguration" factoryName="Application" PROGRAM_PARAMS="{params}" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="{name}" TARGET_NAME="{name}" CONFIG_NAME="{config}" RUN_PATH="{runtime}" WORKING_DIR="$PROJECT_DIR$">
+  <configuration default="false" name="Koral: {name} ({profile})" type="CMakeRunConfiguration" factoryName="Application" PROGRAM_PARAMS="{params}" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="{name}" TARGET_NAME="{target}" CONFIG_NAME="{config}" RUN_PATH="{runtime}" WORKING_DIR="$PROJECT_DIR$">
     <method v="2">
       <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
     </method>
@@ -687,6 +694,7 @@ fn clion_run_config(cfg: &ProjectConfig, profile: &str, runtime: &Path) -> Strin
 </component>
 "#,
         name = cfg.name,
+        target = cfg.scene_target(),
         profile = profile,
         config = xml_attr(&clion_profile_name(profile)),
         params = xml_attr(&params.join(" ")),
@@ -1318,6 +1326,58 @@ mod tests {
         let root = std::env::temp_dir().join(format!("koral-{tag}-{n}"));
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn own_build(name: &str, target: &str) -> ProjectConfig {
+        let mut cfg = ProjectConfig::new(name, "source", [0.5, 0.5, 0.5], crate::model::Kind::Scene);
+        cfg.build = Some(crate::model::Build { own_cmake_lists: true, target: Some(target.into()) });
+        cfg
+    }
+
+    /// A project that writes its own build — an engine with modules and tests — keeps it: the Hub
+    /// writes only what is machine-local, and never git-ignores the project's CMakeLists.
+    #[test]
+    fn a_project_with_its_own_build_keeps_its_cmakelists() {
+        let root = scratch("own-build");
+        let mine = "cmake_minimum_required(VERSION 3.28)\nproject(KoralEngine)\n# the project's own\n";
+        std::fs::write(root.join("CMakeLists.txt"), mine).unwrap();
+        std::fs::write(root.join(".gitignore"), "/build/\n").unwrap();
+
+        let cfg = own_build("KoralEngine", "KoralEditor");
+        generate(&root, &cfg, Path::new("/sdk"), &manifest(), "Debug").expect("generate");
+
+        assert_eq!(std::fs::read_to_string(root.join("CMakeLists.txt")).unwrap(), mine);
+        assert!(root.join("CMakePresets.json").exists(), "the presets are still the Hub's to write");
+        let ignored = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(!ignored.lines().any(|l| l.trim() == "/CMakeLists.txt"), "{ignored}");
+        assert!(ignored.lines().any(|l| l.trim() == "/CMakePresets.json"), "{ignored}");
+
+        let launch = std::fs::read_to_string(root.join(".vscode").join("launch.json")).unwrap();
+        assert!(launch.contains(&crate::builder::lib_file_name("KoralEditor")), "{launch}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A scaffolded project's CMakeLists is still the Hub's: regenerated, and ignored.
+    #[test]
+    fn a_scaffolded_project_gets_its_cmakelists_written() {
+        let root = scratch("scaffolded-build");
+        std::fs::write(root.join("CMakeLists.txt"), "stale").unwrap();
+        let cfg = ProjectConfig::new("Game", "source", [0.5, 0.5, 0.5], crate::model::Kind::Scene);
+        generate(&root, &cfg, Path::new("/sdk"), &manifest(), "Debug").expect("generate");
+
+        assert!(std::fs::read_to_string(root.join("CMakeLists.txt")).unwrap().contains("project(Game"));
+        let ignored = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(ignored.lines().any(|l| l.trim() == "/CMakeLists.txt"), "{ignored}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// CLion is told to build and run the project's scene target, not a target named after it.
+    #[test]
+    fn the_run_config_runs_the_projects_own_target() {
+        let cfg = own_build("KoralEngine", "KoralEditor");
+        let run = clion_run_config(&cfg, "Debug", Path::new("/sdk/bin/Koral_Runtime"));
+        assert!(run.contains(r#"PROJECT_NAME="KoralEngine" TARGET_NAME="KoralEditor""#), "{run}");
+        assert!(run.contains(&crate::builder::lib_file_name("KoralEditor")), "{run}");
     }
 
     /// The run configuration names the CMake profile it builds with, and that has to be the
