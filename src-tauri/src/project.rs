@@ -53,6 +53,9 @@ pub fn create(
     if language == Language::CSharp && kind != Kind::Scene {
         return Err("a C# project is a scene: jobs and modules are C++ only".into());
     }
+    if language == Language::Kotlin && kind != Kind::Scene {
+        return Err("a Kotlin project is a scene: jobs and modules are C++ only".into());
+    }
     let root = location.join(name);
     if root.exists() {
         return Err(format!(
@@ -68,7 +71,14 @@ pub fn create(
     let mut config = ProjectConfig::new(name, framework_version, color, kind);
     config.language = language;
     save(&root, &config)?;
-    if language == Language::CSharp {
+    if language == Language::Kotlin {
+        crate::kotlin::write_sources(&root, name)?;
+        // Best-effort, as for C#: the wrapper and gradle.properties come from the SDK, and every run
+        // writes them again.
+        if let Ok((sdk_root, _)) = crate::framework::resolve(framework_version) {
+            let _ = crate::kotlin::write_machine_files(&root, &sdk_root);
+        }
+    } else if language == Language::CSharp {
         crate::csharp::write_sources(&root, name)?;
         // Best-effort: the SDK may not be on this machine yet, and every run writes it again.
         if let Ok((sdk_root, _)) = crate::framework::resolve(framework_version) {
@@ -609,6 +619,21 @@ mod tests {
         assert_eq!(load(&dest).unwrap().name, "MyProj");
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A Kotlin project is a Gradle build with a scene in src/main/kotlin, and a scene only.
+    #[test]
+    fn a_kotlin_project_is_a_gradle_build_and_says_so() {
+        let base = std::env::temp_dir().join(format!("koral-kotlin-project-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let root = create(&base, "Orbit", "0.0.9", [0.5, 0.5, 0.5], Kind::Scene, Language::Kotlin).unwrap();
+        assert!(root.join("src/main/kotlin/Orbit.kt").is_file());
+        assert!(root.join("build.gradle.kts").is_file());
+        assert_eq!(load(&root).unwrap().language, Language::Kotlin);
+        let text = std::fs::read_to_string(root.join("koral.json")).unwrap();
+        assert!(text.contains(r#""language": "kotlin""#), "{text}");
+        assert!(create(&base, "Worker", "0.0.9", [0.5, 0.5, 0.5], Kind::Job, Language::Kotlin).is_err());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     /// A C# project: a scene script and a .csproj instead of C++ sources, marked as C# in koral.json

@@ -12,7 +12,7 @@ import "./App.css";
 // Job   = single-dispatch headless app: Run() once to completion, then exit.
 type Kind = "Scene" | "Job" | "Module";
 // Mirrors `model::Language`: what a project's scenes are written in.
-type Language = "c++" | "csharp";
+type Language = "c++" | "csharp" | "kotlin";
 
 // Mirrors `GitInfo` — the bit of git status shown beside a project. Null when it isn't a repo.
 type GitInfo = {
@@ -225,7 +225,7 @@ type ProjectConfig = {
   // Extra vcpkg ports this project's own source needs, beyond what the SDK already vendors.
   // Empty for most projects; edited by the Libraries panel.
   libraries?: Library[];
-  // Absent for C++: only a C# project's file carries it.
+  // Absent for C++: only a C# or Kotlin project's file carries it.
   language?: Language;
   [key: string]: unknown;
 };
@@ -965,10 +965,11 @@ export default function App() {
   // What the framework a project pins can do; v1's when it is not installed (nothing to read).
   const capabilitiesOf = (version: string): Capabilities =>
     installed()?.find((f) => f.version === version)?.capabilities ?? V1_CAPABILITIES;
-  // Whether the framework picked for a new project can run C# scenes.
-  const csharpOffered = () => capabilitiesOf(newFramework()).features.includes("csharp");
+  // Whether the framework picked for a new project can run C# or Kotlin scenes: each needs its
+  // bindings built into the SDK, which its capabilities say.
+  const languageOffered = (value: Language) => value === "c++" || capabilitiesOf(newFramework()).features.includes(value);
   createEffect(() => {
-    if (language() === "csharp" && !csharpOffered()) setLanguage("c++");
+    if (!languageOffered(language())) setLanguage("c++");
   });
 
   const [installed, { refetch: refetchInstalled }] = createResource<InstalledFramework[]>(() =>
@@ -3032,7 +3033,7 @@ export default function App() {
                   <span
                     class="project-kind"
                   >
-                    {p().language === "csharp" ? `C# ${p().kind}` : p().kind}
+                    {p().language === "csharp" ? `C# ${p().kind}` : p().language === "kotlin" ? `Kotlin ${p().kind}` : p().kind}
                   </span>
                   <span class="project-fw">{frameworkLabel(p().frameworkVersion)}</span>
                   <Show when={p().git}>
@@ -3504,7 +3505,7 @@ export default function App() {
                         already vendors. Empty is the normal state and costs nothing: a project
                         with no libraries gets no vcpkg.json and no toolchain file, and never
                         involves vcpkg in its build at all. */}
-                    <Show when={draft.cfg!.language !== "csharp"}>
+                    <Show when={(draft.cfg!.language ?? "c++") === "c++"}>
                     <section class="panel">
                       <h2 class="panel-title">Libraries</h2>
                       <Show
@@ -4572,8 +4573,8 @@ export default function App() {
           <form class="modal" onClick={(e) => e.stopPropagation()} onSubmit={submitCreate}>
             <h2 class="modal-title">New Project</h2>
 
-            {/* C# needs a framework built with its bindings: offered only when the chosen one says
-                so, and falling back to C++ when the framework changes to one that does not. */}
+            {/* C# and Kotlin need a framework built with their bindings: offered only when the chosen one
+                says so, and falling back to C++ when the framework changes to one that does not. */}
             <span class="field-label">Language</span>
             <div class="template-picker">
               <For
@@ -4581,21 +4582,24 @@ export default function App() {
                   [
                     ["c++", "C++", "A scene library, built with CMake and run on the Koral runtime."],
                     ["csharp", "C#", "Scripts run by koral-dotnet, which compiles them and reloads them as you save."],
+                    ["kotlin", "Kotlin", "A Gradle project with Jetpack Compose interfaces; edits apply while it runs."],
                   ] as const
                 }
               >
                 {([value, label, blurb]) => {
-                  const offered = () => value === "c++" || csharpOffered();
+                  const offered = () => languageOffered(value);
                   return (
                     <button
                       type="button"
                       class="template-card"
                       classList={{ "template-active": language() === value }}
                       disabled={!offered()}
-                      title={offered() ? undefined : "This framework was built without its C# bindings (-DKORAL_BUILD_DOTNET=ON)"}
+                      title={offered() ? undefined : value === "kotlin"
+                        ? "This framework was built without its Kotlin bindings (-DKORAL_BUILD_KOTLIN=ON)"
+                        : "This framework was built without its C# bindings (-DKORAL_BUILD_DOTNET=ON)"}
                       onClick={() => {
                         setLanguage(value);
-                        if (value === "csharp") setKind("Scene");
+                        if (value !== "c++") setKind("Scene");
                       }}
                     >
                       <span class="template-name">{label}</span>
@@ -4622,8 +4626,8 @@ export default function App() {
                     type="button"
                     class="template-card"
                     classList={{ "template-active": kind() === value }}
-                    disabled={language() === "csharp" && value !== "Scene"}
-                    title={language() === "csharp" && value !== "Scene" ? `A ${value} is C++ only` : undefined}
+                    disabled={language() !== "c++" && value !== "Scene"}
+                    title={language() !== "c++" && value !== "Scene" ? `A ${value} is C++ only` : undefined}
                     onClick={() => setKind(value)}
                   >
                     <span class="template-name">{value}</span>

@@ -1071,6 +1071,11 @@ pub fn open_in_ide(path: String, ide_id: Option<String>) -> Result<(), String> {
         crate::csharp::prepare(root)?;
         return ide::open(&ide_id, root);
     }
+    if cfg.language == Language::Kotlin {
+        // The Gradle build is the IDE's project; gradle.properties says where the SDK and the JDK are.
+        crate::kotlin::prepare(root)?;
+        return ide::open(&ide_id, root);
+    }
     // resolve(), not ensure_installed() + read_manifest(): a source build carries no
     // framework.json of its own, and its manifest is derived from the tree each time.
     let (sdk_root, manifest) = framework::resolve(&cfg.framework_version)?;

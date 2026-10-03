@@ -330,6 +330,11 @@ const CSPROJ: &str = r#"<Project Sdk="Microsoft.NET.Sdk">
       <HintPath>$(KoralSdk)/lib/koral-dotnet/Koral.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <!-- koral-ui's C# binding: interfaces (widgets, the canvas). koral-dotnet ships it beside Koral.dll. -->
+    <Reference Include="Koral.UI">
+      <HintPath>$(KoralSdk)/lib/koral-dotnet/Koral.UI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 
   <!-- What koral-dotnet imports into every script, so the editor sees the same code. -->
@@ -368,6 +373,7 @@ mod tests {
         assert!(scene.contains("public sealed class Orbit : Scene"));
         let csproj = std::fs::read_to_string(dir.join("Orbit.csproj")).unwrap();
         assert!(csproj.contains("$(KoralSdk)/lib/koral-dotnet/Koral.dll"));
+        assert!(csproj.contains("$(KoralSdk)/lib/koral-dotnet/Koral.UI.dll"));
         assert!(std::fs::read_to_string(dir.join(".gitignore")).unwrap().contains(LOCAL_PROPS));
 
         write_local_props(&dir, Path::new("/opt/koral & co")).unwrap();

@@ -264,8 +264,10 @@ fn build(console: &Console, profile: &str) -> Result<BuildOutcome, String> {
 
 /// Build the project (as a `build-*` event stream) and return once done.
 pub fn build_only(console: &Console, profile: &str) -> Result<(), String> {
-    if project::load(console.root())?.language == crate::model::Language::CSharp {
-        return crate::csharp::build(console, profile).map(|_| ());
+    match project::load(console.root())?.language {
+        crate::model::Language::CSharp => return crate::csharp::build(console, profile).map(|_| ()),
+        crate::model::Language::Kotlin => return crate::kotlin::build(console, profile).map(|_| ()),
+        crate::model::Language::Cpp => {}
     }
     build(console, profile).map(|_| ())
 }
@@ -276,8 +278,10 @@ pub fn run(console: &Console, profile: &str) -> Result<(), String> {
     // CreateJob, and fail with a much less helpful message than this one. Checked before the
     // build so the user is told immediately, not after a full compile.
     let cfg = project::load(console.root())?;
-    if cfg.language == crate::model::Language::CSharp {
-        return crate::csharp::run(console, profile);
+    match cfg.language {
+        crate::model::Language::CSharp => return crate::csharp::run(console, profile),
+        crate::model::Language::Kotlin => return crate::kotlin::run(console, profile),
+        crate::model::Language::Cpp => {}
     }
     if !cfg.kind.is_runnable() {
         return Err(format!(
@@ -335,6 +339,12 @@ fn pump(mut stream: impl Read, console: Console) {
 /// when their output is not a terminal.
 #[cfg(unix)]
 pub(crate) fn launch(console: &Console, runtime: &Path, args: &[String]) -> Result<(), String> {
+    launch_env(console, runtime, args, &[])
+}
+
+/// `launch`, with variables set for the child: what a program run through a tool (Gradle's `JAVA_HOME`) needs.
+#[cfg(unix)]
+pub(crate) fn launch_env(console: &Console, runtime: &Path, args: &[String], env: &[(String, String)]) -> Result<(), String> {
     let pty = native_pty_system();
     let pair = pty
         .openpty(PtySize { rows: 40, cols: 140, pixel_width: 0, pixel_height: 0 })
@@ -343,6 +353,9 @@ pub(crate) fn launch(console: &Console, runtime: &Path, args: &[String]) -> Resu
     let mut cmd = CommandBuilder::new(runtime);
     cmd.args(args);
     cmd.env("TERM", "xterm-256color");
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
     // Match `external_command`: don't hand the app the Hub's bundled-library loader environment.
     // The Linux windowing backend is not set here — it rides in as the runtime's `--platform` flag
     // (see `runtime_args`), and so is already visible in the launch line printed above.
@@ -393,6 +406,11 @@ pub(crate) fn launch(console: &Console, runtime: &Path, args: &[String]) -> Resu
 /// build tools already make on every platform. Running is worth more than colour.
 #[cfg(windows)]
 pub(crate) fn launch(console: &Console, runtime: &Path, args: &[String]) -> Result<(), String> {
+    launch_env(console, runtime, args, &[])
+}
+
+#[cfg(windows)]
+pub(crate) fn launch_env(console: &Console, runtime: &Path, args: &[String], env: &[(String, String)]) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     use std::process::Stdio;
 
@@ -406,6 +424,9 @@ pub(crate) fn launch(console: &Console, runtime: &Path, args: &[String]) -> Resu
         // the app's own window. Its output is piped here either way, so nothing is lost — the same
         // reasoning as `external_command`.
         .creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
 
     let mut child = cmd
         .spawn()

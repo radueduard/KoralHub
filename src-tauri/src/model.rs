@@ -133,7 +133,7 @@ impl ProjectConfig {
     }
 }
 
-/// The language a project's scenes are written in. Serialized as `"c++"` / `"csharp"`.
+/// The language a project's scenes are written in. Serialized as `"c++"` / `"csharp"` / `"kotlin"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Language {
     #[default]
@@ -141,6 +141,8 @@ pub enum Language {
     Cpp,
     #[serde(rename = "csharp")]
     CSharp,
+    #[serde(rename = "kotlin")]
+    Kotlin,
 }
 
 impl Language {
