@@ -125,7 +125,7 @@ fn write_sources(root: &Path, name: &str, kind: Kind, scene_table: bool) -> Resu
     }
 
     let (header_tpl, source_tpl, export_tpl) = match kind {
-        Kind::Scene if scene_table => (SCENE_HEADER_TABLE, SCENE_SOURCE, SCENE_EXPORT_TABLE),
+        Kind::Scene if scene_table => (SCENE_HEADER_TABLE, SCENE_SOURCE_TABLE, SCENE_EXPORT_TABLE),
         Kind::Scene => (SCENE_HEADER, SCENE_SOURCE, SCENE_EXPORT),
         Kind::Job => (JOB_HEADER, JOB_SOURCE, JOB_EXPORT),
         Kind::Module => unreachable!("handled above"),
@@ -428,8 +428,8 @@ KORAL_EXPORT kor::Scene* CreateScene()
 }
 "#;
 
-// The same scene on the v2 line: its interface is opted into (a scene has ImGui only when it asks),
-// and the library exports a table of its scenes, which a library can grow to several.
+// The same scene on the v2 line. An interface there is a module's (koral-ui), not a hook of the scene's,
+// so the scene has none; and the library exports a table of its scenes, which a library can grow to several.
 const SCENE_HEADER_TABLE: &str = r#"#pragma once
 
 #include <koral.h>
@@ -437,14 +437,30 @@ const SCENE_HEADER_TABLE: &str = r#"#pragma once
 class {NAME} final : public kor::Scene
 {
 public:
-    // RenderUI draws with ImGui, which a scene has only when it asks for an interface.
-    {NAME}() { EnableInterface(); }
-
     void Initialize() override;
     void Update() override;
     void Render(kor::CommandBuffer& commandBuffer) override;
-    void RenderUI() override;
 };
+"#;
+
+const SCENE_SOURCE_TABLE: &str = r#"#include "{NAME}.h"
+
+void {NAME}::Initialize()
+{
+    // TODO: set up resources
+}
+
+void {NAME}::Update()
+{
+    // TODO: per-frame logic
+}
+
+void {NAME}::Render(kor::CommandBuffer& commandBuffer)
+{
+    commandBuffer
+        .BeginRendering()
+        .EndRendering();
+}
 "#;
 
 const SCENE_EXPORT_TABLE: &str = r#"#include <sceneLibrary.h>
@@ -579,11 +595,12 @@ mod tests {
     }
 
     #[test]
-    fn a_v2_scene_exports_a_table_and_asks_for_its_interface() {
+    fn a_v2_scene_exports_a_table_and_has_no_interface_hooks() {
         let (header, export) = sources_for(true);
         assert!(export.contains("KORAL_SCENES(") && export.contains(r#"KORAL_SCENE("Game", Game)"#), "{export}");
         assert!(!export.contains("CreateScene"));
-        assert!(header.contains("EnableInterface()"), "{header}");
+        // An interface on v2 is koral-ui's, not a hook of the scene's: the engine has no RenderUI to override.
+        assert!(!header.contains("EnableInterface") && !header.contains("RenderUI"), "{header}");
     }
 
     #[test]
