@@ -8,10 +8,13 @@
 //! not "use the empty string". Resolving that fallback is [`Settings`]'s job rather than each call
 //! site's, so a missing setting can never turn into an empty path or a blank IDE id.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::framework;
 use crate::ide;
+use crate::model::Language;
 use crate::paths;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -19,8 +22,15 @@ use crate::paths;
 pub struct Settings {
     /// Parent folder new projects are created in. Empty → `~/Koral`.
     pub project_location: String,
-    /// `Ide::id` of the editor to open projects with. Empty → the first one detected.
-    pub default_ide: String,
+    /// `Ide::id` of the editor to open projects with, per project language (keyed `"c++"`,
+    /// `"csharp"`, `"kotlin"`) — CLion for C++ and Rider for C# is the normal setup, so one choice
+    /// for everything would always be wrong for somebody. Missing or empty → the first installed
+    /// IDE that can open that language.
+    pub default_ides: BTreeMap<String, String>,
+    /// The single preference from before it was per language. Read so an existing choice carries
+    /// over (it applied to C++ projects, the only kind there was); never written back.
+    #[serde(skip_serializing)]
+    default_ide: String,
     /// Framework version new projects target. Empty → the newest the Hub can find.
     pub default_framework_version: String,
     /// Linux only: windowing backend a launched app should use — `"wayland"`, `"x11"`, or empty for
@@ -31,10 +41,15 @@ pub struct Settings {
 pub fn load() -> Settings {
     // A corrupt or missing settings file must never stop the Hub from starting; defaults are
     // always a valid answer, and the user can just set them again.
-    std::fs::read_to_string(paths::settings_file())
+    let mut s: Settings = std::fs::read_to_string(paths::settings_file())
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let legacy = std::mem::take(&mut s.default_ide);
+    if !legacy.is_empty() {
+        s.default_ides.entry(Language::Cpp.tag().to_string()).or_insert(legacy);
+    }
+    s
 }
 
 pub fn save(settings: &Settings) -> Result<(), String> {
@@ -56,16 +71,33 @@ impl Settings {
         }
     }
 
-    /// Which IDE to open a project with, or `None` if this machine has none installed.
+    /// Which IDE to open a project in this language with, or `None` if this machine has none that
+    /// can.
     ///
-    /// A stale preference — an IDE that has since been uninstalled — falls back to whatever *is*
-    /// installed rather than failing, so the Open button keeps working.
-    pub fn default_ide(&self) -> Option<ide::Ide> {
+    /// A stale preference — an IDE that has since been uninstalled, or one that cannot open this
+    /// language — falls back to whatever installed IDE *can* rather than failing, so the Open button
+    /// keeps working.
+    pub fn default_ide(&self, language: Language) -> Option<ide::Ide> {
+        Self::pick(&ide::detect(), self.default_ides.get(language.tag()), language)
+    }
+
+    /// [`Self::default_ide`] for every language, detecting the installed IDEs only once.
+    pub fn default_ides(&self) -> BTreeMap<String, String> {
         let installed = ide::detect();
-        installed
+        Language::ALL
             .iter()
-            .find(|i| i.id == self.default_ide)
-            .or_else(|| installed.first())
+            .filter_map(|&l| {
+                let ide = Self::pick(&installed, self.default_ides.get(l.tag()), l)?;
+                Some((l.tag().to_string(), ide.id))
+            })
+            .collect()
+    }
+
+    fn pick(installed: &[ide::Ide], preferred: Option<&String>, language: Language) -> Option<ide::Ide> {
+        let usable = || installed.iter().filter(|i| i.supports(language));
+        usable()
+            .find(|i| Some(&i.id) == preferred)
+            .or_else(|| usable().next())
             .cloned()
     }
 

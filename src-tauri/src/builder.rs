@@ -170,7 +170,10 @@ fn compile_tree(
     // used as-is rather than downloaded, and it carries no framework.json of its own.
     let (sdk_root, manifest) = framework::resolve(&cfg.framework_version)?;
     if framework::local::find(&cfg.framework_version).is_some() {
-        console.build(&format!("Using local build at {}\n", sdk_root.display()));
+        // The flavour this profile links, which is not the registered path when that is a folder
+        // of per-configuration installs.
+        let tree = framework::tree_for_profile(&sdk_root, profile);
+        console.build(&format!("Using local build at {} for {profile}\n", tree.display()));
     }
 
     console.build("Generating build files…\n");

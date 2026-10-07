@@ -169,6 +169,9 @@ type InstalledFramework = {
   sourceDir?: string;
   /// CMAKE_BUILD_TYPE of the build it was installed from — a Release build has no debug info.
   buildType?: string;
+  /// The configurations it can build against ("Debug", "Release") across all its flavours — a
+  /// folder of per-configuration install prefixes covers several, and each profile links its own.
+  flavours: string[];
   /// What the SDK can do, from the capabilities.json it ships (see `Capabilities` in framework.rs).
   capabilities: Capabilities;
 };
@@ -184,7 +187,11 @@ const V1_CAPABILITIES: Capabilities = { line: 1, apis: ["Vulkan", "OpenGL"], sce
 
 // Mirrors `DetectedSource` — what the Hub can work out about an install prefix before it is
 // registered, so the Add dialog can show it rather than asking blind.
-type DetectedSource = { sourcePath: string; buildPath: string; buildType: string };
+type DetectedSource = { sourcePath: string; buildPath: string; buildType: string; flavours: string[] };
+
+// Said wherever an SDK covering several configurations is shown, so it is clear what that buys.
+const FLAVOURS_HINT =
+  "Each project configuration links its own: Debug builds link the debug SDK, the others link release.";
 
 // Mirrors `ProjectConfig` (koral.json). Only the fields the settings panel edits are spelled
 // out; the rest ride along untouched so saving never drops data the Hub doesn't understand.
@@ -276,7 +283,9 @@ type VcpkgProgress = { step: string; done: boolean; error: string | null };
 // what that resolves to is reported separately as ResolvedDefaults.
 type Settings = {
   projectLocation: string;
-  defaultIde: string;
+  // Language → the IDE a project in it opens with. A missing or empty entry means "the first
+  // installed IDE that can open it".
+  defaultIdes: Partial<Record<Language, string>>;
   defaultFrameworkVersion: string;
   // Linux only: "wayland", "x11", or "" for the session default.
   displayBackend: string;
@@ -286,7 +295,8 @@ type Settings = {
 // honest about what it will do instead of just looking unset.
 type ResolvedDefaults = {
   projectLocation: string;
-  ideId: string;
+  // Absent for a language no installed IDE can open.
+  ideIds: Partial<Record<Language, string>>;
   frameworkVersion: string;
 };
 
@@ -295,7 +305,11 @@ type Ide = {
   id: string;
   name: string;
   command: string;
+  // The project languages it can open.
+  languages: Language[];
 };
+
+const LANGUAGE_LABELS: Record<Language, string> = { "c++": "C++", csharp: "C#", kotlin: "Kotlin" };
 
 // Mirrors `Provider` (serde lowercase) and the account/sign-in DTOs from the auth module.
 type Provider = "github" | "gitlab";
@@ -1030,7 +1044,10 @@ export default function App() {
   const [defaults, { refetch: refetchDefaults }] = createResource<ResolvedDefaults>(() =>
     invoke("resolved_defaults"),
   );
-  const defaultIde = () => ides()?.find((i) => i.id === defaults()?.ideId);
+  // Each language opens in its own IDE — CLion or Rider for C++, Rider for C#, IntelliJ for Kotlin.
+  const idesFor = (language: Language) => (ides() ?? []).filter((i) => i.languages.includes(language));
+  const defaultIdeFor = (language: Language) =>
+    ides()?.find((i) => i.id === defaults()?.ideIds?.[language]);
 
   const [showSettings, setShowSettings] = createSignal(false);
   const [prefs, setPrefs] = createStore<{ s: Settings | null }>({ s: null });
@@ -1441,17 +1458,17 @@ export default function App() {
   // is what opens settings — there is no separate panel to go and find.
   function select(next: Selection) {
     if (sameSelection(next, selected())) return;
-    // Never lose an edit to a click: switching away from a project with unsaved settings asks
-    // first. (This is the only place a selection changes, so the guard cannot be bypassed.)
-    if (settingsDirty()) {
-      setPendingSelection(next);
-      return;
-    }
     applySelection(next);
   }
 
   function applySelection(next: Selection) {
+    // Never lose an edit to a click: an edit still inside its debounce is written now, against the
+    // project it belongs to, before the editor moves on. (Every selection change comes through
+    // here, so nothing can skip it.)
+    void flushSettings();
     setSelected(next);
+    setSaveState("idle");
+    setRenaming(null);
     if (next.kind === "project") loadProjectSettings(next.path);
     else closeProjectSettings();
   }
@@ -1460,15 +1477,11 @@ export default function App() {
 
   const [settingsPath, setSettingsPath] = createSignal<string | null>(null);
   const [draft, setDraft] = createStore<{ cfg: ProjectConfig | null }>({ cfg: null });
-  // The config as loaded, so "dirty" is a fact rather than a guess and Revert has something to
-  // revert to.
+  // The config as last written, so "dirty" is a fact rather than a guess.
   const [savedConfig, setSavedConfig] = createSignal<string>("");
   // The modules this machine can offer the selected project, refreshed on every selection (the set
   // changes as the user creates, downloads or removes module projects).
   const [availableModules, setAvailableModules] = createSignal<ModuleView[]>([]);
-  // A selection waiting on the user to decide what to do with unsaved settings.
-  const [pendingSelection, setPendingSelection] = createSignal<Selection | null>(null);
-
   const settingsDirty = () =>
     !!draft.cfg && !!savedConfig() && JSON.stringify(draft.cfg) !== savedConfig();
 
@@ -1515,11 +1528,6 @@ export default function App() {
     setProfiles(null);
   }
 
-  function revertSettings() {
-    const saved = savedConfig();
-    if (saved) setDraft("cfg", JSON.parse(saved));
-  }
-
   /** Is this module id in the project's list? */
   const hasModule = (id: string) => (draft.cfg?.modules ?? []).includes(id);
 
@@ -1552,31 +1560,98 @@ export default function App() {
   const sourcePinAmbiguous = (version: string) =>
     version === "source" && sourceBuilds().length > 1;
 
-  async function saveSettings(e?: Event) {
-    e?.preventDefault();
-    const path = settingsPath();
-    const config = draft.cfg;
-    if (!path || !config) return false;
+  // --- Autosave: every edit is written to koral.json on its own, with no Save button ---
+  //
+  // Debounced so typing a window size or a path writes once when the typing pauses rather than on
+  // every keystroke. Saves are chained, so two never race to write the same file out of order.
+  const AUTOSAVE_DELAY_MS = 400;
+  const [saveState, setSaveState] = createSignal<"idle" | "saving" | "saved" | "failed">("idle");
+  let saveTimer: ReturnType<typeof setTimeout> | undefined;
+  let saveChain: Promise<unknown> = Promise.resolve();
 
-    setBusy(true);
-    setError(null);
+  createEffect(() => {
+    if (!settingsDirty()) return;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => void flushSettings(), AUTOSAVE_DELAY_MS);
+  });
+
+  /** Write any pending edit now. Resolves once it (and any save before it) is on disk. */
+  function flushSettings(): Promise<unknown> {
+    clearTimeout(saveTimer);
+    saveTimer = undefined;
+    const path = settingsPath();
+    if (path) setSaveState("saving");
+    // Snapshot now: by the time an earlier save in the chain finishes, the selection may have
+    // moved to another project, and this edit belongs to the one it was made in.
+    if (!path || !draft.cfg || !settingsDirty()) return saveChain;
+    const snapshot = JSON.stringify(draft.cfg);
+    saveChain = saveChain.then(() => saveSettings(path, snapshot));
+    return saveChain;
+  }
+
+  async function saveSettings(path: string, snapshot: string) {
+    const config: ProjectConfig = JSON.parse(snapshot);
     try {
       // Entries the user added and left blank would be launch-time "module not found" errors;
-      // drop them here, where the mistake is visible, rather than there.
+      // drop them here, where the mistake is visible, rather than there. The editor keeps them, so
+      // a row added a moment ago is still there to type into.
       const cleaned = {
         ...config,
         modules: (config.modules ?? []).map((m) => m.trim()).filter(Boolean),
         libraries: (config.libraries ?? []).filter((l) => l.vcpkgPort.trim()),
       };
       await invoke("save_project_config", { path, config: cleaned });
-      setSavedConfig(JSON.stringify(draft.cfg));
+      // The selection may have moved on; the status beside the header is about the project shown.
+      if (settingsPath() === path) {
+        setSavedConfig(snapshot);
+        setSaveState("saved");
+      }
       await refetch();
-      return true;
+    } catch (e) {
+      if (settingsPath() === path) setSaveState("failed");
+      setError(String(e));
+    }
+  }
+
+  // --- Renaming a project, inline in the detail header ---
+  const [renaming, setRenaming] = createSignal<{ path: string; name: string } | null>(null);
+  // Enter commits, and so does the blur that follows it — only the first may go through.
+  let renameInFlight = false;
+
+  function startRename(p: RecentProject) {
+    setContextMenu(null);
+    // The header is where the name is edited, so it has to be the one on screen.
+    select({ kind: "project", path: p.path });
+    setRenaming({ path: p.path, name: p.name });
+  }
+
+  async function commitRename() {
+    const r = renaming();
+    if (!r) return;
+    const name = r.name.trim();
+    const current = projectAt(r.path)?.name ?? offListProject()?.name;
+    if (!name || name === current) {
+      setRenaming(null);
+      return;
+    }
+    if (nameProblem(name) || renameInFlight) return; // a problem is shown under the field
+    renameInFlight = true;
+    setError(null);
+    try {
+      // An edit still waiting to be written carries the old name, and would put it back.
+      await flushSettings();
+      await invoke<RecentProject>("rename_project", { path: r.path, name });
+      if (settingsPath() === r.path && draft.cfg) {
+        setDraft("cfg", "name", name);
+        setSavedConfig(JSON.stringify(draft.cfg));
+      }
+      if (offListProject()?.path === r.path) setOffListProject({ ...offListProject()!, name });
+      setRenaming(null);
+      await refetch();
     } catch (e) {
       setError(String(e));
-      return false;
     } finally {
-      setBusy(false);
+      renameInFlight = false;
     }
   }
 
@@ -2447,7 +2522,6 @@ export default function App() {
     !!removingCollection() ||
     !!deviceLogin() ||
     !!publishTarget() ||
-    !!pendingSelection() ||
     !!updating() ||
     showLibraryPicker() ||
     showAddLocal() ||
@@ -2547,6 +2621,8 @@ export default function App() {
     setContextMenu(null);
     setOpening(path);
     try {
+      // The IDE's run configuration is generated from koral.json, so it has to be current.
+      await flushSettings();
       // Explicit null, not undefined — an omitted key would not reach the Option<String> arg.
       await invoke("open_in_ide", { path, ideId: ideId ?? null });
     } catch (e) {
@@ -2561,6 +2637,8 @@ export default function App() {
   async function startJob(path: string, command: "run_project" | "build_project") {
     setError(null);
     setContextMenu(null);
+    // Build what is on screen: an edit made a moment ago may still be inside its debounce.
+    await flushSettings();
     setConsoles(path, { ...emptyConsole(), running: true, wasRun: command === "run_project" });
     try {
       await invoke(command, { path });
@@ -2612,7 +2690,7 @@ export default function App() {
     on: { project?: RecentProject; collection?: SidebarCollection },
   ) {
     e.preventDefault();
-    if (pendingSelection() || (!on.project && !on.collection)) return;
+    if (!on.project && !on.collection) return;
     setContextMenu({ x: e.clientX, y: e.clientY, ...on });
   }
 
@@ -2983,7 +3061,37 @@ export default function App() {
                     {p().name.charAt(0).toUpperCase()}
                   </span>
                   <div class="detail-title-block">
-                    <h1 class="detail-title">{p().name}</h1>
+                    <Show
+                      when={renaming()?.path === p().path}
+                      fallback={
+                        <h1
+                          class="detail-title detail-title-editable"
+                          title="Double-click to rename"
+                          onDblClick={() => startRename(p())}
+                        >
+                          {p().name}
+                        </h1>
+                      }
+                    >
+                      <input
+                        class="input detail-title-input"
+                        value={renaming()!.name}
+                        aria-label="Project name"
+                        ref={(el) => queueMicrotask(() => el.select())}
+                        onInput={(e) => setRenaming({ path: p().path, name: e.currentTarget.value })}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") void commitRename();
+                          if (e.key === "Escape") setRenaming(null);
+                        }}
+                        onBlur={() => void commitRename()}
+                      />
+                      <p class="field-hint" classList={{ "field-bad": !!nameProblem(renaming()!.name.trim()) }}>
+                        {nameProblem(renaming()!.name.trim()) ??
+                          (p().kind === "Module"
+                            ? "Enter to rename, Esc to cancel. A module's id is its name in lower case, so projects that list it must be updated too."
+                            : "Enter to rename, Esc to cancel. The folder keeps its name.")}
+                      </p>
+                    </Show>
                     <p class="detail-path" title={p().path}>
                       {p().path}
                     </p>
@@ -3009,15 +3117,17 @@ export default function App() {
                     >
                       Build
                     </button>
-                    <Show when={defaultIde()}>
-                      <button
-                        class="btn btn-ghost"
-                        title={`Open in ${defaultIde()!.name} (${defaultIde()!.command}) — change the default in Settings`}
-                        disabled={opening() !== null}
-                        onClick={() => openInIde(p().path)}
-                      >
-                        {opening() === p().path ? "Opening…" : `Open in ${defaultIde()!.name}`}
-                      </button>
+                    <Show when={defaultIdeFor(p().language)}>
+                      {(ide) => (
+                        <button
+                          class="btn btn-ghost"
+                          title={`Open in ${ide().name} (${ide().command}) — other IDEs are under ⋮, and the default is in Settings`}
+                          disabled={opening() !== null}
+                          onClick={() => openInIde(p().path, ide().id)}
+                        >
+                          {opening() === p().path ? "Opening…" : `Open in ${ide().name}`}
+                        </button>
+                      )}
                     </Show>
                     <button
                       class="btn btn-ghost btn-icon"
@@ -3055,10 +3165,21 @@ export default function App() {
                       {repoLabel(p().git!.remote!)}
                     </span>
                   </Show>
+                  {/* There is no Save button: every change is written to koral.json as it is
+                      made, and this says so. */}
+                  <Show when={settingsPath() === p().path && saveState() !== "idle"}>
+                    <span class="save-status" classList={{ "save-status-bad": saveState() === "failed" }}>
+                      {settingsDirty() || saveState() === "saving"
+                        ? "Saving…"
+                        : saveState() === "failed"
+                          ? "Not saved"
+                          : "Saved to koral.json"}
+                    </span>
+                  </Show>
                 </div>
 
                 <Show when={draft.cfg} fallback={<p class="muted">Loading settings…</p>}>
-                  <form class="settings" onSubmit={saveSettings}>
+                  <form class="settings" onSubmit={(e) => e.preventDefault()}>
                     <section class="panel">
                       <h2 class="panel-title">Framework</h2>
                       <label class="field">
@@ -3076,8 +3197,8 @@ export default function App() {
                           longest name ("RelWithDebInfo"), which made it the odd size in a row of
                           buttons and, as the panel narrowed, pushed the row over the project's
                           name. In the settings grid it is a field like any other, so nothing
-                          reflows. Still machine-local, and still applied immediately — hence the
-                          hint, since everything else in this form waits for Save. */}
+                          reflows. Still machine-local, and still applied immediately — unlike the
+                          rest of the form, it is not written to koral.json. */}
                       <Show when={profiles()}>
                         {(pr) => (
                           <label class="field">
@@ -3600,19 +3721,6 @@ export default function App() {
                     </section>
                     </Show>
 
-                    {/* Sticky, and only present while there is something to save — a permanent
-                        bar would make an unchanged project look unsaved. */}
-                    <Show when={settingsDirty()}>
-                      <div class="save-bar">
-                        <span class="save-note">Unsaved changes to koral.json</span>
-                        <button type="button" class="btn btn-ghost" onClick={revertSettings}>
-                          Revert
-                        </button>
-                        <button type="submit" class="btn btn-primary" disabled={busy()}>
-                          {busy() ? "Saving…" : "Save"}
-                        </button>
-                      </div>
-                    </Show>
                   </form>
                 </Show>
               </>
@@ -4075,8 +4183,9 @@ export default function App() {
                 fallback={
                   <p class="field-hint">
                     Point the Hub at a framework you built yourself — the directory you passed to{" "}
-                    <code>cmake --install --prefix</code> — to build projects against a version that
-                    was never released, and to debug straight into engine code.
+                    <code>cmake --install --prefix</code>, or the folder holding one per
+                    configuration — to build projects against a version that was never released,
+                    and to debug straight into engine code.
                   </p>
                 }
               >
@@ -4090,13 +4199,23 @@ export default function App() {
                             <span class="fw-tag">source</span>
                             {/* Debug info is what makes a crash land on a line of framework code, and
                                 it is a property of how they built it — so it is stated, not implied. */}
-                            <Show when={fw.buildType}>
-                              <span
-                                class="fw-tag"
-                                classList={{ "fw-tag-draft": !carriesDebugInfo(fw.buildType) }}
-                                title={buildTypeHint(fw.buildType!)}
-                              >
-                                {fw.buildType}
+                            <Show
+                              when={fw.flavours.length > 1}
+                              fallback={
+                                <Show when={fw.buildType}>
+                                  <span
+                                    class="fw-tag"
+                                    classList={{ "fw-tag-draft": !carriesDebugInfo(fw.buildType) }}
+                                    title={buildTypeHint(fw.buildType!)}
+                                  >
+                                    {fw.buildType}
+                                  </span>
+                                </Show>
+                              }
+                            >
+                              {/* Several flavours: one build type would only describe one of them. */}
+                              <span class="fw-tag" title={FLAVOURS_HINT}>
+                                {fw.flavours.join(" + ")}
                               </span>
                             </Show>
                           </span>
@@ -4286,11 +4405,24 @@ export default function App() {
                     >
                       Build
                     </button>
-                    <Show when={defaultIde()}>
-                      <button type="button" class="menu-item" onClick={() => openInIde(p().path)}>
-                        Open in {defaultIde()!.name}
-                      </button>
-                    </Show>
+                    {/* Every installed IDE that understands this project, not just the default —
+                        C++ in Rider for its GLSL linting, while CLion stays the everyday choice. */}
+                    <For each={idesFor(p().language)}>
+                      {(ide) => (
+                        <button
+                          type="button"
+                          class="menu-item"
+                          title={ide.command}
+                          disabled={opening() !== null}
+                          onClick={() => openInIde(p().path, ide.id)}
+                        >
+                          Open in {ide.name}
+                        </button>
+                      )}
+                    </For>
+                    <button type="button" class="menu-item" onClick={() => startRename(p())}>
+                      Rename…
+                    </button>
                     <hr class="menu-divider" />
                     {/* The only way to make a collection: from something to put in it. */}
                     <button
@@ -4436,47 +4568,6 @@ export default function App() {
         )}
       </Show>
 
-      {/* --- Unsaved settings, when the selection is about to move --- */}
-      <Show when={pendingSelection()}>
-        <div class="modal-scrim">
-          <div class="modal" onClick={(e) => e.stopPropagation()}>
-            <h2 class="modal-title">Save changes to {draft.cfg?.name}?</h2>
-            <p class="field-hint">
-              Its <code>koral.json</code> has edits that haven't been written yet.
-            </p>
-            <div class="modal-actions">
-              <button type="button" class="btn btn-ghost" onClick={() => setPendingSelection(null)}>
-                Keep editing
-              </button>
-              <button
-                type="button"
-                class="btn btn-ghost"
-                onClick={() => {
-                  const next = pendingSelection()!;
-                  setPendingSelection(null);
-                  applySelection(next);
-                }}
-              >
-                Discard
-              </button>
-              <button
-                type="button"
-                class="btn btn-primary"
-                disabled={busy()}
-                onClick={async () => {
-                  if (!(await saveSettings())) return;
-                  const next = pendingSelection()!;
-                  setPendingSelection(null);
-                  applySelection(next);
-                }}
-              >
-                {busy() ? "Saving…" : "Save"}
-              </button>
-            </div>
-          </div>
-        </div>
-      </Show>
-
       <Show when={showAddLocal()}>
         <div class="modal-scrim" onClick={() => setAddingLocal(false)}>
           <form class="modal" onClick={(e) => e.stopPropagation()} onSubmit={submitAddLocal}>
@@ -4505,8 +4596,15 @@ export default function App() {
             </label>
             <p class="field-hint">
               The directory you passed to <code>cmake --install --prefix</code> — it holds{" "}
-              <code>bin/</code>, <code>include/</code> and <code>lib/</code>.
+              <code>bin/</code>, <code>include/</code> and <code>lib/</code>. Installed once per
+              configuration (<code>stage/debug</code>, <code>stage/release</code>)? Pick the folder
+              holding them, and every flavour is added at once.
             </p>
+            <Show when={(detected()?.flavours.length ?? 0) > 1}>
+              <p class="field-hint">
+                Covers {detected()!.flavours.join(" and ")}. {FLAVOURS_HINT}
+              </p>
+            </Show>
 
             {/* What the Hub found, so the user can see whether debugging will work before they
                 commit — rather than discovering it at the first crash. */}
@@ -4524,7 +4622,7 @@ export default function App() {
                   <p class="field-hint">
                     Built from <code>{d().sourcePath}</code>
                     {d().buildType ? ` (${d().buildType})` : ""}
-                    {d().buildType && d().buildType !== "Debug"
+                    {d().buildType && d().buildType !== "Debug" && !d().flavours.includes("Debug")
                       ? " — a Release build carries no debug info, so debugging cannot step into it."
                       : "."}
                   </p>
@@ -5204,27 +5302,43 @@ export default function App() {
               </span>
             </label>
 
-            <label class="field">
-              <span class="field-label">Open projects with</span>
-              <Show
-                when={(ides()?.length ?? 0) > 0}
-                fallback={
-                  <p class="field-hint field-bad">
-                    No IDE found on this machine. Install VS Code or CLion and reopen the Hub.
-                  </p>
-                }
-              >
-                {/* Empty = follow whatever is installed, rather than pinning a choice. */}
-                <Select
-                  value={prefs.s!.defaultIde}
-                  options={[
-                    { value: "", label: `Auto (${defaultIde()?.name ?? "none"})` },
-                    ...(ides() ?? []).map((ide) => ({ value: ide.id, label: ide.name })),
-                  ]}
-                  onChange={(v) => setPrefs("s", "defaultIde", v)}
-                />
-              </Show>
-            </label>
+            <Show
+              when={(ides()?.length ?? 0) > 0}
+              fallback={
+                <p class="field-hint field-bad">
+                  No IDE found on this machine. Install VS Code, CLion, Rider or IntelliJ IDEA and
+                  reopen the Hub.
+                </p>
+              }
+            >
+              {/* One per language: CLion for C++ and Rider for C# is the usual setup, so a single
+                  choice would be wrong for one of them. Empty = the first installed IDE that can
+                  open it, rather than pinning a choice. */}
+              <For each={Object.keys(LANGUAGE_LABELS) as Language[]}>
+                {(language) => (
+                  <label class="field">
+                    <span class="field-label">Open {LANGUAGE_LABELS[language]} projects with</span>
+                    <Show
+                      when={idesFor(language).length > 0}
+                      fallback={
+                        <p class="field-hint field-bad">
+                          No installed IDE opens {LANGUAGE_LABELS[language]} projects.
+                        </p>
+                      }
+                    >
+                      <Select
+                        value={prefs.s!.defaultIdes?.[language] ?? ""}
+                        options={[
+                          { value: "", label: `Auto (${idesFor(language)[0]?.name})` },
+                          ...idesFor(language).map((ide) => ({ value: ide.id, label: ide.name })),
+                        ]}
+                        onChange={(v) => setPrefs("s", "defaultIdes", { ...prefs.s!.defaultIdes, [language]: v })}
+                      />
+                    </Show>
+                  </label>
+                )}
+              </For>
+            </Show>
 
             <label class="field">
               <span class="field-label">Framework for new projects</span>

@@ -83,6 +83,10 @@ pub struct InstalledFramework {
     /// debug info, so a crash in it can never land on a line of framework source.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_type: Option<String>,
+    /// The configurations it can build against (`Debug`, `Release`), across every flavour of it —
+    /// a source build registered as a folder of per-configuration prefixes covers several, and
+    /// each project profile links its own. Empty when the tree does not say.
+    pub flavours: Vec<String>,
     /// What this SDK can do — its graphics APIs, the scene interface it speaks. What the settings
     /// panel offers and the templates a new project gets follow from it.
     pub capabilities: Capabilities,
@@ -454,6 +458,7 @@ pub fn installed() -> Vec<InstalledFramework> {
                 platform: platform.file_name().to_string_lossy().into_owned(),
                 size_bytes: dir_size(&dir),
                 capabilities: Capabilities::read(&dir),
+                flavours: flavours(&dir),
                 path: dir.to_string_lossy().into_owned(),
                 local: false,
                 source_dir: None,
@@ -481,7 +486,8 @@ pub fn installed() -> Vec<InstalledFramework> {
             name: entry.name,
             platform: host.clone(),
             size_bytes: 0,
-            capabilities: Capabilities::read(Path::new(&entry.path)),
+            capabilities: Capabilities::read(&primary_tree(Path::new(&entry.path))),
+            flavours: flavours(Path::new(&entry.path)),
             path: entry.path,
             local: true,
             source_dir: (!entry.source_dir.is_empty()).then_some(entry.source_dir),
@@ -603,7 +609,7 @@ pub fn install(version: &str, mut progress: impl FnMut(u64, u64)) -> Result<Path
 /// resolves it rather than trying to download a release by that name.
 pub fn ensure_installed(version: &str) -> Result<PathBuf, String> {
     if let Some(local) = local::resolve_pin(version)? {
-        return Ok(PathBuf::from(local.path));
+        return Ok(primary_tree(Path::new(&local.path)));
     }
     let dir = install_dir(version, &host_platform());
     if dir.join("framework.json").exists() {
@@ -624,14 +630,16 @@ pub fn ensure_installed(version: &str) -> Result<PathBuf, String> {
 /// rebuild is picked up with nothing to refresh.
 pub fn resolve(version: &str) -> Result<(PathBuf, FrameworkManifest), String> {
     if let Some(local) = local::resolve_pin(version)? {
-        let root = PathBuf::from(&local.path);
-        if !root.is_dir() {
+        if !Path::new(&local.path).is_dir() {
             return Err(format!(
                 "the source build '{}' is registered at {}, which no longer exists — \
                  re-register it, or remove it in Frameworks",
                 local.name, local.path
             ));
         }
+        // A folder of flavours resolves to its primary tree; each profile then finds its own
+        // flavour beside it through tree_for_profile.
+        let root = primary_tree(Path::new(&local.path));
         let manifest = describe_tree(&root, "koral", version, &host_platform())?;
         return Ok((root, manifest));
     }
@@ -646,7 +654,7 @@ pub fn resolve(version: &str) -> Result<(PathBuf, FrameworkManifest), String> {
 /// must use: opening a panel is not consent to pull 40 MB over the network.
 pub fn installed_root(version: &str) -> Option<PathBuf> {
     if let Ok(Some(local)) = local::resolve_pin(version) {
-        let root = PathBuf::from(local.path);
+        let root = primary_tree(Path::new(&local.path));
         return root.is_dir().then_some(root);
     }
     let dir = install_dir(version, &host_platform());
@@ -899,6 +907,10 @@ pub mod local {
     /// Returns `(source_dir, build_dir)`; both empty when nothing matched, and `build_dir` empty
     /// whenever the source was inferred rather than identified.
     pub fn discover_source(prefix: &Path) -> (String, String) {
+        // A folder of flavours is discovered through its debug build: that is the one a debugger
+        // steps into, and so the build type worth reporting.
+        let tree = source_tree(prefix);
+        let prefix = tree.as_path();
         // Read each cache once. Capped: a tree of build directories is a lot of megabytes, and
         // nothing beyond the first handful is plausibly the one.
         let caches: Vec<(PathBuf, String)> = build_candidates(prefix)
@@ -991,10 +1003,15 @@ pub mod local {
         // The real check: does this tree look like an installed SDK? describe_tree fails with a
         // specific reason ("SDK has no bin/ directory", "no *Config.cmake found under …"), which
         // is far more useful than a generic rejection.
-        describe_tree(&path, "koral", SOURCE_PIN, &host_platform()).map_err(|e| {
+        //
+        // A folder that is not an SDK itself but holds several — one install prefix per
+        // configuration, `stage/debug` and `stage/release` — is accepted as all of them at once:
+        // each project profile then links the flavour that matches it.
+        describe_tree(&primary_tree(&path), "koral", SOURCE_PIN, &host_platform()).map_err(|e| {
             format!(
                 "{} does not look like an installed Koral SDK — {e}. Point at the directory you \
-                 passed to `cmake --install --prefix`.",
+                 passed to `cmake --install --prefix`, or at the folder holding one such \
+                 directory per configuration.",
                 path.display()
             )
         })?;
@@ -1359,6 +1376,35 @@ mod tests {
             assert_eq!(tree_for_profile(registered, "RelWithDebInfo"), release);
             assert_eq!(tree_for_profile(registered, "MinSizeRel"), release);
         }
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The folder above the per-configuration prefixes is a registration on its own: every
+    /// profile finds its own flavour inside it, and where no profile applies it stands for the
+    /// release tree.
+    #[test]
+    fn a_folder_of_flavours_serves_each_profile_its_own_tree() {
+        let base = scratch();
+        let stage = base.join("stage");
+        let debug = stage.join("debug");
+        let release = stage.join("release");
+        sdk_tree(&debug, &["debug"]);
+        sdk_tree(&release, &["release"]);
+        // Not every folder inside is an SDK.
+        std::fs::create_dir_all(stage.join("notes")).unwrap();
+
+        assert!(!is_sdk_tree(&stage));
+        assert_eq!(flavour_trees(&stage), vec![debug.clone(), release.clone()]);
+        assert_eq!(primary_tree(&stage), release);
+        assert_eq!(tree_for_profile(&stage, "Debug"), debug);
+        for profile in ["Release", "RelWithDebInfo", "MinSizeRel"] {
+            assert_eq!(tree_for_profile(&stage, profile), release);
+        }
+        assert_eq!(flavours(&stage), vec!["Debug".to_string(), "Release".to_string()]);
+        // Either half on its own still reports the pair it belongs to.
+        assert_eq!(flavours(&debug), vec!["Debug".to_string(), "Release".to_string()]);
+        assert!(describe_tree(&primary_tree(&stage), "koral", SOURCE_PIN, "linux-x64").is_ok());
 
         std::fs::remove_dir_all(&base).ok();
     }
@@ -1955,6 +2001,85 @@ pub fn configuration_of(tree: &Path, profile: &str) -> &'static str {
     }
 }
 
+/// Is `dir` an installed SDK prefix itself — a runtime under `bin/` and a package config under
+/// `lib/cmake/`?
+pub fn is_sdk_tree(dir: &Path) -> bool {
+    find_runtime(dir).is_ok() && find_cmake_dir(dir).is_ok()
+}
+
+/// The SDK prefixes directly inside `dir`, sorted — the flavours of a folder that holds one
+/// `cmake --install --prefix` per configuration (`stage/debug`, `stage/release`). Empty for a
+/// folder that holds none, and for an SDK prefix itself (its `bin/` and `lib/` are not SDKs).
+pub fn flavour_trees(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut trees: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && is_sdk_tree(p))
+        .collect();
+    trees.sort();
+    trees
+}
+
+/// The one tree that stands for a registration wherever no profile is in play — the manifest, the
+/// capabilities, the module scan. The registered path itself when it is an SDK; for a folder of
+/// flavours, the release one (what every published SDK is, and what [`configuration_of`] assumes
+/// of a tree that says nothing), else the first. A path that is neither comes back unchanged, so
+/// the caller's own validation reports what is wrong with it.
+pub fn primary_tree(registered: &Path) -> PathBuf {
+    if is_sdk_tree(registered) {
+        return registered.to_path_buf();
+    }
+    let trees = flavour_trees(registered);
+    trees
+        .iter()
+        .find(|t| configurations(t).contains("release"))
+        .or_else(|| trees.first())
+        .cloned()
+        .unwrap_or_else(|| registered.to_path_buf())
+}
+
+/// Every tree a registration can build against: a folder's flavours, or a single prefix plus the
+/// sibling prefixes [`tree_for_profile`] would also pick from.
+fn trees_of(registered: &Path) -> Vec<PathBuf> {
+    if !is_sdk_tree(registered) {
+        return flavour_trees(registered);
+    }
+    let mut trees = vec![registered.to_path_buf()];
+    if let Some(parent) = registered.parent() {
+        trees.extend(flavour_trees(parent).into_iter().filter(|t| t != registered));
+    }
+    trees
+}
+
+/// The configurations a registration can build against, across all its flavours, spelled as
+/// CMake spells them (`Debug`, `Release`). What the Frameworks list shows, so a folder of
+/// flavours reads as one SDK covering both rather than as whichever tree was looked at.
+pub fn flavours(registered: &Path) -> Vec<String> {
+    let mut found = std::collections::BTreeSet::new();
+    for tree in trees_of(registered) {
+        found.extend(configurations(&tree));
+    }
+    found
+        .into_iter()
+        .map(|c| {
+            let mut chars = c.chars();
+            chars.next().map(|f| f.to_uppercase().chain(chars).collect()).unwrap_or_default()
+        })
+        .collect()
+}
+
+/// The tree whose build the source tree is discovered through: the debug flavour when there is
+/// one, since that is the build a debugger steps into, else the primary.
+fn source_tree(registered: &Path) -> PathBuf {
+    trees_of(registered)
+        .into_iter()
+        .find(|t| configurations(t).contains("debug"))
+        .unwrap_or_else(|| primary_tree(registered))
+}
+
 /// The installed SDK tree to build `profile` against, given the one the user registered.
 ///
 /// An SDK is installed once per configuration — `cmake --install --config Debug --prefix …/debug`
@@ -1973,6 +2098,10 @@ pub fn configuration_of(tree: &Path, profile: &str) -> &'static str {
 /// stop working; it can only redirect a profile that had no correct tree to one that has.
 pub fn tree_for_profile(registered: &Path, profile: &str) -> PathBuf {
     let wanted = configuration_for_profile(profile);
+    // A folder holding the flavours (`stage/` over `stage/debug` and `stage/release`) stands for
+    // its primary tree, whose siblings are then exactly the other flavours.
+    let primary = primary_tree(registered);
+    let registered = primary.as_path();
 
     // The registered tree first, so a prefix holding both configurations — which Windows allows,
     // since the debug postfix keeps the filenames apart — is never passed over for a sibling.

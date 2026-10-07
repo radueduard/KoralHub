@@ -368,12 +368,16 @@ pub struct DetectedSource {
     pub source_path: String,
     pub build_path: String,
     pub build_type: String,
+    /// The configurations the folder covers (`Debug`, `Release`) — several when it holds one
+    /// install prefix per configuration.
+    pub flavours: Vec<String>,
 }
 
 #[tauri::command]
 pub fn detect_framework_source(path: String) -> DetectedSource {
     let (source_path, build_path) = framework::local::discover_source(Path::new(&path));
     DetectedSource {
+        flavours: framework::flavours(Path::new(&path)),
         build_type: framework::local::build_type(&build_path).unwrap_or_default(),
         source_path,
         build_path,
@@ -1038,6 +1042,14 @@ pub fn save_project_config(path: String, config: ProjectConfig) -> Result<(), St
     project::save(Path::new(&path), &config)
 }
 
+/// Rename a project (see [`project::rename`]) and return its refreshed list entry.
+#[tauri::command]
+pub fn rename_project(path: String, name: String) -> Result<RecentProject, String> {
+    let root = Path::new(&path);
+    project::rename(root, &name)?;
+    RecentProject::load(root)
+}
+
 /// IDEs installed on this machine, for the per-project "Open in…" actions.
 #[tauri::command]
 pub fn installed_ides() -> Vec<ide::Ide> {
@@ -1055,26 +1067,36 @@ pub fn installed_ides() -> Vec<ide::Ide> {
 pub fn open_in_ide(path: String, ide_id: Option<String>) -> Result<(), String> {
     let root = Path::new(&path);
 
+    let cfg = project::load(root)?;
     let ide_id = match ide_id.filter(|id| !id.is_empty()) {
         Some(id) => id,
         None => {
             settings::load()
-                .default_ide()
-                .ok_or("no IDE found on this machine — install VS Code or CLion")?
+                .default_ide(cfg.language)
+                .ok_or_else(|| {
+                    format!(
+                        "no IDE for {} found on this machine — install {}",
+                        cfg.language.label(),
+                        match cfg.language {
+                            Language::Cpp => "VS Code, CLion or Rider",
+                            Language::CSharp => "VS Code or Rider",
+                            Language::Kotlin => "VS Code or IntelliJ IDEA",
+                        }
+                    )
+                })?
                 .id
         }
     };
 
-    let cfg = project::load(root)?;
     if cfg.language == Language::CSharp {
         // No CMake here: the .csproj is the IDE's project, and only needs to know where the SDK is.
         crate::csharp::prepare(root)?;
-        return ide::open(&ide_id, root);
+        return ide::open(&ide_id, cfg.language, root, &cfg.name);
     }
     if cfg.language == Language::Kotlin {
         // The Gradle build is the IDE's project; gradle.properties says where the SDK and the JDK are.
         crate::kotlin::prepare(root)?;
-        return ide::open(&ide_id, root);
+        return ide::open(&ide_id, cfg.language, root, &cfg.name);
     }
     // resolve(), not ensure_installed() + read_manifest(): a source build carries no
     // framework.json of its own, and its manifest is derived from the tree each time.
@@ -1083,7 +1105,7 @@ pub fn open_in_ide(path: String, ide_id: Option<String>) -> Result<(), String> {
     // the one whose run configuration and compile database the generated files preselect.
     scaffold::generate(root, &cfg, &sdk_root, &manifest, &project::profile(root))?;
 
-    ide::open(&ide_id, root)
+    ide::open(&ide_id, cfg.language, root, &cfg.name)
 }
 
 /// Default parent directory for new projects, for the create dialog.
@@ -1110,7 +1132,9 @@ pub fn save_settings(settings: Settings) -> Result<(), String> {
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedDefaults {
     pub project_location: String,
-    pub ide_id: String,
+    /// Language tag (`"c++"`, `"csharp"`, `"kotlin"`) → the IDE a project in it opens with. A
+    /// language with no IDE installed that can open it is absent.
+    pub ide_ids: std::collections::BTreeMap<String, String>,
     /// Empty when nothing is installed and the release list is unreachable — the panel says so
     /// rather than naming a version that would not resolve.
     pub framework_version: String,
@@ -1121,7 +1145,7 @@ pub fn resolved_defaults() -> ResolvedDefaults {
     let s = settings::load();
     ResolvedDefaults {
         project_location: s.project_location(),
-        ide_id: s.default_ide().map(|i| i.id).unwrap_or_default(),
+        ide_ids: s.default_ides(),
         framework_version: s.framework_version().unwrap_or_default(),
     }
 }

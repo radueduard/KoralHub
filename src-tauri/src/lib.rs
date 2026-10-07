@@ -138,6 +138,7 @@ pub fn run() {
             commands::settings,
             commands::save_settings,
             commands::resolved_defaults,
+            commands::rename_project,
             commands::installed_ides,
             commands::open_in_ide,
             commands::project_config,

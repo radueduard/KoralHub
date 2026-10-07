@@ -556,6 +556,16 @@
   font-weight: 800;
   letter-spacing: -0.02em;
 }
+.detail-title-editable {
+  cursor: text;
+}
+/* Renaming in place: the input takes the title's size, so the header does not jump. */
+.detail-title-input {
+  width: 100%;
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
 .detail-path {
   margin: 4px 0 0;
   font-family: "JetBrains Mono", ui-monospace, "Cascadia Code", Menlo, monospace;
@@ -674,25 +684,15 @@
   align-self: flex-start;
 }
 
-/* Only present while there is something to save, and pinned so it is reachable from anywhere in a
-   long panel. */
-.save-bar {
-  position: sticky;
-  bottom: 0;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 14px 18px;
-  background: var(--bg-card);
-  border: 1px solid var(--accent);
-  border-radius: var(--r-card);
-  box-shadow: var(--shadow);
+/* Settings save as they change; this quietly confirms it, at the end of the badge row. */
+.save-status {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-faint);
+  white-space: nowrap;
 }
-.save-note {
-  flex: 1;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-dim);
+.save-status-bad {
+  color: var(--danger);
 }
 
 /* --- Fields --- */
@@ -1521,14 +1521,22 @@
   align-items: center;
   justify-content: center;
   padding: 24px;
+  /* The dialog is sized to fit inside this padding, so nothing ever hangs off the window. */
+  overflow: hidden;
   background: var(--scrim);
   /* Backdrop blur is part of the One UI dialog look; harmless where unsupported. */
   backdrop-filter: blur(3px);
 }
 
+/* Every dialog is confined to the window: capped at the scrim's padded height, scrolling inside
+   itself once its content is taller than that, however short the window is dragged. */
 .modal {
   width: 100%;
   max-width: 500px;
+  max-height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -1546,10 +1554,17 @@
   max-width: 720px;
 }
 
-/* A modal whose content can exceed the viewport (Settings): cap its height and let the middle
-   scroll, so the title stays at the top and the Cancel/Save row stays pinned at the bottom. */
+/* A modal with a `.modal-scroll` middle (Settings): only that middle scrolls, so the title stays at
+   the top and the Cancel/Save row stays pinned at the bottom. */
 .modal-tall {
-  max-height: calc(100vh - 48px);
+  overflow-y: hidden;
+}
+/* The children of a scrolling dialog must keep their height rather than be squashed to fit. */
+.modal > * {
+  flex-shrink: 0;
+}
+.modal > .modal-scroll {
+  flex-shrink: 1;
 }
 .modal-scroll {
   display: flex;

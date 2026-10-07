@@ -35,6 +35,69 @@ pub fn save(project_root: &Path, config: &ProjectConfig) -> Result<(), String> {
     std::fs::write(project_root.join(CONFIG_FILE), text).map_err(|e| e.to_string())
 }
 
+/// Is `name` usable as a project name? It becomes a CMake target, a `.csproj` file name and Gradle's
+/// `rootProject.name`, so anything but a plain identifier would make a project that cannot build.
+pub fn check_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "'{name}' is not a valid project name — use letters, digits and underscores, not starting with a digit"
+        ))
+    }
+}
+
+/// Rename a project: its `name` in `koral.json`, and the build files that carry it.
+///
+/// The folder stays where it is. Moving it would strand every build tree inside it (CMake records
+/// its absolute source path), break an IDE that has it open, and the per-machine state keyed by
+/// its path; the name is what every listing shows, so that is what renaming changes. Sources the
+/// user owns (`src/<Name>.cpp`, the scene class) are left alone too — they are code, not metadata.
+pub fn rename(project_root: &Path, new_name: &str) -> Result<(), String> {
+    let new_name = new_name.trim();
+    check_name(new_name)?;
+    let mut cfg = load(project_root)?;
+    let old_name = std::mem::replace(&mut cfg.name, new_name.to_string());
+    if old_name == new_name {
+        return Ok(());
+    }
+
+    match cfg.language {
+        // The build looks for `<name>.csproj`, so the file follows the name.
+        Language::CSharp => {
+            let from = project_root.join(format!("{old_name}.csproj"));
+            let to = project_root.join(format!("{new_name}.csproj"));
+            if from.is_file() {
+                // Case-only renames on a case-insensitive filesystem see `to` as already existing.
+                if to.exists() && !old_name.eq_ignore_ascii_case(new_name) {
+                    return Err(format!("{} already exists", to.display()));
+                }
+                std::fs::rename(&from, &to).map_err(|e| format!("failed to rename {}: {e}", from.display()))?;
+            }
+        }
+        // Only the Gradle project's name: `mainClass` names the source file's class, which a
+        // rename does not touch.
+        Language::Kotlin => {
+            let file = project_root.join("settings.gradle.kts");
+            if let Ok(text) = std::fs::read_to_string(&file) {
+                let from = format!("rootProject.name = \"{old_name}\"");
+                if text.contains(&from) {
+                    let text = text.replace(&from, &format!("rootProject.name = \"{new_name}\""));
+                    std::fs::write(&file, text).map_err(|e| format!("failed to write {}: {e}", file.display()))?;
+                }
+            }
+        }
+        // `CMakeLists.txt` is regenerated from koral.json on the next build (unless the project
+        // owns it, in which case its target names are the project's business).
+        Language::Cpp => {}
+    }
+
+    save(project_root, &cfg)
+}
+
 // --- Create a new project -------------------------------------------------------------
 
 /// Scaffold a new project under `location/name` and return its root. Fails if the folder
@@ -614,6 +677,32 @@ mod tests {
         use std::time::{SystemTime, UNIX_EPOCH};
         let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         std::env::temp_dir().join(format!("koral-project-test-{n}"))
+    }
+
+    #[test]
+    fn rename_follows_the_name_into_each_languages_build_files() {
+        let root = scratch();
+        let mut cfg = ProjectConfig::new("Orbit", "0.0.1", [0.5, 0.5, 0.5], Kind::Scene);
+
+        cfg.language = Language::CSharp;
+        save(&root, &cfg).unwrap();
+        std::fs::write(root.join("Orbit.csproj"), "<Project />").unwrap();
+        rename(&root, "Moon").unwrap();
+        assert_eq!(load(&root).unwrap().name, "Moon");
+        assert!(root.join("Moon.csproj").is_file() && !root.join("Orbit.csproj").exists());
+
+        cfg.name = "Moon".into();
+        cfg.language = Language::Kotlin;
+        save(&root, &cfg).unwrap();
+        std::fs::write(root.join("settings.gradle.kts"), "rootProject.name = \"Moon\"\n").unwrap();
+        rename(&root, "Sun").unwrap();
+        let settings = std::fs::read_to_string(root.join("settings.gradle.kts")).unwrap();
+        assert!(settings.contains("rootProject.name = \"Sun\""), "{settings}");
+
+        assert!(rename(&root, "9lives").is_err());
+        assert!(rename(&root, "has space").is_err());
+        assert_eq!(load(&root).unwrap().name, "Sun");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// End-to-end of the git story: a created project is a committed repo, and cloning it (which is
