@@ -49,6 +49,11 @@ pub struct ProjectConfig {
     /// of other modules. Skipped when empty so older projects are not churned.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modules: Vec<String>,
+    /// What of the GPU the project needs ("required") and uses where present ("optional"), by the
+    /// runtime's feature names ("AtomicFloat32", "ShaderInt64"). Carried through untouched — the Hub
+    /// does not edit it — and skipped when empty so older projects are not churned.
+    #[serde(default, skip_serializing_if = "Features::is_empty")]
+    pub features: Features,
     /// What the project's scenes are written in. C++ builds a scene library with CMake and runs it on
     /// the C++ runtime; C# runs its scripts on `koral-dotnet`, which compiles them itself. Skipped for
     /// C++, so every project from before C# existed reads and writes as it did.
@@ -126,6 +131,7 @@ impl ProjectConfig {
             paths: Paths::default(),
             libraries: Vec::new(),
             modules: Vec::new(),
+            features: Features::default(),
             language: Language::default(),
             scene: None,
             build: None,
@@ -149,6 +155,26 @@ impl Language {
     pub fn is_cpp(&self) -> bool {
         *self == Language::Cpp
     }
+
+    /// The serialized form — `"c++"`, `"csharp"`, `"kotlin"` — for keying per-language settings.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Language::Cpp => "c++",
+            Language::CSharp => "csharp",
+            Language::Kotlin => "kotlin",
+        }
+    }
+
+    /// How the language is written for people.
+    pub fn label(self) -> &'static str {
+        match self {
+            Language::Cpp => "C++",
+            Language::CSharp => "C#",
+            Language::Kotlin => "Kotlin",
+        }
+    }
+
+    pub const ALL: [Language; 3] = [Language::Cpp, Language::CSharp, Language::Kotlin];
 }
 
 /// The shapes a Koral library can take.
@@ -333,6 +359,12 @@ pub struct Window {
     /// layout file is a hand edit. Skipped when empty so older projects are not churned.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub imgui_ini: String,
+    /// The formats to present in, most wanted first ("BGRA8_SRGB", "BGRA8_UNORM", "RGBA8_SRGB",
+    /// "RGBA8_UNORM"); the runtime uses the first the display offers. Empty means the runtime's own
+    /// list. Carried through untouched like `imgui_ini`: choosing them is a hand edit, and an empty
+    /// list is not written so older projects are not churned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formats: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -352,6 +384,7 @@ impl Default for Window {
             // Empty by default so loading an older project that lacks the key does not invent one;
             // a *fresh* project pins it explicitly in `ProjectConfig::new`.
             imgui_ini: String::new(),
+            formats: Vec::new(),
         }
     }
 }
@@ -548,5 +581,20 @@ mod contract_tests {
         .expect("old-style config should still parse");
         assert_eq!(cfg.paths.asset_directories, vec!["content".to_string()]);
         assert_eq!(cfg.paths.shader_directories, vec!["glsl".to_string()]);
+    }
+}
+
+/// `features` in koral.json: kor::Feature names the runtime enables on the device.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Features {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional: Vec<String>,
+}
+
+impl Features {
+    pub fn is_empty(&self) -> bool {
+        self.required.is_empty() && self.optional.is_empty()
     }
 }
