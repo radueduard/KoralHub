@@ -282,14 +282,15 @@ impl Default for Paths {
     }
 }
 
-/// Ports the SDK already vendors and hands to consumers through `Koral::Koral`.
+/// Ports an SDK that does not list its own (`providedPorts` in its capabilities) vendors and hands to
+/// consumers through `Koral::Koral` — every SDK before v2 dropped glm and imgui.
 ///
 /// A project must not declare these: they arrive with the framework (see `Koral::vendored` in the
 /// SDK's `KoralConfig.cmake`), and listing them would drag in vcpkg to resolve packages the build
 /// never needed — and risk linking a second, ABI-incompatible copy alongside the SDK's.
 ///
-/// Early projects were seeded with exactly this set, so it is also the list [`ProjectConfig`]
-/// drops when it loads one.
+/// Early projects were seeded with exactly this set; [`crate::project::load`] drops whichever of them
+/// the project's SDK provides.
 pub const SDK_PROVIDED_PORTS: &[&str] = &["glm", "imgui", "spdlog", "fmt"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

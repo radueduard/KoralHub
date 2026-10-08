@@ -112,19 +112,37 @@ pub struct Capabilities {
     /// What it can do beyond that: `sceneTable`, `hotReload`, `offscreenScenes`, `cApi`, ...
     #[serde(default)]
     pub features: Vec<String>,
+    /// The vcpkg ports a project gets through `Koral::Koral`, which it must not declare itself. An
+    /// SDK that does not say vendored the set every SDK did before (glm and imgui among them).
+    #[serde(default = "Capabilities::legacy_provided_ports")]
+    pub provided_ports: Vec<String>,
 }
 
 impl Capabilities {
     fn v1_line() -> u32 { 1 }
     fn v1_apis() -> Vec<String> { vec!["Vulkan".into(), "OpenGL".into()] }
+    fn legacy_provided_ports() -> Vec<String> {
+        crate::model::SDK_PROVIDED_PORTS.iter().map(|p| p.to_string()).collect()
+    }
 
     /// What an SDK without the file is.
     pub fn v1() -> Self {
-        Self { line: 1, apis: Self::v1_apis(), scene_abi_version: 0, features: Vec::new() }
+        Self {
+            line: 1,
+            apis: Self::v1_apis(),
+            scene_abi_version: 0,
+            features: Vec::new(),
+            provided_ports: Self::legacy_provided_ports(),
+        }
     }
 
     pub fn has(&self, feature: &str) -> bool {
         self.features.iter().any(|f| f == feature)
+    }
+
+    /// Does `Koral::Koral` already hand a project this vcpkg port?
+    pub fn provides_port(&self, port: &str) -> bool {
+        self.provided_ports.iter().any(|p| p == port)
     }
 
     /// The SDK at `sdk_root`'s capabilities; v1 when it ships none (or they cannot be read).
@@ -1298,6 +1316,20 @@ mod tests {
         assert_eq!(caps.scene_abi_version, 2);
         assert!(caps.has("sceneTable") && caps.has("hotReload"));
         assert!(!caps.has("cApi"));
+        assert!(caps.provides_port("glm"), "an SDK that does not list its ports vendored glm");
+    }
+
+    #[test]
+    fn an_sdk_lists_the_ports_it_provides() {
+        let root = scratch();
+        let dir = root.join("share").join("Koral");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("capabilities.json"), r#"{
+            "line": 2, "apis": ["Vulkan"], "providedPorts": ["spdlog", "fmt"]
+        }"#).unwrap();
+        let caps = Capabilities::read(&root);
+        assert!(caps.provides_port("spdlog") && caps.provides_port("fmt"));
+        assert!(!caps.provides_port("glm") && !caps.provides_port("imgui"));
     }
 
     #[test]

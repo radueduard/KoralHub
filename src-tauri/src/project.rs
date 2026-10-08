@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{self, Kind, Language, ProjectConfig};
+use crate::model::{Kind, Language, ProjectConfig};
 use crate::paths;
 
 /// Committed, portable project metadata file.
@@ -23,8 +23,10 @@ pub fn load(project_root: &Path) -> Result<ProjectConfig, String> {
     // Projects scaffolded before the SDK vendored its own dependencies were seeded with the very
     // ports the SDK provides. Left in place they would pull in a whole vcpkg setup to resolve
     // packages the build already has — the thing `libraries` being empty is supposed to avoid.
-    cfg.libraries
-        .retain(|l| !model::SDK_PROVIDED_PORTS.contains(&l.vcpkg_port.as_str()));
+    // Which ports those are is the SDK's to say: a v2 SDK no longer ships glm, so a project that
+    // asks for it means it.
+    let sdk = crate::framework::capabilities_for(&cfg.framework_version);
+    cfg.libraries.retain(|l| !sdk.provides_port(&l.vcpkg_port));
 
     Ok(cfg)
 }
